@@ -62,7 +62,11 @@ public:
         void setCursorPosition(int position);
         int getCursorPosition() const { return m_cursorPosition; }
         // Mise à jour (à appeler à chaque frame)
-        std::string getDisplayText() const;
+        // blink: when true (default), the cursor glyph only appears while
+        // SDL_GetTicks()%1000<500, giving a real blinking cursor instead of
+        // a permanently-shown "_". Pass false to always show it (e.g. a
+        // caller doing its own blink timing).
+        std::string getDisplayText(bool blink = true) const;
         void update();
         
         // Activation/désactivation

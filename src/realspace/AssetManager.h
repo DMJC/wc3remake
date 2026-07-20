@@ -14,6 +14,7 @@
 #include "../engine/Loader.h"
 
 #include "TreArchive.h"
+#include "XtreArchive.h"
 // Structure pour stocker le Root Directory Record (selon ISO9660)
 struct RootDirectoryRecord {
     uint8_t recordLength;         // Longueur du record
@@ -97,10 +98,15 @@ public:
     std::string object_root_path;
     std::string mission_root_path;
     std::string intel_root_path;
+    // WC3-specific: pilot/AI profile IFFs (PLAYER.IFF, HOBBES.IFF, etc.) live
+    // under DATA\PROFILE\, not DATA\INTEL\ (which holds unrelated mission
+    // intel/briefing content) — see WC3Mission::LoadProfile.
+    std::string profile_root_path;
     std::string sound_root_path;
     std::string texture_root_path;
     std::string gameflow_root_path;
     std::vector<TreArchive*> tres;
+    std::vector<XtreArchive*> xtres;
 
     static AssetManager& getInstance() {
         static std::mutex instanceMutex;

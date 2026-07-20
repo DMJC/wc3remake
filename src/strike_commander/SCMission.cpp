@@ -354,6 +354,12 @@ void SCMission::update() {
         return;
     }
     this->tick_counter++;
+    // No-op on every actor except the player (SCMissionActorsPlayer's
+    // override) — see ShipComponent's own comment in SCMissionActors.h for
+    // why only the player tracks internal component damage/repair.
+    if (this->player != nullptr) {
+        this->player->TickComponentRepair();
+    }
     uint8_t area_id = this->getAreaID({this->player->plane->x, this->player->plane->y, this->player->plane->z});
     float yawRad = this->player->plane->yaw * (float)M_PI / 1800.0f; // Convert from 0.1 degrees to radians
     // Position the offset behind the aircraft based on current yaw
@@ -394,94 +400,113 @@ void SCMission::update() {
                 }
                 continue;
             }
+            // scene->cast entries are CAST array indices (same numbering as
+            // MISN_PART::id) — not positions into mission_data.parts. The
+            // old `i == cast` loop over `parts` happened to work for actors
+            // whose PART record's array position coincided with their id,
+            // but silently matched nothing (or the wrong actor) whenever it
+            // didn't, which is exactly the case for cast members that only
+            // exist via a scene (no PART record at all — see
+            // WC3Mission::loadMission()'s scene-fallback construction).
             for (auto cast: scene->cast) {
-                int i=0;
-                for (auto part: this->mission->mission_data.parts) {
-                    if (i == cast) {
-                        for (auto actor: this->actors) {
-                            if (actor->actor_name == "PLAYER") {
-                                continue;
+                for (auto actor: this->actors) {
+                    if (actor->actor_name == "PLAYER") {
+                        continue;
+                    }
+                    if (actor->actor_id == cast && actor->is_active == false) {
+                        actor->is_active = true;
+                        actor->is_hidden = false;
+                        if (scene->area_id != -1) {
+                            Vector3D correction;
+                            if (actor->object->unknown2 == 0) {
+                                correction = this->mission->mission_data.areas[scene->area_id]->position;
+                            } else if (actor->object->unknown2 == 1) {
+                                correction = {
+                                    this->player->plane->x,
+                                    this->player->plane->y,
+                                    this->player->plane->z
+                                };
                             }
-                            if (actor->actor_id == part->id && actor->is_active == false) {
-                                actor->is_active = true;
-                                actor->is_hidden = false;
-                                if (scene->area_id != -1) {
-                                    Vector3D correction;
-                                    if (actor->object->unknown2 == 0) {
-                                        correction = this->mission->mission_data.areas[scene->area_id]->position;
-                                    } else if (actor->object->unknown2 == 1) {
-                                        correction = {
-                                            this->player->plane->x,
-                                            this->player->plane->y,
-                                            this->player->plane->z
-                                        };
-                                    }
-                                    if (actor->object->area_id != 255) {
-                                        actor->object->position += correction;
-                                    }
-                                    float ground_y = this->area->getY(actor->object->position.x, actor->object->position.z);
-                                    
-                                    if (actor->plane != nullptr) {
-                                        actor->plane->on_ground = false;
-                                        actor->plane->x = actor->object->position.x;
-                                        actor->plane->y = actor->object->position.y;
-                                        actor->plane->z = actor->object->position.z;
-                                        if (abs(ground_y - actor->object->position.y) <= 10 ) {
-                                            actor->object->position.y = ground_y;
-                                            actor->plane->on_ground = true;
-                                        } else {
-                                            actor->plane->on_ground = false;
-                                        }
-                                        if (actor->object->position.y < ground_y) {
-                                            actor->plane->position.y += ground_y;
-                                        }
-                                    } else if (actor->object->position.y < ground_y) {
+                            // area_corrected is set by WC3Mission::loadMission()
+                            // for every part it positions at load time (real
+                            // PART records and scene-only synthesized ones
+                            // alike) — without this guard, an actor whose
+                            // position was already fully resolved at load
+                            // gets the same area offset added a second time
+                            // the first time its scene activates here,
+                            // landing it far from where it actually spawned.
+                            if (actor->object->area_id != 255 && !actor->object->area_corrected) {
+                                actor->object->position += correction;
+                            }
+                            // Space missions have no terrain (this->area
+                            // stays null) — nothing to snap to, and every
+                            // actor simply starts airborne.
+                            if (this->area != nullptr) {
+                                float ground_y = this->area->getY(actor->object->position.x, actor->object->position.z);
+
+                                if (actor->plane != nullptr) {
+                                    actor->plane->on_ground = false;
+                                    actor->plane->x = actor->object->position.x;
+                                    actor->plane->y = actor->object->position.y;
+                                    actor->plane->z = actor->object->position.z;
+                                    if (abs(ground_y - actor->object->position.y) <= 10 ) {
                                         actor->object->position.y = ground_y;
+                                        actor->plane->on_ground = true;
+                                    } else {
+                                        actor->plane->on_ground = false;
                                     }
+                                    if (actor->object->position.y < ground_y) {
+                                        actor->plane->position.y += ground_y;
+                                    }
+                                } else if (actor->object->position.y < ground_y) {
+                                    actor->object->position.y = ground_y;
                                 }
+                            } else if (actor->plane != nullptr) {
+                                actor->plane->on_ground = false;
+                                actor->plane->x = actor->object->position.x;
+                                actor->plane->y = actor->object->position.y;
+                                actor->plane->z = actor->object->position.z;
+                            }
+                        }
+
+                        if (actor->on_is_activated.size() > 0) {
+                            SCProg *p = new SCProg(actor, actor->on_is_activated, this, actor->object->on_is_activated);
+                            p->execute();
+                            delete p;
+                        }
+                        if (this->area != nullptr && actor->object->entity->entity_type == EntityType::rnwy) {
+                            for (auto runway: this->area->objectOverlay) {
+                                Vector3D pos = actor->object->position;
                                 
-                                if (actor->on_is_activated.size() > 0) {
-                                    SCProg *p = new SCProg(actor, actor->on_is_activated, this, actor->object->on_is_activated);
-                                    p->execute();
-                                    delete p;
+                                // Vérifier si la position de l'objet est à l'intérieur de la piste
+                                if (pos.x >= runway.lx && pos.x <= runway.hx && 
+                                    pos.z <= -runway.ly && pos.z >= -runway.hy) {
+                                    
+                                    // Calculer les dimensions de la piste
+                                    float width = (float)std::abs(runway.lx - runway.hx); 
+                                    float length = (float)std::abs(runway.ly - runway.hy);
+                                    
+                                    // Calculer l'orientation (angle) de la piste
+                                    float angle = (float)std::atan2(runway.ly - runway.hy, 
+                                                            runway.lx - runway.hx);
+                                    
+                                    // Recalculer la bounding box
+                                    actor->object->entity->bb.min.x = -width / 2.0f;
+                                    actor->object->entity->bb.max.x = width / 2.0f;
+                                    actor->object->entity->bb.min.y = -5;
+                                    actor->object->entity->bb.max.y = 5;
+                                    actor->object->entity->bb.min.z = -length / 2.0f;
+                                    actor->object->entity->bb.max.z = length / 2.0f;
+                                    
+                                    // Appliquer l'orientation à l'objet
+                                    actor->object->azymuth = angle * 180.0f / M_PI;
+                                    
+                                    break;
                                 }
-                                if (actor->object->entity->entity_type == EntityType::rnwy) {
-                                    for (auto runway: this->area->objectOverlay) {
-                                        Vector3D pos = actor->object->position;
-                                        
-                                        // Vérifier si la position de l'objet est à l'intérieur de la piste
-                                        if (pos.x >= runway.lx && pos.x <= runway.hx && 
-                                            pos.z <= -runway.ly && pos.z >= -runway.hy) {
-                                            
-                                            // Calculer les dimensions de la piste
-                                            float width = (float)std::abs(runway.lx - runway.hx); 
-                                            float length = (float)std::abs(runway.ly - runway.hy);
-                                            
-                                            // Calculer l'orientation (angle) de la piste
-                                            float angle = (float)std::atan2(runway.ly - runway.hy, 
-                                                                    runway.lx - runway.hx);
-                                            
-                                            // Recalculer la bounding box
-                                            actor->object->entity->bb.min.x = -width / 2.0f;
-                                            actor->object->entity->bb.max.x = width / 2.0f;
-                                            actor->object->entity->bb.min.y = -5;
-                                            actor->object->entity->bb.max.y = 5;
-                                            actor->object->entity->bb.min.z = -length / 2.0f;
-                                            actor->object->entity->bb.max.z = length / 2.0f;
-                                            
-                                            // Appliquer l'orientation à l'objet
-                                            actor->object->azymuth = angle * 180.0f / M_PI;
-                                            
-                                            break;
-                                        }
-                                    }
-                                }
-                                break;
                             }
                         }
                         break;
                     }
-                    i++;
                 }
             }
             if (scene->on_is_activated != -1) {
@@ -503,7 +528,11 @@ void SCMission::update() {
         
     }
     this->in_combat = false;
+    float cloakDt = (this->tps > 0) ? 1.0f / (float)this->tps : 0.0f;
     for (auto ai_actor : this->actors) {
+        if (ai_actor != nullptr && !ai_actor->is_destroyed && cloakDt > 0.0f) {
+            ai_actor->UpdateCloak(cloakDt);
+        }
         if (ai_actor->object->alive == false && ai_actor->is_destroyed == false) {
             ai_actor->is_destroyed = true;
             if (ai_actor->on_is_destroyed.size() > 0 && ai_actor->plane == nullptr) {
@@ -511,6 +540,21 @@ void SCMission::update() {
                 SCProg *p = new SCProg(ai_actor, ai_actor->on_is_destroyed, this, ai_actor->object->on_is_destroyed);
                 p->execute();
                 delete p;
+            }
+            // Fallback EXPL spawn for anything that went alive=false without
+            // already exploding via hasBeenHit — mainly capital ships and
+            // static/ground objects (planes are covered further below, in
+            // the flying-actor wreck-falling loop, or already covered here
+            // via hasBeenHit itself for a weapon kill). has_exploded keeps
+            // this from double-firing on top of hasBeenHit's own spawn.
+            if (!ai_actor->has_exploded && ai_actor->object->entity != nullptr &&
+                ai_actor->object->entity->explos != nullptr) {
+                ai_actor->has_exploded = true;
+                this->explosions.push_back(new SCExplosion(ai_actor->object->entity->explos->objct, ai_actor->object->position));
+                if (this->sound.sounds.size() > 0) {
+                    MemSound *sound = this->sound.sounds[SoundEffectIds::EXPLOSION_1];
+                    Mixer.playSoundVoc(sound->data, sound->size);
+                }
             }
             if (ai_actor->object->member_name_destroyed != "") {
                 RSEntity *entity = LoadEntity(ai_actor->object->member_name_destroyed);
@@ -661,7 +705,11 @@ void SCMission::update() {
         ai_actor->object->azymuth = 360 - (uint16_t)(ai_actor->plane->azimuthf / 10.0f);
         ai_actor->object->roll = (uint16_t)(ai_actor->plane->twist / 10.0f);
         ai_actor->object->pitch = (uint16_t)(ai_actor->plane->elevationf / 10.0f);
-        if (ai_actor->is_destroyed == true && ai_actor->object->position.y < this->area->getY(ai_actor->object->position.x, ai_actor->object->position.z)) {
+        // Space missions have no terrain (this->area stays null) — there's no
+        // ground for wreckage to fall to, so treat "destroyed" as final
+        // immediately instead of waiting to fall below a ground level.
+        if (ai_actor->is_destroyed == true &&
+            (this->area == nullptr || ai_actor->object->position.y < this->area->getY(ai_actor->object->position.x, ai_actor->object->position.z))) {
             ai_actor->object->alive = false;
             ai_actor->is_active = false;
             if (ai_actor->on_is_destroyed.size() > 0 && ai_actor->plane != nullptr) {
@@ -669,15 +717,60 @@ void SCMission::update() {
                 p->execute();
                 delete p;
             }
-            this->explosions.push_back(new SCExplosion(ai_actor->object->entity->explos->objct, ai_actor->object->position));
-            if (this->sound.sounds.size() > 0) {
-                MemSound *sound = this->sound.sounds[SoundEffectIds::EXPLOSION_4];
-                Mixer.playSoundVoc(sound->data, sound->size, 4, 0);
+            // has_exploded guard: a weapon kill already spawned this
+            // actor's explosion via hasBeenHit at the moment it died (mid-
+            // air) — don't spawn a second one here just because its wreck
+            // has now finished falling/reached "final" status. Also guards
+            // the entity->explos dereference itself, previously
+            // unconditional (crashed on any actor with no EXPL chunk —
+            // live-tested 2026-07 session).
+            if (!ai_actor->has_exploded && ai_actor->object->entity != nullptr &&
+                ai_actor->object->entity->explos != nullptr) {
+                ai_actor->has_exploded = true;
+                this->explosions.push_back(new SCExplosion(ai_actor->object->entity->explos->objct, ai_actor->object->position));
+                if (this->sound.sounds.size() > 0) {
+                    MemSound *sound = this->sound.sounds[SoundEffectIds::EXPLOSION_4];
+                    Mixer.playSoundVoc(sound->data, sound->size, 4, 0);
+                }
             }
             if (ai_actor->object->entity->destroyed_object != nullptr && ai_actor->plane == nullptr) {
                 ai_actor->object->entity = ai_actor->object->entity->destroyed_object;
             }
             //ai_actor->plane = nullptr;
+        }
+    }
+    // Space missions have no runway/ground for SCJdynPlane's own landed
+    // model (on_ground stays false unconditionally — see the no_gravity
+    // guards in SCJdynPlane::Simulate()/updateAcceleration()) to ever set
+    // SCPlane::landed. Approximate it instead: inside the carrier's own
+    // hangar-bay area (the actor whose cast name gave it a
+    // SCMissionActorsStrikeBase, e.g. WC3's "VIC"-prefixed TCS Victory
+    // entry — see WC3Mission::loadMission()) at under 100 KPS, and only
+    // after having left that same area at least once since mission start.
+    //
+    // The player must explicitly radio the Victory and request landing
+    // (the radio 'f' option, "NEED CLEARANCE" — see
+    // SCMissionActors::respondToRadioMessage) before landing_clearance_granted
+    // is set; only then does approach+slow-down actually land the plane.
+    //
+    // Known gap: real WC3 normally auto-grants clearance once the mission's
+    // win/loss condition is already met, but a few missions (e.g. the
+    // Laconda series) gate it behind an additional in-flight decision
+    // (there: whether to help Flint). No mission-objective/win-condition
+    // tracking exists yet, so respondToRadioMessage's 'f' case grants
+    // clearance and reports a win unconditionally as soon as it's asked for.
+    if (this->player->plane->no_gravity && !this->player->plane->landed) {
+        for (auto* base_actor : this->actors) {
+            if (dynamic_cast<SCMissionActorsStrikeBase*>(base_actor) == nullptr) continue;
+            bool in_bay = base_actor->object->area_id != 255 &&
+                          area_id == (uint8_t)(base_actor->object->area_id + 1);
+            if (!in_bay) {
+                this->has_left_carrier_bay = true;
+            } else if (this->has_left_carrier_bay && this->landing_clearance_granted &&
+                       this->player->plane->airspeed < 100) {
+                this->player->plane->landed = true;
+            }
+            break;
         }
     }
     if (this->player->plane->landed) {

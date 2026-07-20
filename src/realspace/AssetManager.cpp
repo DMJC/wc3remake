@@ -104,30 +104,57 @@ void AssetManager::init(std::vector<std::string> nameIds){
 
     //Load all TRE in RAM and store them.
     for (auto nameId : nameIds) {
-        TreArchive* tre = new TreArchive();
         FileData *fileData = GetFileData(nameId);
         if (fileData == nullptr) {
             printf("Unable to load asset '%s' (Did you set the SC base folder ?).\n",nameId.c_str());
             continue;
         }
-        tre->InitFromRAM(nameId.c_str(), fileData->data, fileData->size);
+
         this->loader.log("Loading TRE " + nameId);
-        if (tre->IsValid()) {
-            this->tres.push_back(tre);
-            this->loader.log("Loaded TRE " + nameId + " with " + std::to_string(tre->GetNumEntries()) + " entries.");
-            for (auto treEntry : tre->entries) {
+
+        // Auto-detect XTRE format (Wing Commander 3/4)
+        bool isXtre = fileData->size >= 4 && memcmp(fileData->data, "XTRE", 4) == 0;
+
+        std::vector<TreEntry*>* entryList = nullptr;
+        bool archiveValid = false;
+
+        if (isXtre) {
+            XtreArchive* xtre = new XtreArchive();
+            xtre->InitFromRAM(nameId.c_str(), fileData->data, fileData->size);
+            archiveValid = xtre->IsValid();
+            if (archiveValid) {
+                this->xtres.push_back(xtre);
+                entryList = &xtre->entries;
+            } else {
+                delete xtre;
+            }
+        } else {
+            TreArchive* tre = new TreArchive();
+            tre->InitFromRAM(nameId.c_str(), fileData->data, fileData->size);
+            archiveValid = tre->IsValid();
+            if (archiveValid) {
+                this->tres.push_back(tre);
+                entryList = &tre->entries;
+            } else {
+                delete tre;
+            }
+        }
+
+        if (archiveValid && entryList) {
+            this->loader.log("Loaded " + std::string(isXtre ? "XTRE" : "TRE") + " " + nameId +
+                             " with " + std::to_string(entryList->size()) + " entries.");
+            for (auto treEntry : *entryList) {
                 std::string *name = new std::string(treEntry->name);
                 if (treEntries.find(*name) != treEntries.end()) {
-                    printf("Duplicate entry '%s' in TRE '%s'.\n",name->c_str(),nameId.c_str());
-                    //exit(-1);
+                    printf("Duplicate entry '%s' in %s '%s'.\n", name->c_str(),
+                           isXtre ? "XTRE" : "TRE", nameId.c_str());
                 }
                 auto res = treEntries.insert(std::pair<std::string,TreEntry*>(*name,treEntry));
-                this->loader.log("Inserted entry " + *name + " from TRE " + nameId);
+                this->loader.log("Inserted entry " + *name + " from " + nameId);
                 if (!res.second) {
                     printf("ERROR INSERTING name %s", name->c_str());
                 }
             }
-
         } else {
             printf("Unable to load asset '%s' (Did you set the SC base folder ?).\n",nameId.c_str());
             exit(-1);

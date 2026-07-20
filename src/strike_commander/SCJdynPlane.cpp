@@ -99,7 +99,11 @@ void SCJdynPlane::Simulate() {
 
     this->gravity = GRAVITY * dt * dt;
     this->fps_knots = 1.944f / dt;
-    this->groundlevel = this->area->getY(this->x, this->z);
+    // Space missions have no terrain (area stays null — see
+    // WC3Mission::loadMission()). Pin groundlevel far below any reachable
+    // altitude so checkStatus()'s "not on ground" branch always wins,
+    // instead of dereferencing a null area.
+    this->groundlevel = this->area ? this->area->getY(this->x, this->z) : -1000000.0f;
     this->computeGravity();
     this->processInput();
     this->updatePosition();
@@ -112,9 +116,10 @@ void SCJdynPlane::Simulate() {
     this->updateAcceleration();
     this->updateVelocity();
 
-    // Calculer la distance parcourue depuis la dernière frame
-    
-    float vitesse_ms = abs(this->vz) / dt;
+    // vz is now a real per-second rate (KPS, see computeThrust/updatePosition),
+    // not a per-frame delta, so it no longer needs dividing by dt to recover
+    // a rate here — that used to undo the old per-frame-delta convention.
+    float vitesse_ms = abs(this->vz);
     this->airspeed = (int)(vitesse_ms * 1.944f);
     this->climbspeed = (short)(dt / (this->y - this->last_py));
     this->g_load = (this->lift_force*this->inverse_mass) / this->gravity;
@@ -232,21 +237,70 @@ void SCJdynPlane::Simulate() {
 
 void SCJdynPlane::updatePosition() {
     float temp{0.0f};
-    
+    float dt = GameTimer::getInstance().getDeltaTime();
+
+    // Integrate this frame's incremental rotation into the persistent
+    // orientationQuat (gimbal-lock-free) instead of rebuilding "current
+    // orientation" from yaw/pitch/roll (re-extracted from ptw every frame
+    // below) and re-applying it via 3 Euler rotateM calls — that compose/
+    // re-extract round-trip is what causes gimbal lock as pitch nears
+    // +-90 (asin-based extraction becomes singular there), confirmed by
+    // live testing once the new dps-calibrated turn rates made reaching
+    // that range trivial. yaw/pitch/roll below are still computed each
+    // frame (from the resulting ptw) for every other system that reads
+    // them (camera, HUD, AI, ...), but orientationQuat itself is never
+    // reconstructed from them, so that feedback loop is broken — this
+    // integration step (dq_yaw/dq_pitch/dq_roll composed onto the
+    // existing orientationQuat below) is the ship's only real source of
+    // truth for its orientation.
+    Quaternion dq_yaw, dq_pitch, dq_roll;
+    dq_yaw.FromAxisAngle(0, 1, 0, tenthOfDegreeToRad(this->yaw_speed));
+    dq_pitch.FromAxisAngle(1, 0, 0, tenthOfDegreeToRad(this->pitch_speed));
+    dq_roll.FromAxisAngle(0, 0, 1, tenthOfDegreeToRad((float)this->roll_speed));
+    // All three are applied body-relative via PRE-multiply (dq on the
+    // left, dq.Multiply(&orientationQuat) then orientationQuat = dq) —
+    // yawing, pitching, and rolling should always turn the ship around its
+    // OWN current nose/wing/up axes (its center), never around a fixed
+    // world axis, regardless of current attitude.
+    //
+    // This looks backwards from the "usual" quaternion rule (post-multiply
+    // = body-relative), and an earlier version of this code trusted that
+    // usual rule and used post-multiply for pitch/roll — but it's wrong
+    // for THIS codebase's specific combination of row-vector matrices
+    // (Vector3D::transformPoint does p*M, not M*p) and FromAxisAngle's own
+    // negated half-angle (chosen to match Matrix::rotateM's rotation
+    // direction, see its own comment). Verified numerically (simulating
+    // Quaternion::Multiply/FromAxisAngle/ToMatrix exactly): starting from
+    // a 90-degree-yawed orientation and post-multiplying a "pitch"
+    // increment rotates around the fixed world X axis regardless of the
+    // yaw already applied (forward vector doesn't move); pre-multiplying
+    // the same increment correctly rotates around the ship's current
+    // right axis instead. Each increment below is composed against the
+    // most up to date orientationQuat (yaw's result feeds pitch's
+    // pre-multiply, pitch's feeds roll's), so a later axis in the chain
+    // still turns around the ship's true current attitude including this
+    // same frame's earlier increments. No gimbal lock either way (pure
+    // quaternion composition, no Euler round trip).
+    dq_yaw.Multiply(&this->orientationQuat);
+    this->orientationQuat = dq_yaw;
+    dq_pitch.Multiply(&this->orientationQuat);
+    this->orientationQuat = dq_pitch;
+    dq_roll.Multiply(&this->orientationQuat);
+    this->orientationQuat = dq_roll;
+    this->orientationQuat.Normalize();
+    Matrix orientationMatrix = this->orientationQuat.ToMatrix();
+
     this->ptw.Identity();
     this->ptw.translateM(this->x, this->y, this->z);
+    this->ptw.Multiply(&orientationMatrix);
 
-    this->ptw.rotateM(tenthOfDegreeToRad(this->yaw), 0, 1, 0);
-    this->ptw.rotateM(tenthOfDegreeToRad(this->pitch), 1, 0, 0);
-    this->ptw.rotateM(tenthOfDegreeToRad(this->roll), 0, 0, 1);
-    
-    this->ptw.translateM(this->vx, this->vy, this->vz);
-    if (round(this->yaw_speed) != 0)
-        this->ptw.rotateM(tenthOfDegreeToRad(roundf(this->yaw_speed)), 0, 1, 0);
-    if (round(this->pitch_speed) != 0)
-        this->ptw.rotateM(tenthOfDegreeToRad(roundf(this->pitch_speed)), 1, 0, 0);
-    if (round(this->roll_speed) != 0)
-        this->ptw.rotateM(tenthOfDegreeToRad((float)this->roll_speed), 0, 0, 1);
+    // vz is now a real KPS rate (computeThrust's rate-limited ramp), unlike
+    // vx/vy which stay on the older small-per-frame-delta convention (still
+    // driven by the force/inverse_mass pipeline, untouched here) — so only
+    // vz needs an explicit *dt to become "world units this frame" instead
+    // of moving a full KPS-worth of distance every single frame. Assumes
+    // 1 KPS == 1 world unit/second (per live-testing feedback).
+    this->ptw.translateM(this->vx, this->vy, this->vz * dt);
 
     temp = 0.0f;
     this->m_old_pitch = this->pitch;
@@ -302,18 +356,31 @@ void SCJdynPlane::updatePosition() {
     float rad_pitch_speed = tenthOfDegreeToRad(this->pitch_speed);
     float rad_yaw_speed = tenthOfDegreeToRad(this->yaw_speed);
 
-    this->incremental.Identity();
-    if (this->roll_speed)
-        this->incremental.rotateM(-rad_roll_speed, 0, 0, 1);
-    if (this->pitch_speed)
-        this->incremental.rotateM(-rad_pitch_speed, 1, 0, 0);
-    if (this->yaw_speed)
-        this->incremental.rotateM(-rad_yaw_speed, 0, 1, 0);
-    this->incremental.translateM(this->vx, this->vy, this->vz);
-
-    this->vx = this->incremental.v[3][0];
-    this->vy = this->incremental.v[3][1];
-    this->vz = this->incremental.v[3][2];
+    // vx/vy/vz are body-frame velocity (see computeLift/computeDrag/
+    // updateAcceleration treating vz as forward speed and projecting world
+    // gravity into body space via ptw's own rows) — the ptw composition
+    // above (translateM(vx,vy,vz*dt) applied through the CURRENT
+    // orientationMatrix) already reprojects them into world space fresh
+    // every frame using the ship's true current attitude, so they need no
+    // separate "carry the turn forward" step.
+    //
+    // This used to additionally spin vx/vy/vz here via a from-scratch,
+    // world-fixed-axis Matrix::rotateM sequence (this->incremental,
+    // reset to Identity every frame — copied from the older SCPlane/
+    // SCSimplePlane base implementation, where it made sense: THAT
+    // updatePosition() rebuilds ptw's whole orientation from absolute
+    // yaw/pitch/roll via the same fixed-axis rotateM every frame, so
+    // incremental's rotation at least spoke the same language as ptw's
+    // own). Once orientation moved to the persistent, gimbal-lock-free
+    // orientationQuat above, this block became a second, INCONSISTENT
+    // rotation of the same vector — never chained against the real
+    // orientation, so it drifted further from the ship's true attitude
+    // every frame it turned, injecting spurious body-frame velocity that
+    // the position integration above then applied as real translation.
+    // That's what sent the ship swinging away from where its nose was
+    // actually pointing while pitching/yawing (reported: pitching swings
+    // the view through the TCS Victory's flight deck near the mission's
+    // spawn point) instead of turning in place around itself.
 
     float deltaTime = 1.0f / this->tps;
     
@@ -346,12 +413,64 @@ void SCJdynPlane::updatePosition() {
 }
 void SCJdynPlane::processInput() {
     float dt = GameTimer::getInstance().getDeltaTime();
-    
+
+    // WC3 ships (RSEntity::parseREAL_OBJT_SSHP_DYNM_FGTR) carry their own
+    // calibrated max pitch/yaw/roll dps stats. "WC3 doesn't have real
+    // physics" (live-tested ground truth): turn rate is a fixed dps value
+    // independent of airspeed, not a control-surface-authority-times-
+    // velocity model — so bypass the vz-scaled formula below entirely for
+    // these ships and drive roll/pitch/yaw_speed (tenths of a degree this
+    // frame — see updatePosition's rotateM calls) directly from stick
+    // input and the ship's own dps stat. ROLL_RATE/TWIST_RATE are
+    // misleadingly named (inherited from this struct's SC1/JETP shape) —
+    // manual cross-check confirms ROLL_RATE is actually pitch dps and
+    // TWIST_RATE is actually yaw dps; WC3_TRUE_ROLL_RATE_DPS is the real
+    // roll dps, previously parsed and discarded.
+    if (this->object != nullptr && this->object->entity != nullptr && this->object->entity->jdyn != nullptr &&
+        this->object->entity->jdyn->WC3_TRUE_ROLL_RATE_DPS > 0) {
+        JDYN *dyn = this->object->entity->jdyn;
+        constexpr float kStickFullDeflection = 200.0f;
+        // Raw JDYN dps values (e.g. Hellcat's 60/60/60) taken as literal
+        // degrees/second work out to a 6.0s full 360 at max deflection —
+        // sluggish next to WC3's remembered snappy arcade turning, and
+        // unlike computeThrust's spool-up time this dps interpretation was
+        // never verified against live DOS timing. Doubled per live-testing
+        // feedback (still felt slow at full stick/Shift-held deflection,
+        // i.e. this isn't the separate half/full-rate keyboard scheme
+        // below in checkKeyboard) rather than re-deriving an exact
+        // ground-truth multiplier from DOSBox.
+        constexpr float kWC3TurnRateMultiplier = 2.0f;
+        auto axisSpeedTenths = [&](float stickValue, float maxDps) -> float {
+            float ratio = stickValue / kStickFullDeflection;
+            if (ratio > 1.0f) ratio = 1.0f;
+            if (ratio < -1.0f) ratio = -1.0f;
+            return ratio * maxDps * kWC3TurnRateMultiplier * 10.0f * dt;
+        };
+        // rudder's own natural range is +-10 (SCStrike::checkKeyboard ramps
+        // it by +-0.1/frame), not the +-200-ish stick range, so rescale it
+        // onto the same kStickFullDeflection basis before normalizing.
+        constexpr float kRudderFullDeflection = 10.0f;
+        // Negated: Quaternion::FromAxisAngle's rotation-direction fix (see
+        // its own comment — needed to match Matrix::rotateM's convention
+        // and resolve the cockpit/orientation desync) flipped the visual
+        // effect of a positive pitch/roll_speed for every axis uniformly.
+        // Yaw stayed correct because it's driven through rudder's own
+        // separate ramp, not control_stick_x/y directly, but pitch/roll's
+        // sign (tuned against the pre-fix convention) needed re-flipping —
+        // confirmed by live testing.
+        this->pitch_speed = axisSpeedTenths(-this->control_stick_y, (float)dyn->ROLL_RATE);
+        this->roll_speed = axisSpeedTenths(-this->control_stick_x, (float)dyn->WC3_TRUE_ROLL_RATE_DPS);
+        this->yaw_speed = axisSpeedTenths(this->rudder * (kStickFullDeflection / kRudderFullDeflection), (float)dyn->TWIST_RATE);
+        this->elevation_speedf = this->pitch_speed;
+        this->azimuth_speedf = this->yaw_speed;
+        return;
+    }
+
     int itemp {0};
     float temp {0.0f};
     float elevtemp{0.0f};
     int DELAY = (int)(0.25f / dt);  // 1/4 de seconde
-    
+
     float DELAYF = dt * 0.25f;
 
     /* tenths of degrees per tick	*/
@@ -692,7 +811,56 @@ void SCJdynPlane::computeGravity() {
 }
 void SCJdynPlane::computeThrust() {
     float dt = GameTimer::getInstance().getDeltaTime();
-    this->thrust_force = 0.01f * dt * dt * this->thrust * this->Mthrust;
+    // Mthrust is constructed from RSEntity::thrust_in_newton, which despite
+    // its name is actually the ship's calibrated max normal-flight speed in
+    // KPS (confirmed against the game manual's per-ship stats: e.g. Arrow
+    // 520, Excalibur 500, Hellcat 420, Thunderbolt 380 all match exactly).
+    // While the afterburner key is held, scale toward the ship's own
+    // max-afterburner-speed stat instead — RSEntity::weight_in_kg, which
+    // the same manual cross-check showed is actually that value (Arrow
+    // 1400, Excalibur 1300, Hellcat 1200, Thunderbolt 1000), not mass —
+    // rather than applying one hardcoded multiplier for every ship.
+    float mthrust = this->Mthrust;
+    float abMaxSpeed = mthrust;
+    if (this->object != nullptr && this->object->entity != nullptr) {
+        abMaxSpeed = (float)this->object->entity->weight_in_kg;
+    }
+    // WC3 "doesn't have real physics" (live DOS-original ground truth,
+    // timed directly against the running game): a stationary Hellcat V
+    // (420 KPS max) reaches full speed in ~2.2s and holds there — a clean
+    // linear ramp with a hard cap, not a thrust/drag equilibrium. Arrow's
+    // manual figures independently predict ~2.08s (520/250). One constant
+    // reasonably stands in for a real per-ship "Acceleration" stat, which
+    // isn't present anywhere in the parsed JDYN data.
+    //
+    // thrust_force here is therefore the signed vz delta needed THIS
+    // FRAME to move current speed toward the throttle target, rate-limited
+    // by kSpoolUpSeconds — applied directly in updateForces() instead of
+    // being combined with lift_drag_force/drag_force, since (per the same
+    // ground truth) aerodynamic drag doesn't fight thrust here the way it
+    // would under a real force model; folding it in was why the previous
+    // attempt still felt too slow despite a correctly-calibrated target.
+    constexpr float kSpoolUpSeconds = 2.08f;
+    // Afterburner always targets the ship's full AB speed regardless of throttle.
+    // On release, the target falls back to the throttle-proportional speed and
+    // the ship decelerates at the same rate as normal throttle changes.
+    float targetSpeed = this->afterburner_engaged
+        ? abMaxSpeed
+        : mthrust * (this->thrust / 100.0f);
+    float currentSpeed = -this->vz; // vz is negative for forward motion
+    // Rate is always based on normal max so AB spool-up matches throttle feel.
+    float maxDelta = (mthrust / kSpoolUpSeconds) * dt;
+    float diff = targetSpeed - currentSpeed;
+    if (diff > maxDelta) diff = maxDelta;
+    if (diff < -maxDelta) diff = -maxDelta;
+    // updateAcceleration() unconditionally divides acceleration.z by mass
+    // right after updateForces() applies -thrust_force to it (that step
+    // exists for the old F=ma force model). diff here is already the
+    // exact velocity delta the ramp wants, not a force, so pre-multiply by
+    // mass to cancel that division out — otherwise the ramp ends up ~1000x
+    // slower than kSpoolUpSeconds, since W (mass) is itself the mislabeled
+    // weight_in_kg field (~1000-1400, not a real small aircraft mass).
+    this->thrust_force = diff * (this->W + this->fuel);
 }
 void SCJdynPlane::updateAcceleration() {
     if (this->acceleration.x != 0.0f) {
@@ -701,22 +869,60 @@ void SCJdynPlane::updateAcceleration() {
     this->acceleration.y *= this->inverse_mass;
     this->acceleration.z *= this->inverse_mass;
 
-    this->acceleration.x -= this->ptw.v[0][1] * this->gravity;
-    this->acceleration.y -= this->ptw.v[1][1] * this->gravity;
-    this->acceleration.z -= this->ptw.v[2][1] * this->gravity;
+    // this->gravity itself stays nonzero even in space (it's also the 1G
+    // reference unit for Lmax/Lmin/g_load structural-stress limits) — only
+    // skip actually applying it as a directional pull.
+    if (!this->no_gravity) {
+        this->acceleration.x -= this->ptw.v[0][1] * this->gravity;
+        this->acceleration.y -= this->ptw.v[1][1] * this->gravity;
+        this->acceleration.z -= this->ptw.v[2][1] * this->gravity;
+    }
 }
 void SCJdynPlane::updateForces() {
     int vz_sign = (this->vz < 0.0f) ? 1 : -1;
     this->acceleration.x = 0.0f;
-    this->acceleration.y = this->lift_force + (vz_sign * this->gravity_drag_force);
-    this->acceleration.z = this->lift_drag_force - this->thrust_force + (vz_sign * this->drag_force);
+    // Aerodynamic lift requires atmosphere — it's already meaningless for
+    // space combat, and gravity itself is correctly skipped here via
+    // no_gravity (see updateAcceleration), but lift_force/gravity_drag_force
+    // were still being applied to acceleration.y unconditionally. That was
+    // roughly harmless while vz stayed tiny (the old per-frame-delta
+    // convention), but now that vz is a real KPS-scale rate (up to
+    // 500-1400+), lift_force's own vz-dependent terms (some of which
+    // divide by vz) blow up, sending y to an extreme value — confirmed by
+    // live testing: at high speed this tripped SCJdynPlane::checkStatus's
+    // "on ground" branch, which unconditionally sets on_ground=true and,
+    // if airspeed/thrust happen to read low in that same degenerate frame,
+    // landed=true — which SCMission::update() treats as mission complete.
+    this->acceleration.y = this->no_gravity ? 0.0f : (this->lift_force + (vz_sign * this->gravity_drag_force));
+    // thrust_force (computeThrust) is already the rate-limited signed vz
+    // delta toward the throttle target — apply it directly rather than
+    // folding it into the lift_drag_force/drag_force equilibrium (see
+    // computeThrust's comment: WC3 doesn't model real drag opposing
+    // thrust, so combining them here just made the ramp too slow).
+    this->acceleration.z = -this->thrust_force;
 }
 void SCJdynPlane::updateVelocity() {
     float temp{0.0f};
     float dt = GameTimer::getInstance().getDeltaTime();
     this->vx += this->acceleration.x;
     this->vz += this->acceleration.z;
-    
+
+    // Cap forward speed at the ship's own calibrated max (computeThrust's
+    // mthrust) so the linear spool-up in computeThrust() can't overshoot
+    // once it gets there — matching "1sec:250 2sec:500 and then max" (the
+    // ramp keeps accumulating thrust_force indefinitely otherwise, there's
+    // no other ceiling on vz).
+    if (this->object != nullptr && this->object->entity != nullptr) {
+        // Hard ceiling is always the afterburner max — computeThrust's targetSpeed
+        // enforces the normal-max ceiling when AB is off, so clamping to thrust_in_newton
+        // here would snap the speed instantly when AB is released from full AB speed.
+        float hardMax = (float)this->object->entity->weight_in_kg;
+        if (hardMax > 0.0f) {
+            if (this->vz < -hardMax) this->vz = -hardMax;
+            if (this->vz > hardMax) this->vz = hardMax;
+        }
+    }
+
     if (this->on_ground && this->status > MEXPLODE) {
         temp = 0.0f;
         float mcos;

@@ -157,6 +157,14 @@ void SCSmokeSet::init(){
 
     std::string path = "..\\..\\DATA\\OBJECTS\\SMOKESET.IFF";
     TreEntry *smk = Assets.GetEntryByName(path.c_str());
+    if (smk == nullptr) {
+        // SMOKESET.IFF is a Strike Commander-only asset — it doesn't exist
+        // anywhere in WC3's data files, so every WC3 plane hit this
+        // unconditional dereference. Leave textures/smoke_textures at their
+        // default-constructed empty state (no smoke trail) instead of
+        // crashing; every other SCPlane use of them is size()-guarded.
+        return;
+    }
 
     RSSmokeSet *smoke_set = new RSSmokeSet();
     smoke_set->InitFromRam(smk->data, smk->size);

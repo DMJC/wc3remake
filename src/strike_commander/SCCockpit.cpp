@@ -6,13 +6,259 @@
 //  Copyright (c) 2014 Fabien Sanglard. All rights reserved.
 //
 #include "precomp.h"
+#include "../engine/GLBatch.h"
 #include "SCCockpit.h"
+#include "../commons/GraphicsSettings.h"
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
 #include <climits>
+#include <unordered_map>
+#include <unordered_set>
 #include "../engine/gametimer.h"
+#include "../wing_commander_3/WC3Globals.h"
+#include "../wing_commander_3/WC3Font.h"
 
+// ..\..\DATA\COCKPITS\TARGSHAP.PAK — per-ship-type target-diagram art
+// (bracket/lock animation + per-facing shield/hull status), documented by
+// the user from the WC3 manual/asset notes:
+//
+//   Outer PAK: 37 entries (000.SHP..036.SHP), one per ship type/class.
+//   Each entry is itself a nested PAK (a ".SHP" is the same container
+//   format as ".PAK" elsewhere in this codebase — see e.g. TM.SHP in
+//   SCTrainingMenu.cpp) of either 51 or 11 RLEShape frames:
+//     51 frames: 0-5 targeting animation; 6-8/9-11/12-14/15-17 top/left/
+//     bottom/right shield (3 frames each); 18-19/20-21/22-23/24-25 top/
+//     left/bottom/right hull damage (2 frames each); 26-51 repeats 0-25 at
+//     SVGA (hi-res) scale.
+//     11 frames: 0-5 targeting animation; 6-11 same at SVGA scale (no
+//     per-facing shield/hull frames at all — presumably simple/inanimate
+//     targets that don't track quadrant damage).
+//
+// Mapping "top/left/bottom/right" (a target diagram, viewed from above) to
+// this engine's own front/back/left/right (SCMissionActors::shield_front
+// etc.) is an assumed but unconfirmed convention: top=front (nose), bottom=
+// back (tail), matching how a top-down ship silhouette is normally drawn.
+namespace TargShapeIndex {
+    // Ship model filename (MISN_PART::member_name, upper-cased) -> TARGSHAP
+    // index. Built from the user's ship-name list cross-referenced against
+    // real filenames in DATA\OBJECTS\ (OBJECTS.TRE) — only kept where a
+    // filename match was reasonably confident; ships left out simply get no
+    // TARGSHAP art (SelectTargShapeSet returns nullptr) rather than risk
+    // showing the wrong ship's diagram. "P"-suffixed fighter filenames
+    // (HELLCATP/TBOLTP/ARROWP/EXCALP) follow this codebase's own established
+    // player-flyable-variant naming convention (see WC3Mission.cpp's
+    // buildActorFromPart, HELLCATP donor-matching). KDESD/KCRUD/EXCALD-style
+    // "D"-suffixed names elsewhere in OBJECTS.TRE are that same ship's
+    // destroyed/debris variant, not a distinct class, so deliberately not
+    // used here.
+    static const std::unordered_map<std::string, int> kShipNameToIndex = {
+        {"ARROWP", 1},
+        {"HELLCATP", 2},
+        {"TBOLTP", 3},
+        {"EXCALP", 4},
+        {"VICTORY", 5},
+        {"SHUTTLE", 7},
+        {"BEHEMOTH", 8},
+        {"DARKET", 10},
+        {"DRALTHI", 11},
+        {"VAKTOTH", 12},
+        {"BLOODFNG", 13},
+        {"STRAKHA", 14},
+        {"PAKTAHN", 15},
+        {"KCORV", 16},
+        {"KCRUISER", 17},
+        // Light vs Heavy Destroyer (18/19): guessed from KDESTL's "L" suffix
+        // vs plain KDEST — not confirmed against the manual.
+        {"KDESTL", 18},
+        {"KDEST", 19},
+        {"KTRN", 20},
+        {"KDREAD", 21},
+        {"KCARRIER", 22},
+        {"TCRUISER", 24},
+        {"TDEST", 25},
+        {"TTRANS", 26},
+        {"KASBASE", 30},
+        {"ASTRFTR", 31},
+        {"EKAPSHI", 32},
+        {"KTRAND", 33},
+        {"SORTHAK", 34},
+        {"FAULT", 35},
+        {"KSGENR", 36},
+    };
+    // Lazily loaded/cached, keyed by index — the outer PAK and each nested
+    // per-ship SHP only ever need decoding once, not per-cockpit-instance
+    // or per-frame.
+    static PakArchive* s_outerPak = nullptr;
+    static bool s_outerPakLoadAttempted = false;
+    static std::unordered_map<int, RSImageSet*> s_shapesByIndex;
+
+    static RSImageSet* GetShapesForIndex(int index) {
+        auto cached = s_shapesByIndex.find(index);
+        if (cached != s_shapesByIndex.end()) {
+            return cached->second;
+        }
+        if (!s_outerPakLoadAttempted) {
+            s_outerPakLoadAttempted = true;
+            TreEntry* entry = AssetManager::getInstance().GetEntryByName("..\\..\\DATA\\COCKPITS\\TARGSHAP.PAK");
+            if (entry != nullptr) {
+                s_outerPak = new PakArchive();
+                s_outerPak->InitFromRAM("TARGSHAP.PAK", entry->data, entry->size);
+                printf("DEBUG TARGSHAP: loaded, numEntries=%zu\n", s_outerPak->GetNumEntries());
+            } else {
+                printf("DEBUG TARGSHAP: TreEntry not found\n");
+            }
+        }
+        if (s_outerPak == nullptr || !s_outerPak->IsReady() || (size_t)index >= s_outerPak->GetNumEntries()) {
+            return nullptr;
+        }
+        PakEntry* shipEntry = s_outerPak->GetEntry(index);
+        if (shipEntry == nullptr || shipEntry->size == 0) {
+            return nullptr;
+        }
+        PakArchive nested;
+        nested.InitFromRAM("TARGSHAP.PAK entry", shipEntry->data, shipEntry->size);
+        RSImageSet* set = new RSImageSet();
+        set->InitFromSubPakEntry(&nested);
+        printf("DEBUG TARGSHAP: index=%d nestedEntries=%zu decodedFrames=%zu\n",
+               index, nested.GetNumEntries(), set->GetNumImages());
+        s_shapesByIndex[index] = set;
+        return set;
+    }
+    // Returns nullptr if this actor's model has no confident TARGSHAP
+    // mapping (see kShipNameToIndex) or the archive/entry couldn't be
+    // loaded.
+    static RSImageSet* SelectTargShapeSet(SCMissionActors* actor) {
+        if (actor == nullptr || actor->object == nullptr) {
+            return nullptr;
+        }
+        std::string name = actor->object->member_name;
+        std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+        auto it = kShipNameToIndex.find(name);
+        if (it == kShipNameToIndex.end()) {
+            return nullptr;
+        }
+        return GetShapesForIndex(it->second);
+    }
+}
+
+// Capital-ship classification for the Target Radar's cross-vs-dot marker
+// (see RenderMFDSTargetRadarWC3). Ship-name-based, same convention/data
+// source as TargShapeIndex::kShipNameToIndex above (MISN_PART::member_name,
+// upper-cased) — not derived from any engine field since none currently
+// distinguishes ship class. Real-world WC3 ship-class knowledge, not
+// independently re-verified against the manual: Kilrathi/Terran capitals,
+// carriers, transports, and stations are listed; fighters (including
+// Kilrathi ones — Dralthi/Vaktoth/Bloodfang/Strakha/Paktahn) are not.
+// Finds the palette entry closest (by RGB distance) to the requested color.
+// The HUD is drawn entirely through palette-index primitives (color 223 is
+// used everywhere else in this file for a fixed green/amber look), so there
+// is no direct way to ask for "red" or "blue" — the actual index that looks
+// red/blue depends on whatever VGAPalette this cockpit loaded.
+static uint8_t ClosestPaletteIndex(const VGAPalette &pal, uint8_t r, uint8_t g, uint8_t b) {
+    uint8_t best = 0;
+    int bestDist = INT_MAX;
+    for (int i = 0; i < 256; i++) {
+        int dr = (int)pal.colors[i].r - r;
+        int dg = (int)pal.colors[i].g - g;
+        int db = (int)pal.colors[i].b - b;
+        int dist = dr * dr + dg * dg + db * db;
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = (uint8_t)i;
+        }
+    }
+    return best;
+}
+
+// Draws a ship's TARGSHAP.PAK target diagram (targeting/lock animation
+// frames 0-5, plus per-facing shield/armor tiers when the 51-frame variant
+// has them) centered at `center`. Shared by RenderTargetWithCam (the
+// full-screen HUD-projected target overlay) and RenderMFDSTarget (the
+// right MFD's fixed panel) — same art, same layout, different callers'
+// idea of where "the target's on-screen position" is.
+// Per-facing shield (3-tier) + hull damage (2-tier) indicators — only
+// present in the 51-frame TARGSHAP variant (see TargShapeIndex's own layout
+// comment). Top=front/Bottom=back/Left=left/Right=right is an assumed,
+// unconfirmed top-down-diagram convention. Screen offsets around center are
+// a first guess pending live-visual tuning, same as every other hand-placed
+// gauge position this session. Split out from DrawShipTargetDiagram (below)
+// so RenderMFDSShield can reuse just this part for the player's own ship —
+// the target-lock scan animation DrawShipTargetDiagram also draws makes no
+// sense on a "my own ship's shield status" page.
+static void DrawShipFacingDiagram(FrameBuffer *fb, Point2D center, SCMissionActors *targetActor, RSImageSet *targShapes) {
+    size_t numFrames = targShapes->GetNumImages();
+    if (numFrames >= 26 && targetActor != nullptr) {
+        struct FacingGauge {
+            float current, maxVal;
+            uint32_t shieldFrameBase;  // 3 frames
+            uint32_t armorFrameBase;   // 2 frames
+            int dx, dy;                // screen offset from center
+        };
+        FacingGauge facings[4] = {
+            { targetActor->shield_front, targetActor->max_shield_front, 6,  18, 0, -14 },  // top/front
+            { targetActor->shield_left,  targetActor->max_shield_left,   9,  20, -14, 0 }, // left
+            { targetActor->shield_back,  targetActor->max_shield_back,   12, 22, 0, 14 },  // bottom/back
+            { targetActor->shield_right, targetActor->max_shield_right,  15, 24, 14, 0 },  // right
+        };
+        float armorFacing[4] = { targetActor->armor_front, targetActor->armor_left,
+                                  targetActor->armor_back, targetActor->armor_right };
+        float armorMaxFacing[4] = { targetActor->max_armor_front, targetActor->max_armor_left,
+                                     targetActor->max_armor_back, targetActor->max_armor_right };
+        for (int i = 0; i < 4; i++) {
+            Point2D facingPos = { center.x + facings[i].dx, center.y + facings[i].dy };
+            if (facings[i].maxVal > 0.0f) {
+                float frac = facings[i].current / facings[i].maxVal;
+                if (frac < 0.0f) frac = 0.0f;
+                if (frac > 1.0f) frac = 1.0f;
+                // 3 frames: full/damaged/critical.
+                uint32_t tier = frac > 0.66f ? 0 : (frac > 0.33f ? 1 : 2);
+                RLEShape *shieldShape = targShapes->GetShape(facings[i].shieldFrameBase + tier);
+                if (shieldShape != nullptr) {
+                    Point2D pos = facingPos;
+                    pos.x = pos.x - shieldShape->GetWidth() / 2;
+                    pos.y = pos.y - shieldShape->GetHeight() / 2;
+                    shieldShape->SetPosition(&pos);
+                    fb->drawShape(shieldShape);
+                }
+            }
+            if (armorMaxFacing[i] > 0.0f) {
+                // 2 frames: pristine (0) vs any damage (1).
+                uint32_t tier = (armorFacing[i] >= armorMaxFacing[i]) ? 0 : 1;
+                RLEShape *armorShape = targShapes->GetShape(facings[i].armorFrameBase + tier);
+                if (armorShape != nullptr) {
+                    Point2D pos = facingPos;
+                    pos.x = pos.x - armorShape->GetWidth() / 2;
+                    pos.y = pos.y - armorShape->GetHeight() / 2;
+                    armorShape->SetPosition(&pos);
+                    fb->drawShape(armorShape);
+                }
+            }
+        }
+    }
+}
+
+// Draws a ship's TARGSHAP.PAK target diagram: targeting/lock animation
+// (frames 0-5) plus, via DrawShipFacingDiagram, per-facing shield/armor
+// tiers when the 51-frame variant has them. Shared by RenderTargetWithCam
+// (the full-screen HUD-projected target overlay) and RenderMFDSTarget (the
+// right MFD's fixed panel).
+static void DrawShipTargetDiagram(FrameBuffer *fb, Point2D center, SCMissionActors *targetActor, RSImageSet *targShapes) {
+    // Targeting/lock animation: frames 0-5, always
+    // present regardless of the 51 vs 11 frame variant.
+    static uint32_t targetAnimTick = 0;
+    targetAnimTick++;
+    size_t animFrame = (targetAnimTick / 4) % 6;
+    RLEShape *animShape = targShapes->GetShape(animFrame);
+    if (animShape != nullptr) {
+        Point2D animPos = center;
+        animPos.x = animPos.x - animShape->GetWidth() / 2;
+        animPos.y = animPos.y - animShape->GetHeight() / 2;
+        animShape->SetPosition(&animPos);
+        fb->drawShape(animShape);
+    }
+    DrawShipFacingDiagram(fb, center, targetActor, targShapes);
+}
 
 static bool projectRealToHUD( Vector3D targetWorld,  Matrix planeFromWorld,  Vector3D eyeLocal,
                               FrameBuffer *fb, int &outX, int &outY) {
@@ -77,8 +323,78 @@ bool SCCockpit::project_to_screen(Vector3D coord, int &Xout, int &Yout) {
     }
     return false;
 }
+Point2D SCCockpit::GetWC3MfdSize() {
+    if (this->cockpit != nullptr && !this->cockpit->instrumentShapes.empty()) {
+        const RSCockpit::WC3VDULayout &vdu = g_ifVGA ? this->cockpit->vgaFrontVDU : this->cockpit->svgaFrontVDU;
+        if (vdu.valid) {
+            return {vdu.width, vdu.height};
+        }
+    }
+    return {115, 95};
+}
+void SCCockpit::SetWC3Resolution(bool vga) {
+    g_ifVGA = vga;
+    VGA.SetCanvasResolution(vga ? 320 : 640, vga ? 200 : 480);
+    // target_framebuffer/comm_framebuffer/debug_framebuffer/mfd_*_framebuffer
+    // are all sized from g_ifVGA at SCCockpit::init() time and never
+    // revisited elsewhere — resize them here now that this is a live,
+    // repeatable toggle rather than a one-off settings choice.
+    if (this->target_framebuffer != nullptr) {
+        delete this->target_framebuffer;
+        this->target_framebuffer = new FrameBuffer(vga ? 320 : 640, vga ? 200 : 480);
+    }
+    if (this->comm_framebuffer != nullptr) {
+        delete this->comm_framebuffer;
+        this->comm_framebuffer = new FrameBuffer(vga ? 320 : 640, 13);
+    }
+    if (this->debug_framebuffer != nullptr) {
+        delete this->debug_framebuffer;
+        this->debug_framebuffer = new FrameBuffer(vga ? 320 : 640, vga ? 200 : 480);
+    }
+    // GetWC3MfdSize reads g_ifVGA (already updated above) to pick the real
+    // per-resolution VDU size.
+    Point2D mfdSize = this->GetWC3MfdSize();
+    if (this->mfd_right_framebuffer != nullptr) {
+        delete this->mfd_right_framebuffer;
+        this->mfd_right_framebuffer = new FrameBuffer(mfdSize.x, mfdSize.y);
+    }
+    if (this->mfd_left_framebuffer != nullptr) {
+        delete this->mfd_left_framebuffer;
+        this->mfd_left_framebuffer = new FrameBuffer(mfdSize.x, mfdSize.y);
+    }
+}
+// F1: SVGA_COCKPIT -> VGA_COCKPIT -> HUD_ONLY -> SVGA_COCKPIT. Only the two
+// *_COCKPIT states are a resolution choice (SetWC3Resolution); HUD_ONLY
+// deliberately keeps whichever resolution was already active — it's a
+// "hide the cockpit frame" toggle, not a third resolution. This is a
+// session-only override (doesn't call saveGraphicsSettings, unlike the
+// Options menu's own VGA/SVGA choice) — cycling views in flight shouldn't
+// silently rewrite the player's saved default.
+void SCCockpit::CycleViewMode() {
+    switch (this->cockpit_view_mode) {
+    case WC3CockpitViewMode::SVGA_COCKPIT:
+        this->cockpit_view_mode = WC3CockpitViewMode::VGA_COCKPIT;
+        this->SetWC3Resolution(true);
+        break;
+    case WC3CockpitViewMode::VGA_COCKPIT:
+        this->cockpit_view_mode = WC3CockpitViewMode::HUD_ONLY;
+        break;
+    case WC3CockpitViewMode::HUD_ONLY:
+        this->cockpit_view_mode = WC3CockpitViewMode::SVGA_COCKPIT;
+        this->SetWC3Resolution(false);
+        break;
+    }
+}
 SCCockpit::SCCockpit() {
-    this->cockpit_camera.setPersective(45.0f, 320.0f / 200.0f, 0.1f, 10000.0f);
+    // Matches the current logical canvas aspect ratio (see
+    // commons/GraphicsSettings.h/RSVGA::SetCanvasResolution) — 320x200 for
+    // VGA, 640x480 for SVGA. Read g_ifVGA directly rather than
+    // VGA.GetCanvasWidth()/Height(): this constructor can run before
+    // RSVGA::init() has applied the setting, but g_ifVGA itself is set
+    // during early startup regardless (see main.cpp's wc3_options.cfg
+    // load), so it's always current.
+    float aspect = g_ifVGA ? (320.0f / 200.0f) : (640.0f / 480.0f);
+    this->cockpit_camera.setPersective(45.0f, aspect, 0.1f, 10000.0f);
 }
 SCCockpit::~SCCockpit() {
     if (this->hud_framebuffer) {
@@ -124,6 +440,12 @@ void SCCockpit::init() {
         if (player_plane->object->entity != nullptr) {
             RSEntity *e = player_plane->object->entity;
             cockpit_def = Assets.GetEntryByName("..\\..\\DATA\\OBJECTS\\" + e->cockpit_name + ".IFF");
+            // WC3's cockpit IFFs (MEDPIT.IFF, ARWPIT.IFF, etc., from
+            // MISSIONS.TRE) live under DATA\COCKPITS\, not DATA\OBJECTS\ (the
+            // Strike Commander convention above). Try that path too before
+            // falling through to the SC-specific F16/F22 fallbacks below.
+            if (cockpit_def == nullptr)
+                cockpit_def = Assets.GetEntryByName("..\\..\\DATA\\COCKPITS\\" + e->cockpit_name + ".IFF");
         }
     }
     if (cockpit_def == nullptr) {
@@ -140,40 +462,87 @@ void SCCockpit::init() {
     }
     if (cockpit_def != nullptr) {
         cockpit = new RSCockpit();
-        cockpit->InitFromRam(cockpit_def->data, cockpit_def->size);
+        // WC3's cockpit IFFs use a top-level "FORM COCK", entirely unrelated
+        // to Strike Commander's "FORM CKPT" — detect it from the tag at
+        // byte offset 8 (after the "FORM"/size header) and dispatch to the
+        // WC3-specific parser instead.
+        bool isWC3Cockpit = cockpit_def->size >= 12 &&
+                             memcmp(cockpit_def->data + 8, "COCK", 4) == 0;
+        if (isWC3Cockpit) {
+            cockpit->InitFromWC3Ram(cockpit_def->data, cockpit_def->size);
+        } else {
+            cockpit->InitFromRam(cockpit_def->data, cockpit_def->size);
+        }
+        // Framebuffers/fonts are needed for MFD and instrument rendering
+        // regardless of whether SC's HUD.IFF-based analog HUD asset exists —
+        // WC3 doesn't ship one (its own HUD is drawn from the cockpit's own
+        // sprite atlas instead, not yet wired up), so this used to be gated
+        // on hud_def and left every framebuffer/font null for WC3.
+        for (int i = 0; i < 36; i++) {
+            HudLine line;
+            line.start.x = 0;
+            line.start.y = 0 + i * 20;
+            line.end.x = 70;
+            line.end.y = 0 + i * 20;
+            horizon.push_back(line);
+        }
+        hud_framebuffer = new FrameBuffer(150, 128);
+        // Sized from the real per-cockpit COCK>VDU chunk when available
+        // (InitFromWC3Ram already ran above, so vgaFrontVDU/svgaFrontVDU
+        // are populated by now) — falls back to the old 115x95 guess only
+        // if the file has no valid VDU chunk, or this is an SC cockpit.
+        Point2D mfdSize = this->GetWC3MfdSize();
+        mfd_right_framebuffer = new FrameBuffer(mfdSize.x, mfdSize.y);
+        mfd_left_framebuffer = new FrameBuffer(mfdSize.x, mfdSize.y);
+        Point2D raws_size = {this->cockpit->MONI.INST.RAWS.ZOOM.GetWidth(), this->cockpit->MONI.INST.RAWS.ZOOM.GetHeight()};
+        raws_framebuffer = new FrameBuffer((std::max)(raws_size.x, 1), (std::max)(raws_size.y, 1));
+        // target_framebuffer spans the whole logical canvas (the targeting
+        // overlay's own bounding box, see RSCockpit::targetHudVGA/SVGA, is
+        // defined in that same canvas' coordinate space) — sized to match
+        // g_ifVGA rather than hardcoded 320x200, so SVGA mode's box
+        // ((0,0)-(639,268), a genuinely different 4:3 canvas, not a 2x
+        // scale of VGA's) doesn't draw or clip against an undersized
+        // buffer. comm_framebuffer's width follows the same canvas width
+        // (it's a full-width text banner); its height (13, a font-line
+        // height) doesn't scale with resolution.
+        target_framebuffer = new FrameBuffer(g_ifVGA ? 320 : 640, g_ifVGA ? 200 : 480);
+        alti_framebuffer = new FrameBuffer(33, 29);
+        speed_framebuffer = new FrameBuffer(36, 29);
+        // 22x49 matches WC3CockpitShapeId::kBarMeterFillA's own frame size
+        // (MEDPIT.IFF) — only meaningful for WC3 cockpits, see
+        // RenderShieldGauge.
+        shield_framebuffer = new FrameBuffer(22, 49);
+        comm_framebuffer = new FrameBuffer(g_ifVGA ? 320 : 640, 13);
+        this->font = FontManager.GetFont("..\\..\\DATA\\FONTS\\SHUDFONT.SHP");
+        this->big_font = FontManager.GetFont("..\\..\\DATA\\FONTS\\HUDFONT.SHP");
+
         TreEntry *hud_def = Assets.GetEntryByName("..\\..\\DATA\\OBJECTS\\HUD.IFF");
         if (hud_def != nullptr) {
             hud = new RSHud();
             hud->InitFromRam(hud_def->data, hud_def->size);
-            for (int i = 0; i < 36; i++) {
-                HudLine line;
-                line.start.x = 0;
-                line.start.y = 0 + i * 20;
-                line.end.x = 70;
-                line.end.y = 0 + i * 20;
-                horizon.push_back(line);
-            }
-            hud_framebuffer = new FrameBuffer(150, 128);
-            mfd_right_framebuffer = new FrameBuffer(115, 95);
-            mfd_left_framebuffer = new FrameBuffer(115, 95);
-            Point2D raws_size = {this->cockpit->MONI.INST.RAWS.ZOOM.GetWidth(), this->cockpit->MONI.INST.RAWS.ZOOM.GetHeight()};
-            raws_framebuffer = new FrameBuffer(raws_size.x, raws_size.y);
-            target_framebuffer = new FrameBuffer(320, 200);
-            alti_framebuffer = new FrameBuffer(33, 29);
-            speed_framebuffer = new FrameBuffer(36, 29);
-            comm_framebuffer = new FrameBuffer(320, 13);
-            this->font = FontManager.GetFont("..\\..\\DATA\\FONTS\\SHUDFONT.SHP");
-            this->big_font = FontManager.GetFont("..\\..\\DATA\\FONTS\\HUDFONT.SHP");
         }
     }
-    debug_framebuffer = new FrameBuffer(320, 200);
+    debug_framebuffer = new FrameBuffer(g_ifVGA ? 320 : 640, g_ifVGA ? 200 : 480);
 }
 void SCCockpit::RenderMFDS(Point2D mfds, FrameBuffer *fb = nullptr) {
-    if (this->cockpit->MONI.SHAP.data == nullptr) {
-        return;
-    }
     if (!fb) {
         fb = VGA.getFrameBuffer();
+    }
+    // Clear the panel first. Not every MFD page draws an opaque
+    // full-panel background of its own (RenderMFDSWeapon has none), and
+    // RLE shape drawing only paints non-transparent pixels — without an
+    // explicit clear here, switching pages (e.g. weapons -> power) left
+    // the previous page's pixels visible underneath/around the new
+    // page's content instead of being replaced by it. This used to
+    // early-return before ever reaching here for WC3 cockpits (no
+    // MONI.SHAP casing — that's an SC-only asset), which is exactly the
+    // case that was missing this clear.
+    Point2D mfdSize = this->GetWC3MfdSize();
+    for (int row = 0; row < mfdSize.y; row++) {
+        fb->line(mfds.x, mfds.y + row, mfds.x + mfdSize.x - 1, mfds.y + row, 0);
+    }
+    if (this->cockpit->MONI.SHAP.data == nullptr) {
+        return;
     }
     this->cockpit->MONI.SHAP.SetPosition(&mfds);
     for (int i = 0; i < this->cockpit->MONI.SHAP.GetHeight(); i++) {
@@ -181,38 +550,433 @@ void SCCockpit::RenderMFDS(Point2D mfds, FrameBuffer *fb = nullptr) {
     }
     fb->drawShape(&this->cockpit->MONI.SHAP);
 }
+// Right MFD panel, per the user's spec: the generic COCK>SHAP scanning
+// animation (kTargetLockBox, id 8) while no target is selected, then
+// TARGSHAP.PAK's per-ship diagram (DrawShipTargetDiagram, shared with
+// RenderTargetWithCam's full-screen HUD overlay) once current_target_actor
+// is set. Always called for the right MFD (see RenderHUD's dispatch) —
+// unlike the left MFD, not gated behind show_radars/show_weapons/etc.
+void SCCockpit::RenderMFDSTarget(Point2D pmfd, FrameBuffer *fb) {
+    if (!fb) {
+        fb = VGA.getFrameBuffer();
+    }
+    this->RenderMFDS(pmfd, fb);
+    // Real WC3 MFD panel size from the cockpit file's own COCK>VDU chunk
+    // (GetWC3MfdSize) rather than MONI.SHAP.GetWidth/Height — that field is
+    // SC-only (never populated for WC3 cockpits) and RLEShape's dist fields
+    // have no default initializer, so it reads uninitialized memory here
+    // rather than reliably 0.
+    Point2D mfdSize = this->GetWC3MfdSize();
+    Point2D center = {pmfd.x + mfdSize.x / 2, pmfd.y + mfdSize.y / 2};
+    // Background grid — user-confirmed (2026-07 session, from the same
+    // id-by-id contact sheet used to identify the shield gauge): id 29
+    // (kRadarScreenGrid)/59 (its SVGA pair) is specifically the shield
+    // and targeting displays' background, not a generic panel backdrop
+    // reused elsewhere. RenderMFDSShield already draws it indirectly
+    // (its mode=0x00 INST record resolves to this same id/pair per
+    // cockpit file); this panel has no such per-mode INST record of its
+    // own (it's the fixed right MFD, not one of the paged left-MFD
+    // modes), so it's looked up directly here instead.
+    {
+        auto bgIt = this->cockpit->instrumentShapes.find(g_ifVGA ? 59 : 29);
+        if (bgIt != this->cockpit->instrumentShapes.end() && bgIt->second != nullptr && bgIt->second->GetNumImages() > 0) {
+            RLEShape *bgShape = bgIt->second->GetShape(0);
+            if (bgShape != nullptr) {
+                Point2D bgPos = pmfd;
+                bgShape->SetPosition(&bgPos);
+                fb->drawShape(bgShape);
+            }
+        }
+    }
+    if (this->current_target_actor == nullptr) {
+        auto it = this->cockpit->instrumentShapes.find(WC3CockpitShapeId::kTargetLockBox);
+        if (it == this->cockpit->instrumentShapes.end() || it->second == nullptr || it->second->GetNumImages() == 0) {
+            return;
+        }
+        static uint32_t scanTick = 0;
+        scanTick++;
+        size_t frame = (scanTick / 4) % it->second->GetNumImages();
+        RLEShape *shape = it->second->GetShape(frame);
+        if (shape == nullptr) {
+            return;
+        }
+        Point2D pos = center;
+        pos.x = pos.x - shape->GetWidth() / 2;
+        pos.y = pos.y - shape->GetHeight() / 2;
+        shape->SetPosition(&pos);
+        fb->drawShape(shape);
+        return;
+    }
+    RSImageSet *targShapes = TargShapeIndex::SelectTargShapeSet(this->current_target_actor);
+    if (targShapes == nullptr || targShapes->GetNumImages() == 0) {
+        return;
+    }
+    DrawShipTargetDiagram(fb, center, this->current_target_actor, targShapes);
+}
+// Left MFD, 'p' key: 4 power meters. See RenderMFDSPower's own body comment
+// for the real COCK>FRNT>INST mode=0x060a group this draws from. The
+// fill/level bars and E/W/S/D letters are a simulated overlay (see
+// SCCockpit::power_alloc/CyclePowerOrShield/AdjustSelectedPower) — no chunk
+// anywhere records real per-meter fill art or a fill/level value, so the
+// bars are drawn as plain solid rectangles rather than fabricated shape
+// ids (see this function's history for why kBarMeterFillSmallA/B were
+// dropped as a mislabeled guess). SC-format cockpits have no equivalent
+// concept at all, so this is a no-op there (just the shared MFD
+// background/border).
+void SCCockpit::RenderMFDSPower(Point2D pmfd, FrameBuffer *fb) {
+    if (!fb) {
+        fb = VGA.getFrameBuffer();
+    }
+    this->RenderMFDS(pmfd, fb);
+    if (this->cockpit->instrumentShapes.empty()) {
+        return;
+    }
+    // Real per-file layout: COCK>FRNT>INST's only repeating MFD-relative
+    // group in the whole table (every other record is a singleton) is
+    // mode=0x060a, 4 records, shape id 47 (kGaugeBezelHorizontalSmall) —
+    // confirmed universal, byte-identical relative x/y across all 6 real
+    // cockpit files checked (5 of 6 share x=16,y=6/15/24/33; MEDPIT alone
+    // is 1px off at y=5/14/23/32, unexplained). This is the real "4 power
+    // meters" layout; file order top-to-bottom is user-confirmed as
+    // Engines/Weapons/Shields/Damage-repair (E/W/S/D).
+    // Hand-rolled 5x7 bitmap glyphs, not RSFont/WC3Font: RSFont (this->font/
+    // big_font) is an SC-only asset — WC3 cockpits never populate it (see
+    // WC3NavMap.h's "WC3 has no equivalent asset for at all" comment,
+    // confirmed live: this->big_font null-derefs here for a real WC3
+    // cockpit). The real WC3 text path (WC3Font/WC3Globals) lives in the
+    // wing_commander_3/ layer, which strike_commander/ (this file) can't
+    // depend on without the same virtual-hook-override machinery
+    // SCNavMap/WC3NavMap needed for its own text overlay — out of scope
+    // for 4 static letters, so they're drawn directly instead.
+    static const char *const kGlyphE[7] = {"11111", "10000", "10000", "11110", "10000", "10000", "11111"};
+    static const char *const kGlyphW[7] = {"10001", "10001", "10001", "10101", "10101", "11011", "10001"};
+    static const char *const kGlyphS[7] = {"01111", "10000", "10000", "01110", "00001", "00001", "11110"};
+    static const char *const kGlyphD[7] = {"11110", "10001", "10001", "10001", "10001", "10001", "11110"};
+    static const char *const *const kGaugeGlyphs[4] = {kGlyphE, kGlyphW, kGlyphS, kGlyphD};
+    auto drawGlyph = [&](const char *const *glyph, int x, int y, uint8_t color) {
+        for (int row = 0; row < 7; row++) {
+            const char *line = glyph[row];
+            for (int col = 0; col < 5; col++) {
+                if (line[col] == '1') {
+                    fb->plot_pixel(x + col, y + row, color);
+                }
+            }
+        }
+    };
+    uint8_t colorRed = ClosestPaletteIndex(this->palette, 255, 0, 0);
+    uint8_t colorGreen = ClosestPaletteIndex(this->palette, 0, 255, 0);
+    auto &layouts = g_ifVGA ? this->cockpit->vgaFrontInstruments : this->cockpit->svgaFrontInstruments;
+    int gaugeIndex = 0;
+    for (auto &rec : layouts) {
+        if (rec.mode != 0x060a) continue;
+        auto it = this->cockpit->instrumentShapes.find(rec.shapeId);
+        if (it == this->cockpit->instrumentShapes.end() || it->second == nullptr || it->second->GetNumImages() == 0) {
+            continue;
+        }
+        RLEShape *shape = it->second->GetShape(0);
+        if (shape == nullptr) {
+            continue;
+        }
+        Point2D pos = {pmfd.x + rec.x, pmfd.y + rec.y};
+        shape->SetPosition(&pos);
+        fb->drawShape(shape);
+
+        if (gaugeIndex < 4) {
+            // "Fill" is how much of the real gauge graphic's own left edge
+            // is shown — user-confirmed real behavior ("only the first
+            // quarter of each gauge graphic is visible" by default, i.e.
+            // the graphic itself is cropped, not a bezel plus a
+            // separately-colored overlay bar). Draw the whole shape, then
+            // paint over the unlit portion (from the fill point to its
+            // right edge) with black, rather than clipping the draw call
+            // itself. Fraction is this subsystem's share of the 100-unit
+            // power pool: default 25/100 -> exactly a quarter shown.
+            float frac = this->power_alloc[gaugeIndex] / kTotalPowerUnits;
+            if (frac < 0.0f) frac = 0.0f;
+            if (frac > 1.0f) frac = 1.0f;
+            int visibleW = (int)(shape->GetWidth() * frac + 0.5f);
+            int maskX = pos.x + visibleW;
+            // Inset 7px off the top/bottom and 1px off the right edge so
+            // the mask covers the gauge's interior track only, leaving its
+            // bezel border visible on those three sides.
+            int maskW = shape->GetWidth() - visibleW - 1;
+            int maskTop = 7;
+            int maskBottom = shape->GetHeight() - 7;
+            if (maskW > 0) {
+                for (int row = maskTop; row < maskBottom; row++) {
+                    fb->line(maskX, pos.y + row, maskX + maskW - 1, pos.y + row, 0);
+                }
+            }
+
+            bool selected = (gaugeIndex == this->selected_power_gauge);
+            drawGlyph(kGaugeGlyphs[gaugeIndex], pmfd.x + rec.x - 10, pos.y + (shape->GetHeight() - 7) / 2,
+                      selected ? colorGreen : colorRed);
+        }
+        gaugeIndex++;
+    }
+}
+
+// MDFS_POWER ('p') handler — user-confirmed real behavior (2026-07
+// session): rotates through 5 states rather than a plain open/close
+// toggle — gauge E highlighted, W, S, D, then the shield/hull MFD, then
+// back to gauge E. There is no "closed" state reachable via 'p' itself;
+// the panel only goes away by switching to a different MFD page (radar/
+// weapons/comm/damage/cam), same as every other show_* flag. Direct 's'
+// (MDFS_SHIELD) still independently toggles the shield page on its own,
+// unrelated to this cycle.
+void SCCockpit::CyclePowerOrShield() {
+    if (this->show_power) {
+        this->selected_power_gauge++;
+        if (this->selected_power_gauge > 3) {
+            this->selected_power_gauge = 0;
+            this->show_power = false;
+            this->show_shield = true;
+        }
+    } else if (this->show_shield) {
+        this->show_shield = false;
+        this->show_power = true;
+        this->selected_power_gauge = 0;
+    } else {
+        this->show_power = true;
+        this->selected_power_gauge = 0;
+    }
+}
+
+// Power-allocation MFD ('[' decreases, ']' increases the selected gauge —
+// see SCStrike's context-sensitive RADAR_ZOOM_IN/OUT handler). delta is
+// signed whole power units to move into (positive) or out of (negative)
+// the currently selected gauge; the 4 gauges always sum to
+// kTotalPowerUnits, so whatever's applied here is taken from/returned to
+// the other three, split proportionally to their current share (falls
+// back to an even split if they're all at 0, e.g. after repeatedly maxing
+// one gauge out).
+void SCCockpit::AdjustSelectedPower(float delta) {
+    int sel = this->selected_power_gauge;
+    if (sel < 0 || sel > 3) return;
+    float otherSum = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        if (i != sel) otherSum += this->power_alloc[i];
+    }
+    float applied = delta;
+    if (applied > 0.0f) {
+        applied = (std::min)(applied, otherSum);
+        applied = (std::min)(applied, kTotalPowerUnits - this->power_alloc[sel]);
+    } else if (applied < 0.0f) {
+        applied = -(std::min)(-applied, this->power_alloc[sel]);
+    }
+    if (applied == 0.0f) return;
+    this->power_alloc[sel] += applied;
+    float remaining = -applied;
+    for (int i = 0; i < 4; i++) {
+        if (i == sel) continue;
+        float share = (otherSum > 0.0f) ? (this->power_alloc[i] / otherSum) : (1.0f / 3.0f);
+        this->power_alloc[i] += remaining * share;
+        if (this->power_alloc[i] < 0.0f) this->power_alloc[i] = 0.0f;
+    }
+}
+
+// Left MFD, 's' key: shield status — user-confirmed real page. COCK>FRNT>
+// INST mode=0x00 is the real per-file backdrop for this page: a single
+// record, shape id 59 (kGaugeBezelHorizontalSmall's sibling
+// kRadarScreenGridSVGA — a generic grid-style panel background, not
+// exclusively "radar"; reused here since SYS's own slot 0 is the real
+// "Shields" subsystem id, matching this page number).
+//
+// The per-facing shield/hull diagram itself does NOT come from
+// TARGSHAP.PAK (that's for displaying OTHER ships once targeted/scanned —
+// see RenderMFDSTarget/DrawShipTargetDiagram). User-confirmed (2026-07
+// session, identified live from a full id-by-id contact sheet dumped
+// from this cockpit's own COCK>SHAP, cross-checked against a real
+// screenshot): it's this cockpit's own shape id 9, 24 frames, real
+// colors confirmed via the cockpit's own PALETTE.IFF — each facing gets
+// its own dedicated 3-frame block (3/2/1 lines-or-tiers, frame = base +
+// (3-tier)) —
+//   top(front)=0-2, right=3-5, bottom(back)=6-8, left=9-11: shield ticks (yellow)
+//   top(front)=12-14, right=15-17, bottom(back)=18-20, left=21-23: hull frame (orange/red)
+// Driven by the same real per-facing simulation data
+// (shield_front/back/left/right + max_shield_*, armor_front/back/
+// left/right + max_armor_*) RenderShieldGauge/the old TARGSHAP path
+// read, just for the player's own ship instead of the current target.
+void SCCockpit::RenderMFDSShield(Point2D pmfd, FrameBuffer *fb) {
+    if (!fb) {
+        fb = VGA.getFrameBuffer();
+    }
+    this->RenderMFDS(pmfd, fb);
+    if (this->cockpit->instrumentShapes.empty()) {
+        return;
+    }
+    Point2D mfdSize = this->GetWC3MfdSize();
+    Point2D center = {pmfd.x + mfdSize.x / 2, pmfd.y + mfdSize.y / 2};
+
+    auto &layouts = g_ifVGA ? this->cockpit->vgaFrontInstruments : this->cockpit->svgaFrontInstruments;
+    for (auto &rec : layouts) {
+        if ((rec.mode >> 8) != 0x00) continue;
+        auto it = this->cockpit->instrumentShapes.find(rec.shapeId);
+        if (it == this->cockpit->instrumentShapes.end() || it->second == nullptr || it->second->GetNumImages() == 0) {
+            continue;
+        }
+        RLEShape *shape = it->second->GetShape(0);
+        if (shape == nullptr) continue;
+        Point2D pos = {pmfd.x + rec.x, pmfd.y + rec.y};
+        shape->SetPosition(&pos);
+        fb->drawShape(shape);
+    }
+
+    if (this->player_plane == nullptr || this->player_plane->pilot == nullptr) {
+        return;
+    }
+    auto gaugeIt = this->cockpit->instrumentShapes.find(9);
+    if (gaugeIt == this->cockpit->instrumentShapes.end() || gaugeIt->second == nullptr ||
+        gaugeIt->second->GetNumImages() < 18) {
+        return;
+    }
+    RSImageSet *gaugeSet = gaugeIt->second;
+    SCMissionActors *pilot = this->player_plane->pilot;
+
+    auto tierFor = [](float cur, float mx) -> int {
+        if (mx <= 0.0f) return 0;
+        float frac = cur / mx;
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+        if (frac > 0.66f) return 3;
+        if (frac > 0.33f) return 2;
+        if (frac > 0.0f) return 1;
+        return 0;
+    };
+    auto drawTier = [&](int tier, uint32_t facingBase, Point2D at) {
+        if (tier <= 0) return;
+        RLEShape *shape = gaugeSet->GetShape(facingBase + (3 - tier));
+        if (shape == nullptr) return;
+        // Not centered via GetWidth()/2,GetHeight()/2: every frame in
+        // this set declares the same large, mostly-transparent canvas
+        // (leftDist/rightDist/topDist/botDist are real per-frame
+        // registration-point offsets read from the file, not a
+        // symmetric bounding box), with visible content sitting close
+        // to the registration point itself and padding trailing off to
+        // the right/bottom. Halving the full declared width/height and
+        // subtracting it — the convention used elsewhere in this file
+        // for genuinely centered sprites — pushed every facing's
+        // content into the same top-left-ish spot regardless of which
+        // facing it was, which is the clustering the user reported.
+        // SetPosition's point IS the registration point, so it's used
+        // directly here.
+        shape->SetPosition(&at);
+        fb->drawShape(shape);
+    };
+
+    // Hand-placed offsets from center, matching the reference screenshot's
+    // proportions — pending live-visual tuning, same as every other
+    // hand-placed gauge position this session. Facing-to-frame-base
+    // mapping is user-confirmed (2026-07 session): top=front, right,
+    // bottom=back, left, each its own dedicated 3-frame block (not a
+    // shared horizontal/vertical pair as first guessed from the false-
+    // color contact sheet — top/bottom and left/right just happen to
+    // look visually identical to each other since they're both plain
+    // line clusters).
+    const int kShieldOfs = 24;
+    const int kHullOfs = 12;
+    // Left/right and top/bottom corrections (user-confirmed, 2026-07
+    // session, live-tuned against the running game): the registration
+    // point isn't at the visual center of this shape's content in
+    // either orientation, needing further hand-tuned shifts on top of
+    // the base kShieldOfs/kHullOfs radius.
+    const int kVerticalFacingUpOfs = 17;
+    const int kVerticalFacingOutOfs = 20;
+    const int kHorizontalFacingLeftOfs = 25;
+    const int kHorizontalFacingOutOfs = 10;
+    drawTier(tierFor(pilot->shield_front, pilot->max_shield_front), 0,
+             {center.x - kHorizontalFacingLeftOfs, center.y - kShieldOfs - kHorizontalFacingOutOfs});
+    drawTier(tierFor(pilot->shield_right, pilot->max_shield_right), 3,
+             {center.x + kShieldOfs + kVerticalFacingOutOfs, center.y - kVerticalFacingUpOfs});
+    drawTier(tierFor(pilot->shield_back, pilot->max_shield_back), 6,
+             {center.x - kHorizontalFacingLeftOfs, center.y + kShieldOfs + kHorizontalFacingOutOfs});
+    drawTier(tierFor(pilot->shield_left, pilot->max_shield_left), 9,
+             {center.x - kShieldOfs - kVerticalFacingOutOfs, center.y - kVerticalFacingUpOfs});
+
+    drawTier(tierFor(pilot->armor_front, pilot->max_armor_front), 12,
+             {center.x - kHorizontalFacingLeftOfs, center.y - kHullOfs - kHorizontalFacingOutOfs});
+    drawTier(tierFor(pilot->armor_right, pilot->max_armor_right), 15,
+             {center.x + kHullOfs + kVerticalFacingOutOfs, center.y - kVerticalFacingUpOfs});
+    drawTier(tierFor(pilot->armor_back, pilot->max_armor_back), 18,
+             {center.x - kHorizontalFacingLeftOfs, center.y + kHullOfs + kHorizontalFacingOutOfs});
+    drawTier(tierFor(pilot->armor_left, pilot->max_armor_left), 21,
+             {center.x - kHullOfs - kVerticalFacingOutOfs, center.y - kVerticalFacingUpOfs});
+}
 void SCCockpit::RenderTargetWithCam(Point2D top_left = {126, 5}, FrameBuffer *fb = nullptr) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
     }
+    // Real per-cockpit layout (COCK>VGA|SVGA>FRNT>TARG — see
+    // RSCockpit::targetHudVGA/SVGA) when available: VGA is (0,0)-(319,112),
+    // SVGA is (0,0)-(639,268) — byte-identical across every cockpit file
+    // checked (MEDPIT/HVYPIT/ARWPIT), so this is a universal WC3 layout,
+    // not something that needs per-ship lookup. Picks whichever matches
+    // the current g_ifVGA setting (see commons/GraphicsSettings.h) since
+    // target_framebuffer is now sized to match too. Falls back to the old
+    // hardcoded 68x85 box for SC-format cockpits (F16/F22), which never
+    // populate either.
     Point2D hud_size = {68, 85};
+    if (this->cockpit != nullptr) {
+        RSCockpit::TargetHudBox &targetHud = g_ifVGA ? this->cockpit->targetHudVGA : this->cockpit->targetHudSVGA;
+        if (targetHud.valid) {
+            top_left = {targetHud.xMin, targetHud.yMin};
+            hud_size = {targetHud.xMax - targetHud.xMin,
+                        targetHud.yMax - targetHud.yMin};
+        }
+    }
     Point2D bottom_right = {top_left.x + hud_size.x, top_left.y + hud_size.y};
 
     if (this->current_target != nullptr) {
         int Xhud, Yhud;
         if (project_to_screen(this->current_target->position, Xhud, Yhud)) {
-
-            // Check if the target is within HUD boundaries
+            // Check if the target is within HUD boundaries. This used to
+            // get immediately overwritten by a second, buggy check here
+            // that compared hudX against fb->height instead of hudY
+            // (copy-paste typo) — on top of the box itself being a
+            // hardcoded 68x85 guess instead of the real ~319x112 region
+            // above, targets past screen x=200 (of 320) were rejected
+            // outright regardless of the box. Between the two, the
+            // targeting display essentially never appeared. Confirmed by
+            // decoding the real COCK>VGA>FRNT>TARG chunk (see
+            // RSCockpit::targetHudVGA) directly from 3 different cockpit
+            // files.
             bool isInHud = (Xhud >= top_left.x && Xhud < bottom_right.x && Yhud >= top_left.y && Yhud < bottom_right.y);
             int hudX = Xhud - top_left.x;
             int hudY = Yhud - top_left.y;
-            isInHud = (hudX >= 0 && hudX < fb->width && hudX >= 0 && hudX < fb->height);
             // If the target is within the HUD boundaries, draw a targeting indicator
             if (isInHud) {
-                // Draw a targeting reticle at the position
                 Point2D targetPoint = {hudX + top_left.x, hudY + top_left.y};
-                RLEShape *targetShape = this->hud->small_hud->TARG->SHAPSET->GetShape(1);
-                targetPoint.x = targetPoint.x - targetShape->GetWidth() / 2;
-                targetPoint.y = targetPoint.y - targetShape->GetHeight() / 2;
-                targetShape->SetPosition(&targetPoint);
-                fb->drawShape(targetShape);
-                if (this->target_in_range && this->current_weapon_id != weapon_ids::ID_20MM) {
-                    RLEShape *inRangeShape = this->hud->small_hud->MISD->SHAP;
-                    Point2D inRangePos = {hudX + top_left.x, hudY + top_left.y};
-                    inRangePos.x = inRangePos.x - inRangeShape->GetWidth() / 2;
-                    inRangePos.y = inRangePos.y - inRangeShape->GetHeight() / 2;
-                    inRangeShape->SetPosition(&inRangePos);
-                    fb->drawShape(inRangeShape);
+                if (this->hud != nullptr) {
+                    // SC-format path (F16/F22 cockpits, which ship HUD.IFF).
+                    RLEShape *targetShape = this->hud->small_hud->TARG->SHAPSET->GetShape(1);
+                    Point2D reticlePos = targetPoint;
+                    reticlePos.x = reticlePos.x - targetShape->GetWidth() / 2;
+                    reticlePos.y = reticlePos.y - targetShape->GetHeight() / 2;
+                    targetShape->SetPosition(&reticlePos);
+                    fb->drawShape(targetShape);
+                    if (this->target_in_range && this->current_weapon_id != weapon_ids::ID_20MM) {
+                        RLEShape *inRangeShape = this->hud->small_hud->MISD->SHAP;
+                        Point2D inRangePos = targetPoint;
+                        inRangePos.x = inRangePos.x - inRangeShape->GetWidth() / 2;
+                        inRangePos.y = inRangePos.y - inRangeShape->GetHeight() / 2;
+                        inRangeShape->SetPosition(&inRangePos);
+                        fb->drawShape(inRangeShape);
+                    }
+                } else if (this->cockpit != nullptr) {
+                    // WC3 cockpits never ship HUD.IFF (this->hud stays
+                    // null) — the SC-format path above used to dereference
+                    // it unconditionally here, crashing the moment a target
+                    // was locked and in view. Use TARGSHAP.PAK's per-ship
+                    // target diagram art instead (see TargShapeIndex above) —
+                    // the correct, purpose-built resource for this, rather
+                    // than the cockpit's own generic instrumentShapes
+                    // (kTargetLockBox/kTargetHealthBar), which this used to
+                    // fall back to before TARGSHAP.PAK's existence/layout
+                    // was documented.
+                    RSImageSet *targShapes = TargShapeIndex::SelectTargShapeSet(this->current_target_actor);
+                    if (targShapes != nullptr && targShapes->GetNumImages() > 0) {
+                        DrawShipTargetDiagram(fb, targetPoint, this->current_target_actor, targShapes);
+                    }
                 }
             }
         }
@@ -489,10 +1253,10 @@ void SCCockpit::RenderTargetingReticle(FrameBuffer *fb, CHUD_SHAPE *reticleShape
             if (this->face == CP_BIG) {
                 diamond_size = 6;
             }
-            fb->lineWithBox(Xlead, Ylead - diamond_size, Xlead + diamond_size, Ylead, 223, 0, 320, 0, 200);
-            fb->lineWithBox(Xlead + diamond_size, Ylead, Xlead, Ylead + diamond_size, 223, 0, 320, 0, 200);
-            fb->lineWithBox(Xlead, Ylead + diamond_size, Xlead - diamond_size, Ylead, 223, 0, 320, 0, 200);
-            fb->lineWithBox(Xlead - diamond_size, Ylead, Xlead, Ylead - diamond_size, 223, 0, 320, 0, 200);
+            fb->lineWithBox(Xlead, Ylead - diamond_size, Xlead + diamond_size, Ylead, 223, 0, fb->width, 0, fb->height);
+            fb->lineWithBox(Xlead + diamond_size, Ylead, Xlead, Ylead + diamond_size, 223, 0, fb->width, 0, fb->height);
+            fb->lineWithBox(Xlead, Ylead + diamond_size, Xlead - diamond_size, Ylead, 223, 0, fb->width, 0, fb->height);
+            fb->lineWithBox(Xlead - diamond_size, Ylead, Xlead, Ylead - diamond_size, 223, 0, fb->width, 0, fb->height);
         }
 
         int Xtarget = 0, Ytarget = 0;
@@ -506,10 +1270,10 @@ void SCCockpit::RenderTargetingReticle(FrameBuffer *fb, CHUD_SHAPE *reticleShape
             if (this->face == CP_BIG) {
                 box_size = 5;
             }
-            fb->lineWithBox(Xtarget - box_size, Ytarget - box_size, Xtarget + box_size, Ytarget - box_size, 223, 0, 320, 0, 200);
-            fb->lineWithBox(Xtarget + box_size, Ytarget - box_size, Xtarget + box_size, Ytarget + box_size, 223, 0, 320, 0, 200);
-            fb->lineWithBox(Xtarget + box_size, Ytarget + box_size, Xtarget - box_size, Ytarget + box_size, 223, 0, 320, 0, 200);
-            fb->lineWithBox(Xtarget - box_size, Ytarget + box_size, Xtarget - box_size, Ytarget - box_size, 223, 0, 320, 0, 200);
+            fb->lineWithBox(Xtarget - box_size, Ytarget - box_size, Xtarget + box_size, Ytarget - box_size, 223, 0, fb->width, 0, fb->height);
+            fb->lineWithBox(Xtarget + box_size, Ytarget - box_size, Xtarget + box_size, Ytarget + box_size, 223, 0, fb->width, 0, fb->height);
+            fb->lineWithBox(Xtarget + box_size, Ytarget + box_size, Xtarget - box_size, Ytarget + box_size, 223, 0, fb->width, 0, fb->height);
+            fb->lineWithBox(Xtarget - box_size, Ytarget + box_size, Xtarget - box_size, Ytarget - box_size, 223, 0, fb->width, 0, fb->height);
         }
     }
 
@@ -737,11 +1501,108 @@ void SCCockpit::RenderBombSight(FrameBuffer *fb, Point2D hudTopLeft, Point2D hud
     delete weap;
 }
 void SCCockpit::RenderMFDSWeapon(Point2D pmfd_right, FrameBuffer *fb = nullptr) {
-    if (this->cockpit->MONI.SHAP.data == nullptr) {
-        return;
-    }
     if (!fb) {
         fb = VGA.getFrameBuffer();
+    }
+    if (!this->cockpit->instrumentShapes.empty()) {
+        // WC3 ('w' key): id 14's 38 icons (frame 0 = idle/none, 1-37 one per
+        // armed hardpoint — real frame-to-weapon-type mapping unconfirmed,
+        // so hardpoints just get sequential icons rather than a specific
+        // per-weapon-type one) for per-mount status, and id 20
+        // (kBarMeterFillB) as the "Weapon's gauge" — reuses the gun energy
+        // pool (SCPlane::gun_energy_current/capacity) for gun-category
+        // weapons since that's the one real per-weapon "readiness" fraction
+        // this codebase already tracks; missiles/torpedoes have no such pool
+        // so show a full gauge.
+        //
+        // Used to also draw id 13 as a "static backdrop frame" — dumping its
+        // raw per-frame headers shows an 89x81 canvas whose visible content
+        // *shifts position* frame to frame (real animation, not a static
+        // backdrop), and it already has an independent, corroborated
+        // identity elsewhere in this file: WC3CockpitShapeId::
+        // kPilotHandAnimation2 = 13 (matching its SVGA twin's 12-frame count
+        // exactly). That's the real per-file "a ship picture is showing up
+        // on the weapon screen" bug report — a pilot-hand-animation shape
+        // was being drawn as if it were weapon-panel art. Removed; no
+        // confirmed real backdrop shape id exists for this page, so that's
+        // left as an explicit gap rather than guessing a replacement.
+        this->RenderMFDS(pmfd_right, fb);
+        Point2D mfdSize = this->GetWC3MfdSize();
+        int mfdW = mfdSize.x;
+        int mfdH = mfdSize.y;
+        auto mountIt = this->cockpit->instrumentShapes.find(14);
+        if (mountIt != this->cockpit->instrumentShapes.end() && mountIt->second != nullptr &&
+            mountIt->second->GetNumImages() > 1 && this->player_plane != nullptr) {
+            size_t numMountFrames = mountIt->second->GetNumImages() - 1;  // frame 0 excluded (idle/none)
+            // Real per-hardpoint icon anchors from the cockpit file's own
+            // WEAP chunk (group A = gun-category hardpoints, group B =
+            // missile/secondary — inferred from MEDPIT's known loadout
+            // matching countA/countB, not independently confirmed). Falls
+            // back to the old generic 6-column grid for any hardpoint past
+            // what the file records anchors for, or entirely if the
+            // cockpit's WEAP chunk didn't parse.
+            const RSCockpit::WC3WeaponLayout &weap = g_ifVGA ? this->cockpit->vgaFrontWeap : this->cockpit->svgaFrontWeap;
+            int drawnA = 0, drawnB = 0, drawnFallback = 0, drawn = 0;
+            for (size_t i = 0; i < this->player_plane->weaps_load.size(); i++) {
+                if (this->player_plane->weaps_load[i] == nullptr) {
+                    continue;
+                }
+                auto *wdat = this->player_plane->weaps_load[i]->objct->wdat;
+                bool isGun = (wdat != nullptr && wdat->weapon_category == 0);
+                Point2D iconPos;
+                bool havePos = false;
+                if (weap.valid) {
+                    if (isGun && drawnA < (int)weap.groupA.size()) {
+                        iconPos = {pmfd_right.x + weap.groupA[drawnA].x, pmfd_right.y + weap.groupA[drawnA].y};
+                        drawnA++;
+                        havePos = true;
+                    } else if (!isGun && drawnB < (int)weap.groupB.size()) {
+                        iconPos = {pmfd_right.x + weap.groupB[drawnB].x, pmfd_right.y + weap.groupB[drawnB].y};
+                        drawnB++;
+                        havePos = true;
+                    }
+                }
+                if (!havePos) {
+                    iconPos = {pmfd_right.x + 8 + (drawnFallback % 6) * 16,
+                               pmfd_right.y + 8 + (drawnFallback / 6) * 16};
+                    drawnFallback++;
+                }
+                size_t frame = 1 + (drawn % numMountFrames);
+                RLEShape *icon = mountIt->second->GetShape(frame);
+                if (icon != nullptr) {
+                    icon->SetPosition(&iconPos);
+                    fb->drawShape(icon);
+                }
+                drawn++;
+            }
+        }
+        auto gaugeIt = this->cockpit->instrumentShapes.find(20);
+        if (gaugeIt != this->cockpit->instrumentShapes.end() && gaugeIt->second != nullptr &&
+            gaugeIt->second->GetNumImages() > 0) {
+            float fraction = 1.0f;
+            if (this->player_plane != nullptr && !this->player_plane->weaps_load.empty() &&
+                this->player_plane->weaps_load[this->player_plane->selected_weapon] != nullptr) {
+                auto *wdat = this->player_plane->weaps_load[this->player_plane->selected_weapon]->objct->wdat;
+                if (wdat != nullptr && wdat->weapon_category == 0 && this->player_plane->object->entity->gun_energy_capacity > 0.0f) {
+                    fraction = this->player_plane->gun_energy_current / this->player_plane->object->entity->gun_energy_capacity;
+                }
+            }
+            if (fraction < 0.0f) fraction = 0.0f;
+            if (fraction > 1.0f) fraction = 1.0f;
+            size_t numFrames = gaugeIt->second->GetNumImages();
+            size_t frameIdx = (size_t)((1.0f - fraction) * (float)(numFrames - 1) + 0.5f);
+            if (frameIdx >= numFrames) frameIdx = numFrames - 1;
+            RLEShape *gaugeShape = gaugeIt->second->GetShape(frameIdx);
+            if (gaugeShape != nullptr) {
+                Point2D gaugePos = {pmfd_right.x + mfdW - gaugeShape->GetWidth() - 4, pmfd_right.y + mfdH / 2 - gaugeShape->GetHeight() / 2};
+                gaugeShape->SetPosition(&gaugePos);
+                fb->drawShape(gaugeShape);
+            }
+        }
+        return;
+    }
+    if (this->cockpit->MONI.SHAP.data == nullptr) {
+        return;
     }
     std::string txt;
     this->RenderMFDS(pmfd_right, fb);
@@ -844,9 +1705,323 @@ void SCCockpit::RenderMFDSWeapon(Point2D pmfd_right, FrameBuffer *fb = nullptr) 
     fb->printText(this->big_font, &pmfd_right_weapon_flare, const_cast<char *>("F:30"), 0, 0, 4, 2, 2);
 }
 
+// WC3's left-MFD "Target Radar": COCK>SHAP id 15 background, contacts
+// plotted by ANGLE OFF BORESIGHT rather than a top-down world-space map —
+// dead ahead lands at the panel center, directly behind lands on the outer
+// ring, with bearing (up/down/left/right around the player) mapped to
+// angular position around the circle. Confirmed by the user. One unified
+// display, no AARD/AGRD/ASST-style mode split (unlike the SC-format
+// implementations below, which this replaces for WC3 — those read
+// this->cockpit->MONI.MFDS.*.ARTS, an SC-only field WC3 cockpits never
+// populate, so they never worked here regardless).
+// pmfd is unused for WC3 cockpits — position/size now always come from
+// GetCompassAreaRect (see its own comment), not the caller's panel origin.
+// User-confirmed (2026-07 session): WC3CockpitShapeId::kCompassDialLarge
+// (id 15), previously drawn here as a background dial behind the dots, is
+// not wanted at all — removed, along with the RenderMFDS() panel clear
+// (that cleared a GetWC3MfdSize()-sized rectangle, sized for the old left-
+// VDU-panel placement; wrong for the small compass-area circle this now
+// draws into, and there's no dial background to clear underneath anymore
+// anyway — the dots plot directly over the cockpit's own printed art).
+void SCCockpit::RenderMFDSTargetRadarWC3(Point2D pmfd, float range, FrameBuffer *fb) {
+    Point2D topLeft{}, bottomRight{};
+    bool haveRect = this->GetCompassAreaRect(!g_ifVGA, topLeft, bottomRight);
+    if (!haveRect) {
+        // No confirmed or fallback rect at all — nothing sane to draw into.
+        return;
+    }
+    int mfdW = bottomRight.x - topLeft.x;
+    int mfdH = bottomRight.y - topLeft.y;
+    Point2D center = {topLeft.x + mfdW / 2, topLeft.y + mfdH / 2};
+    // Half the smaller dimension, so the dot ring stays inside the
+    // confirmed rect on both axes even when it isn't perfectly square
+    // (e.g. BOMPIT's 82x81).
+    const int ringRadius = (std::min)(mfdW, mfdH) / 2;
+    if (this->player_plane == nullptr || this->current_mission == nullptr) {
+        return;
+    }
+    Matrix planeFromWorld = this->player_plane->ptw.invertRigidBodyMatrixLocal();
+    // User-confirmed exact radar colors (2026-07 session) — supersede the
+    // earlier approximate values (plain red/blue/orange/yellow).
+    uint8_t colorRed = ClosestPaletteIndex(this->palette, 239, 56, 24);      // enemy fighters
+    uint8_t colorBlue = ClosestPaletteIndex(this->palette, 24, 73, 235);     // friendly fighters
+    uint8_t colorOrange = ClosestPaletteIndex(this->palette, 239, 130, 48);  // enemy capital ships
+    uint8_t colorWhite = ClosestPaletteIndex(this->palette, 255, 255, 255);
+    // Friendly capital ships/stations (IsCapitalShipName) and supply
+    // structures (jump buoys, asteroid depots — IsFriendlySupplyStructureName)
+    // get a distinct color from ordinary friendly fighters/wingmen.
+    uint8_t colorLightBlue = ClosestPaletteIndex(this->palette, 93, 134, 239);
+    uint8_t colorYellow = ClosestPaletteIndex(this->palette, 239, 203, 69);  // missiles/mines
+
+    auto plotContact = [&](Vector3D worldPos, uint8_t color, bool cross) {
+        Vector3D local = worldPos.transformPoint(planeFromWorld);
+        float len = sqrtf(local.x * local.x + local.y * local.y + local.z * local.z);
+        if (len < 1.0f || len > range) {
+            return;
+        }
+        // 0 = dead ahead (-Z, this engine's local-forward convention — see
+        // project_to_screen's projectRealToHUD comment), pi = directly behind.
+        float angleFromForward = acosf((std::max)(-1.0f, (std::min)(1.0f, -local.z / len)));
+        float radiusFrac = angleFromForward / (float)M_PI;
+        // Bearing around the circle: local Y (up) = 12 o'clock, local X
+        // (right) = 3 o'clock. Not independently confirmed against a real
+        // reference image.
+        float bearingAngle = atan2f(local.x, local.y);
+        Point2D dot = {
+            center.x + (int)(radiusFrac * ringRadius * sinf(bearingAngle)),
+            center.y - (int)(radiusFrac * ringRadius * cosf(bearingAngle))
+        };
+        if (dot.x < topLeft.x || dot.x >= bottomRight.x || dot.y < topLeft.y || dot.y >= bottomRight.y) {
+            return;
+        }
+        // User-confirmed (2026-07 session) marker sizes: plain contacts are
+        // a 2x2 pixel block; the selected-target cross is two overlapping
+        // filled bars, 6x2 (horizontal) and 2x6 (vertical), both centered
+        // on the plotted position.
+        auto fillRect = [&](int x0, int y0, int w, int h) {
+            for (int yy = 0; yy < h; yy++) {
+                for (int xx = 0; xx < w; xx++) {
+                    fb->plot_pixel(x0 + xx, y0 + yy, color);
+                }
+            }
+        };
+        if (cross) {
+            fillRect(dot.x - 3, dot.y - 1, 6, 2);
+            fillRect(dot.x - 1, dot.y - 3, 2, 6);
+        } else {
+            fillRect(dot.x, dot.y, 2, 2);
+        }
+    };
+
+    // User-confirmed (2026-07 session): capital ships and fighters are
+    // both plotted as plain dots — only the currently-selected target
+    // (current_target_actor) is drawn as a cross, regardless of what kind
+    // of contact it is. Previously every capital ship was unconditionally
+    // a cross; that was wrong.
+    for (auto actor : this->current_mission->enemies) {
+        if (actor == nullptr || !actor->is_active || actor->is_destroyed || actor->object == nullptr) {
+            continue;
+        }
+        // User-confirmed (2026-07 session): cloaked enemy contacts (e.g.
+        // Strakha fighters, Skipper missiles — Kilrathi cloaking-capable
+        // types) disappear from radar entirely. Reuses SCPlane::cloaked
+        // (SCPlane.h), the same field WC3Strike::updateCloakEffect already
+        // drives for the player's own Excalibur cloak — generic, not
+        // hardcoded to a specific ship name, so it applies to any actor
+        // whose plane gets cloaked, not just Strakha specifically. No
+        // enemy AI currently ever sets this true (only the player-cloak
+        // path does), so this check is a no-op until enemy cloak-toggling
+        // behavior exists — see this session's own memory note for the
+        // "Skipper missile" gap (not found anywhere in the codebase/data,
+        // so its radar entry couldn't be wired up at all).
+        if (actor->plane != nullptr && actor->plane->cloaked) {
+            continue;
+        }
+        std::string name = actor->object->member_name;
+        std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+        bool capital = SCMissionActors::IsCapitalShipName(name);
+        bool isSelectedTarget = (actor == this->current_target_actor);
+        plotContact(actor->object->position, capital ? colorOrange : colorRed, isSelectedTarget);
+    }
+    for (auto actor : this->current_mission->friendlies) {
+        if (actor == nullptr || actor == this->current_mission->player || !actor->is_active ||
+            actor->is_destroyed || actor->object == nullptr) {
+            continue;
+        }
+        std::string name = actor->object->member_name;
+        std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+        bool capital = SCMissionActors::IsCapitalShipName(name);
+        bool lightBlue = capital || SCMissionActors::IsFriendlySupplyStructureName(name);
+        bool isSelectedTarget = (actor == this->current_target_actor);
+        plotContact(actor->object->position, lightBlue ? colorLightBlue : colorBlue, isSelectedTarget);
+    }
+    for (auto wp : this->current_mission->waypoints) {
+        if (wp == nullptr || wp->spot == nullptr) {
+            continue;
+        }
+        // Nav points: always a white "+", per the user's own confirmation
+        // — unlike capital ships/fighters, not conditional on being the
+        // selected target.
+        plotContact(wp->spot->position, colorWhite, true);
+    }
+
+    // Missiles/torpedoes in flight — user-confirmed real behavior: yellow
+    // dots. weapon_category 2=missile, 3=torpedo (SCenums.h's own
+    // convention); category 0 (guns) is a hitscan/short-lived tracer, not
+    // meaningfully trackable on a radar sweep, so it's excluded. No mine
+    // weapon type exists anywhere in this codebase yet (SCenums.h's
+    // weapon_ids has no mine entry, and nothing spawns/simulates one) —
+    // that's a separate, larger gap than a radar-color tweak.
+    auto plotWeapons = [&](const std::vector<SCSimulatedObject *> &weapons) {
+        for (auto sim_obj : weapons) {
+            if (sim_obj == nullptr || !sim_obj->alive || sim_obj->obj == nullptr || sim_obj->obj->wdat == nullptr) {
+                continue;
+            }
+            uint8_t cat = sim_obj->obj->wdat->weapon_category;
+            if (cat != 2 && cat != 3) continue;
+            plotContact({sim_obj->x, sim_obj->y, sim_obj->z}, colorYellow, false);
+        }
+    };
+    plotWeapons(this->player_plane->weaps_object);
+    for (auto actor : this->current_mission->actors) {
+        if (actor == nullptr || actor->plane == nullptr || actor == this->current_mission->player) {
+            continue;
+        }
+        plotWeapons(actor->plane->weaps_object);
+    }
+}
+// See header comment: dead-ahead boresight. Not the framebuffer's raw
+// geometric center (user-confirmed live in-game: that showed up off to
+// the right and low in the cockpit frame), and not project_to_screen's
+// projection either (also tried, same session — its own asymmetric
+// baked-in offset didn't land on the real boresight point). User-
+// confirmed real calibration for MEDPIT instead: (320, 176) at SVGA's
+// 640x480 reference canvas, scaled proportionally to whatever the
+// current canvas actually is (VGA included). Other cockpit files may
+// need their own calibration once tested — this is the only one
+// confirmed so far.
+Point2D SCCockpit::GetWC3BoresightScreenPos(FrameBuffer *fb) {
+    const float kSvgaBoresightX = 320.0f;
+    const float kSvgaBoresightY = 176.0f;
+    return {(int16_t)(kSvgaBoresightX * (fb->width / 640.0f)), (int16_t)(kSvgaBoresightY * (fb->height / 480.0f))};
+}
+// See header comment. Same idea as RenderTargetingReticle's own inline
+// calc (predictedTargetPos/timeOfFlight, further down in this file) but
+// that one's gated behind this->hud (SC's HUD.IFF, never populated for
+// WC3) and has a real bug worth not copying here: its own per-tick target
+// velocity is computed into a locally-shadowed variable that immediately
+// goes out of scope, so its lead solution silently always uses zero
+// target velocity. This version divides the per-tick position delta by
+// dt properly before using it.
+Vector3D SCCockpit::ComputeTargetLeadPoint() {
+    if (this->player_plane == nullptr) {
+        return {0.0f, 0.0f, 0.0f};
+    }
+    Vector3D avionPos = {this->player_plane->x, this->player_plane->y, this->player_plane->z};
+    if (this->current_target_actor == nullptr || this->current_target_actor->object == nullptr) {
+        return avionPos;
+    }
+    Vector3D targetPos = this->current_target_actor->object->position;
+    float dt = (this->player_plane->tps > 0) ? (1.0f / (float)this->player_plane->tps) : (1.0f / 60.0f);
+    Vector3D targetVel = {0.0f, 0.0f, 0.0f};
+    if (this->current_target_actor->plane != nullptr && dt > 0.0f) {
+        targetVel = {
+            (this->current_target_actor->plane->x - this->current_target_actor->plane->last_px) / dt,
+            (this->current_target_actor->plane->y - this->current_target_actor->plane->last_py) / dt,
+            (this->current_target_actor->plane->z - this->current_target_actor->plane->last_pz) / dt
+        };
+    }
+    float projectileSpeed = this->player_plane->getWeaponIntialVector(1000.0f).Length();
+    if (projectileSpeed <= 0.0f) {
+        return targetPos;
+    }
+    // 3 iterations to converge time-of-flight against the moving
+    // predicted point — same iteration count RenderTargetingReticle uses.
+    Vector3D predicted = targetPos;
+    for (int iter = 0; iter < 3; iter++) {
+        Vector3D toPredicted = {predicted.x - avionPos.x, predicted.y - avionPos.y, predicted.z - avionPos.z};
+        float tof = toPredicted.Length() / projectileSpeed;
+        predicted = {
+            targetPos.x + targetVel.x * tof,
+            targetPos.y + targetVel.y * tof,
+            targetPos.z + targetVel.z * tof
+        };
+    }
+    return predicted;
+}
+// See header comment for the real per-frame meaning of each of id 6's 4
+// frames (user-confirmed, 2026-07 session). project_to_screen's own math
+// is calibrated to a fixed 320x200 reference canvas regardless of the
+// cockpit's real VGA/SVGA resolution (see its own body — the +1)*160/
+// *100 constants), so its raw output is rescaled here to the actual
+// framebuffer size rather than assumed to already match it.
+void SCCockpit::RenderWC3TargetingReticle(FrameBuffer *fb) {
+    if (!fb) {
+        fb = VGA.getFrameBuffer();
+    }
+    if (this->cockpit == nullptr) {
+        return;
+    }
+    auto it = this->cockpit->instrumentShapes.find(WC3CockpitShapeId::kTargetingReticle);
+    if (it == this->cockpit->instrumentShapes.end() || it->second == nullptr || it->second->GetNumImages() < 4) {
+        return;
+    }
+    RSImageSet *reticleSet = it->second;
+    auto drawFrame = [&](uint32_t frameIdx, Point2D at) {
+        RLEShape *shape = reticleSet->GetShape(frameIdx);
+        if (shape == nullptr) return;
+        Point2D pos = at;
+        pos.x -= shape->GetWidth() / 2;
+        pos.y -= shape->GetHeight() / 2;
+        shape->SetPosition(&pos);
+        fb->drawShape(shape);
+    };
+    auto projectScaled = [&](Vector3D world, Point2D &outPos) -> bool {
+        int x, y;
+        if (!this->project_to_screen(world, x, y)) return false;
+        outPos.x = (int)(x * (fb->width / 320.0f));
+        outPos.y = (int)(y * (fb->height / 200.0f));
+        return outPos.x >= 0 && outPos.x < fb->width && outPos.y >= 0 && outPos.y < fb->height;
+    };
+
+    // Frame 0 (on-screen lead marker) / frame 2 (off-screen edge tracker):
+    // mutually exclusive, only while a target is locked.
+    if (this->current_target_actor != nullptr && this->player_plane != nullptr) {
+        Vector3D leadPoint = this->ComputeTargetLeadPoint();
+        Point2D leadPos;
+        if (projectScaled(leadPoint, leadPos)) {
+            drawFrame(0, leadPos);
+        } else {
+            // Off-screen: clamp to the screen edge along the real 3D
+            // bearing to the lead point, boresight-relative — same
+            // local-space transform + atan2 bearing RenderMFDSTargetRadarWC3
+            // uses for its own off-boresight contacts, but mapped onto a
+            // rectangular screen edge instead of a circular MFD ring.
+            Matrix planeFromWorld = this->player_plane->ptw.invertRigidBodyMatrixLocal();
+            Vector3D local = leadPoint.transformPoint(planeFromWorld);
+            float len = sqrtf(local.x * local.x + local.y * local.y + local.z * local.z);
+            if (len > 1.0f) {
+                float bearingAngle = atan2f(local.x, local.y);
+                float dirX = sinf(bearingAngle);
+                float dirY = -cosf(bearingAngle);
+                int marginX = fb->width / 8;
+                int marginY = fb->height / 8;
+                int cx = fb->width / 2;
+                int cy = fb->height / 2;
+                float halfW = (float)(fb->width / 2 - marginX);
+                float halfH = (float)(fb->height / 2 - marginY);
+                float scale = (std::min)((fabsf(dirX) > 0.0001f) ? halfW / fabsf(dirX) : 1e9f,
+                                          (fabsf(dirY) > 0.0001f) ? halfH / fabsf(dirY) : 1e9f);
+                Point2D edgePos = {(int16_t)(cx + (int)(dirX * scale)), (int16_t)(cy + (int)(dirY * scale))};
+                drawFrame(2, edgePos);
+            }
+        }
+    }
+
+    // Frame 1: next waypoint marker, only while it projects on-screen.
+    if (this->current_mission != nullptr && this->nav_point_id != nullptr &&
+        !this->current_mission->waypoints.empty() &&
+        (size_t)*this->nav_point_id < this->current_mission->waypoints.size() &&
+        this->current_mission->waypoints[*this->nav_point_id]->spot != nullptr) {
+        Vector3D wpPos = this->current_mission->waypoints[*this->nav_point_id]->spot->position;
+        Point2D wpScreenPos;
+        if (projectScaled(wpPos, wpScreenPos)) {
+            drawFrame(1, wpScreenPos);
+        }
+    }
+
+    // Frame 3: mouse cursor, only while flying with the mouse.
+    if (this->mouse_control) {
+        drawFrame(3, this->Mouse.position);
+    }
+}
 void SCCockpit::RenderMFDSRadar(Point2D pmfd_left, float range, int mode, FrameBuffer *fb = nullptr) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
+    }
+    if (!this->cockpit->instrumentShapes.empty()) {
+        this->RenderMFDSTargetRadarWC3(pmfd_left, range, fb);
+        return;
     }
     switch (mode) {
     case RadarMode::AARD:
@@ -1311,6 +2486,11 @@ void SCCockpit::RenderRAWS(Point2D pmfd_left = {84, 112}, FrameBuffer *fb = null
 }
 
 void SCCockpit::RenderMFDSComm(Point2D pmfd_left, int mode, FrameBuffer *fb = nullptr) {
+    // No WC3-native comm MFD page exists yet (no chunk in the cockpit file
+    // carries comm-page layout data to build one from) — unlike
+    // RenderMFDSCamera's equivalent gap, this one is already safe: data has
+    // a real nullptr default, so this just leaves the left MFD blank for a
+    // WC3 cockpit rather than reading anything uninitialized.
     if (this->cockpit->MONI.SHAP.data == nullptr) {
         return;
     }
@@ -1370,15 +2550,823 @@ void SCCockpit::RenderMFDSComm(Point2D pmfd_left, int mode, FrameBuffer *fb = nu
     fb->drawShape(&this->cockpit->MONI.SHAP);
 }
 
+// See header comment. Same letterboxed-viewport/immediate-mode-quad GL code
+// as RenderHighResBackground below, factored out and generalized to any
+// shape+palette instead of just the cached ARTP_SVGA background — but with
+// an overlay-only palette (index 255 forced transparent) instead of
+// this->palette directly, and no glClear, so it composites onto whatever
+// this frame already drew instead of replacing it.
+void SCCockpit::RenderCockpitOverlayShape(RLEShape *shape) {
+    if (shape == nullptr) {
+        return;
+    }
+    int w = shape->GetWidth();
+    int h = shape->GetHeight();
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    std::vector<uint8_t> indexBuf((size_t)w * h, 255);
+    shape->buffer_size.x = w;
+    shape->buffer_size.y = h;
+    size_t byteRead = 0;
+    shape->Expand(indexBuf.data(), &byteRead);
+
+    // Local copy, not this->palette directly: index 255 means "transparent,
+    // show what's underneath" for this overlay (same convention
+    // RSVGA::vSync uses for the low-res instrument buffer), but that's not
+    // true of every palette user — e.g. RenderHighResBackground's own
+    // opaque background may legitimately paint with color 255. Mutating
+    // this->palette in place would leak the override into those unrelated
+    // draws.
+    VGAPalette overlayPalette = this->palette;
+    overlayPalette.colors[255].a = 0;
+
+    RSImage img;
+    img.width = w;
+    img.height = h;
+    img.data = indexBuf.data();
+    img.palette = &overlayPalette;
+    img.flags = 0;
+
+    Texture tex;
+    tex.set(&img);
+    tex.updateContent(&img);
+    // Same detach as RenderHighResBackground: img.data merely points into
+    // indexBuf's vector-owned buffer, never something RSImage owns.
+    img.data = nullptr;
+
+    int winW = VGA.GetWindowWidth();
+    int winH = VGA.GetWindowHeight();
+    int vw = (int)((float)winH * (4.0f / 3.0f));
+    int x = (winW - vw) / 2;
+    glViewport(x, 0, vw, winH);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, w, 0, h, -10, 10);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    GLuint glId = 0;
+    glGenTextures(1, &glId);
+    glBindTexture(GL_TEXTURE_2D, glId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, tex.data);
+
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    gb.color4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    gb.begin(GL_QUADS);
+    gb.texCoord2f(0, 1);
+    gb.vertex2d(0, 0);
+    gb.texCoord2f(1, 1);
+    gb.vertex2d(w, 0);
+    gb.texCoord2f(1, 0);
+    gb.vertex2d(w, h);
+    gb.texCoord2f(0, 0);
+    gb.vertex2d(0, h);
+    gb.end();
+
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDeleteTextures(1, &glId);
+}
+
+bool SCCockpit::IsPlayerFrontQuadrantDamaged() {
+    if (this->player_plane == nullptr || this->player_plane->pilot == nullptr) {
+        return false;
+    }
+    SCMissionActors *pilot = this->player_plane->pilot;
+    return pilot->shield_front < pilot->max_shield_front ||
+           pilot->armor_front < pilot->max_armor_front;
+}
+// WC3CockpitShapeId::kCompassDialMedium's real screen position — "the
+// predefined compass area", near screen center, independent of both VDU
+// panels. Used both to anchor RenderMFDSRadar's output there instead of
+// the left VDU, and as the position for RenderVDUDamageOverlay's
+// radar-damage frame. found is false (position undefined) if neither a
+// per-cockpit override nor a FRNT INST record for it exists.
+//
+// User-confirmed (2026-07 session) per-cockpit overrides — none of these
+// come from the cockpit files' own data (checked for MEDPIT specifically:
+// searched the raw file for its circle's coordinates, as both plain int16
+// and the VDU chunk's own ×256 fixed-point encoding — no match at all;
+// MEDPIT.IFF's own FRNT INST record for id 24 gives (220,130) in SVGA
+// space, confirmed simply wrong for this purpose by the mismatch with the
+// user's real coordinates). Position is each circle's top-left corner
+// (RLEShape::SetPosition is top-left-registered like everywhere else in
+// this renderer) — e.g. MEDPIT's 80x80 circle from (280,280) to (360,360)
+// stores as {280,280}; EXCPIT's 75x75 circle from (282,310) to (357,385)
+// (real cockpit_name confirmed via MISNB002.IFF's own COCK chunk, the
+// mission that actually flies the Excalibur — NOT "excalpit") stores as
+// {282,310}. Keyed by cockpit name (RSEntity::cockpit_name, already
+// upper-cased at parse time) until every cockpit's real position is
+// known; falls through to the (demonstrated unreliable for MEDPIT, but
+// only other option available) raw INST-record lookup for any cockpit
+// without a confirmed override yet.
+struct CompassAreaRect { Point2D topLeft; Point2D bottomRight; };
+static const std::unordered_map<std::string, CompassAreaRect> kCompassAreaOverrideByCockpit = {
+    {"MEDPIT", {{280, 280}, {360, 360}}},
+    {"EXCPIT", {{282, 310}, {357, 385}}},
+    {"ARWPIT", {{283, 323}, {357, 396}}},  // Arrow
+    {"HVYPIT", {{284, 268}, {356, 338}}},  // Thunderbolt
+    {"BOMPIT", {{45, 329}, {127, 410}}},   // Longbow — notably off-center
+};
+// Real screen rectangle for "the predefined compass area" — where the
+// radar dial/dots actually live, near screen center (except BOMPIT — see
+// its own map comment), independent of both VDU panels. found is false
+// (rect undefined) if neither a per-cockpit override nor a FRNT INST
+// record for WC3CockpitShapeId::kCompassDialMedium exists.
+//
+// User-confirmed (2026-07 session) per-cockpit overrides — none of these
+// come from the cockpit files' own data (checked for MEDPIT specifically:
+// searched the raw file for its circle's coordinates, as both plain int16
+// and the VDU chunk's own ×256 fixed-point encoding — no match at all;
+// MEDPIT.IFF's own FRNT INST record for id 24 gives (220,130) in SVGA
+// space, confirmed simply wrong for this purpose by the mismatch with the
+// user's real coordinates). EXCPIT's real cockpit_name was confirmed via
+// MISNB002.IFF's own COCK chunk (the mission that actually flies the
+// Excalibur) — NOT "excalpit". Keyed by cockpit name (RSEntity::
+// cockpit_name, already upper-cased at parse time); falls through to the
+// (demonstrated unreliable for MEDPIT, but only other option available)
+// raw INST-record lookup only if a 6th cockpit variant with no override
+// ever turns up — all 5 known WC3 cockpits now have confirmed overrides.
+bool SCCockpit::GetCompassAreaRect(bool isSVGA, Point2D &topLeft, Point2D &bottomRight) {
+    if (this->player_plane != nullptr && this->player_plane->object != nullptr &&
+        this->player_plane->object->entity != nullptr) {
+        auto overrideIt = kCompassAreaOverrideByCockpit.find(this->player_plane->object->entity->cockpit_name);
+        if (overrideIt != kCompassAreaOverrideByCockpit.end()) {
+            topLeft = overrideIt->second.topLeft;
+            bottomRight = overrideIt->second.bottomRight;
+            return true;
+        }
+    }
+    const auto& layouts = isSVGA ? this->cockpit->svgaFrontInstruments : this->cockpit->vgaFrontInstruments;
+    const RSCockpit::WC3VDULayout& vdu = isSVGA ? this->cockpit->svgaFrontVDU : this->cockpit->vgaFrontVDU;
+    for (auto& rec : layouts) {
+        if (rec.shapeId != WC3CockpitShapeId::kCompassDialMedium) {
+            continue;
+        }
+        Point2D pos;
+        if ((rec.mode >> 8) == 0xff) {
+            pos = {rec.x, rec.y};
+        } else if (vdu.valid) {
+            pos = {(int16_t)(vdu.leftX + rec.x), (int16_t)(vdu.leftY + rec.y)};
+        } else {
+            continue;
+        }
+        // No real size known for the raw-INST fallback case — reuse the
+        // generic MFD panel size as a best-effort guess.
+        Point2D mfdSize = this->GetWC3MfdSize();
+        topLeft = pos;
+        bottomRight = {(int16_t)(pos.x + mfdSize.x), (int16_t)(pos.y + mfdSize.y)};
+        return true;
+    }
+    return false;
+}
+Point2D SCCockpit::GetCompassAreaScreenPos(bool isSVGA, bool &found) {
+    Point2D topLeft{}, bottomRight{};
+    found = this->GetCompassAreaRect(isSVGA, topLeft, bottomRight);
+    return topLeft;
+}
+// See this method's own header comment (SCCockpit.h) for the frame->
+// component mapping.
+void SCCockpit::RenderVDUDamageOverlay(FrameBuffer* fb, const RSCockpit::WC3VDULayout& vdu, bool isSVGA) {
+    if (this->player_plane == nullptr || this->player_plane->pilot == nullptr) {
+        return;
+    }
+    SCMissionActors *pilot = this->player_plane->pilot;
+    uint32_t shapeId = isSVGA ? WC3CockpitShapeId::kCanopyDamageCracksSVGA
+                               : WC3CockpitShapeId::kCanopyDamageCracks;
+    auto it = this->cockpit->instrumentShapes.find(shapeId);
+    if (it == this->cockpit->instrumentShapes.end() || it->second == nullptr) {
+        return;
+    }
+    RSImageSet *imgset = it->second;
+    auto drawFrame = [&](int frame, Point2D pos) {
+        if ((size_t)frame >= imgset->GetNumImages()) {
+            return;
+        }
+        RLEShape *shape = imgset->GetShape(frame);
+        if (shape == nullptr) {
+            return;
+        }
+        shape->SetPosition(&pos);
+        fb->drawShape(shape);
+    };
+    if (vdu.valid && pilot->component_damage[(size_t)ShipComponent::VDU1] > 0.0f) {
+        drawFrame(0, {vdu.leftX, vdu.leftY});
+    }
+    if (vdu.valid && pilot->component_damage[(size_t)ShipComponent::VDU2] > 0.0f) {
+        Point2D rightOrigin = vdu.GetRightOrigin(fb->width);
+        drawFrame(1, rightOrigin);
+    }
+    if (pilot->component_damage[(size_t)ShipComponent::TacticalDisplay] > 0.0f) {
+        bool found = false;
+        Point2D compassPos = this->GetCompassAreaScreenPos(isSVGA, found);
+        if (found) {
+            drawFrame(2, compassPos);
+        }
+    }
+}
+void SCCockpit::RenderWC3InstrumentsSVGA(FrameBuffer* fb, bool useHud) {
+    // In SVGA mode the framebuffer is 640x480, so SVGA INST positions (also
+    // in 640x480 space) map directly — no scaling or GL quad path needed.
+    //
+    // Mode high byte 0xff = screen-absolute cockpit overlay; draw at INST (x,y).
+    // Other mode high bytes (0x00–0x06) are MFD-relative: their (x,y) values
+    // are offsets within the VDU sub-panel, not the main framebuffer.
+
+    // kBarMeterFillA/B and kBarMeterFillSmallA/B are level gauges (fuel,
+    // weapon charge, ...) meant to be frame-selected by the actual value
+    // they represent — same idea already implemented, but never wired up,
+    // in RenderShieldGauge below. Cycling them by wc3_anim_frame like a
+    // real animation (heading needle, pilot hand, ...) is what live
+    // testing reported as "gauges cycling constantly". No per-ship value
+    // is wired up here yet, so this pins them to frame 0 (RenderShieldGauge's
+    // own comment already established frame 0 = full) instead of a moving
+    // target — static-but-wrong-level beats constant flicker, and is a
+    // smaller follow-up once a real value is threaded through.
+    //
+    // kAutopilotLabel/kAutopilotLabelSmall (AUTO) and kLockLabel/
+    // kLockLabelSmall (LOCK) are 2-frame dark/lit status-light toggles —
+    // same "was being time-cycled instead of state-driven" bug, this time
+    // reported directly (both lights blinking constantly rather than
+    // reflecting real autopilot-available/missile-lock state).
+    auto selectStateFrame = [&](uint32_t shapeId) -> int {
+        using namespace WC3CockpitShapeId;
+        if (shapeId == kBarMeterFillA || shapeId == kBarMeterFillB ||
+            shapeId == kBarMeterFillSmallA || shapeId == kBarMeterFillSmallB) {
+            return 0;
+        }
+        if (shapeId == kAutopilotLabel || shapeId == kAutopilotLabelSmall) {
+            return this->autopilot_available ? 1 : 0;
+        }
+        if (shapeId == kLockLabel || shapeId == kLockLabelSmall) {
+            return this->target_locked ? 1 : 0;
+        }
+        return -1;
+    };
+    auto drawShape = [&](uint32_t shapeId, RSImageSet* imgset, Point2D pos) {
+        if (imgset == nullptr || imgset->GetNumImages() == 0) return;
+        // Throttle hand — user-confirmed (2026-07 session): kThrottleHandAnimation
+        // (id 12, NOT kPilotHandAnimation id 11/the joystick hand, which
+        // moves with joystick input instead) represents the throttle
+        // position, not a real looping animation. Frame-select by
+        // this->throttle (0-100) instead of wc3_anim_frame, and pin the
+        // shape's own bottom edge (position.y + botDist, same
+        // registration-point convention every other per-frame-sized shape
+        // this session uses) to the framebuffer's bottom-middle —
+        // otherwise different-height throttle poses shift the hand
+        // up/down as the frame changes instead of keeping its base
+        // planted, and rec.x/rec.y (tuned for one specific frame) don't
+        // track that.
+        if (shapeId == WC3CockpitShapeId::kThrottleHandAnimation) {
+            size_t n = imgset->GetNumImages();
+            float frac = (std::max)(0.0f, (std::min)(1.0f, this->throttle / 100.0f));
+            int frame = (int)(frac * (float)(n > 1 ? n - 1 : 0) + 0.5f);
+            RLEShape* shape = imgset->GetShape(frame);
+            if (shape == nullptr) return;
+            Point2D handPos = {(int16_t)(fb->width / 2), (int16_t)(fb->height - shape->botDist)};
+            shape->SetPosition(&handPos);
+            fb->drawShape(shape);
+            return;
+        }
+        // kCenterMarker (id 5) — user-confirmed (2026-07 session): should
+        // sit on the real dead-ahead boresight (see GetWC3BoresightScreenPos's
+        // own comment for why that's not simply the framebuffer's raw
+        // center), same reference point as kTargetingReticle's (id 6)
+        // lead marker, not at whatever position its own file INST record
+        // supplies (off-center in practice).
+        if (shapeId == WC3CockpitShapeId::kCenterMarker) {
+            RLEShape* shape = imgset->GetShape(wc3_anim_frame % imgset->GetNumImages());
+            if (shape == nullptr) return;
+            Point2D centerPos = this->GetWC3BoresightScreenPos(fb);
+            shape->SetPosition(&centerPos);
+            fb->drawShape(shape);
+            return;
+        }
+        // kTargetingReticle (id 6) — drawn by RenderWC3TargetingReticle
+        // instead (its 4 frames are 4 distinct, conditionally-shown
+        // indicators, not a real animation — see that function's own
+        // comment), so skip it here rather than also cycling it via
+        // wc3_anim_frame like every other unhandled id.
+        if (shapeId == WC3CockpitShapeId::kTargetingReticle) {
+            return;
+        }
+        // kCompassDialMedium (id 24) — user-confirmed (2026-07 session):
+        // not always-on background art (its "compass/radar dial" look was
+        // an unconfirmed visual guess), but a front-quadrant-damage
+        // indicator, only meant to appear once the player's own front
+        // shield/armor has taken damage. Its own INST position is also
+        // reused as the Tactical Display/radar-scope screen location for
+        // RenderVDUDamageOverlay's frame-2 (radar damage) overlay — see
+        // that function's own header comment.
+        if (shapeId == WC3CockpitShapeId::kCompassDialMedium && !this->IsPlayerFrontQuadrantDamaged()) {
+            return;
+        }
+        int stateFrame = selectStateFrame(shapeId);
+        int frame = stateFrame >= 0 ? stateFrame : (wc3_anim_frame % imgset->GetNumImages());
+        RLEShape* shape = imgset->GetShape(frame);
+        if (shape == nullptr) return;
+        int16_t bx = shape->position.x;
+        int16_t by = shape->position.y;
+        pos.x += (bx < 0 && by < 0 ? bx : 0);
+        pos.y += (bx < 0 && by < 0 ? by : 0);
+        shape->SetPosition(&pos);
+        fb->drawShape(shape);
+    };
+
+    // vdu.leftShapeId/rightShapeId are NOT VDU screen background art — live
+    // testing found the left MFD showing a correctly-positioned red radar
+    // grid + bar gauges (built from the MFD-relative INST records handled
+    // below) with no visible "background shape" at all, so this was
+    // dumped and checked: for MEDPIT.IFF, leftShapeId=25/rightShapeId=26
+    // exactly match WC3CockpitShapeId::kCanopyDamageCracks (126x109, 3
+    // frames) / kCanopyDamageCracksAlt (154x117, 5 frames) — confirmed by
+    // frame count and per-frame width/height, not just id number. These
+    // two fields are the canopy-damage-crack shape ids, not a VDU
+    // background pair; the leftX/leftY they're drawn at is coincidentally
+    // the same coordinate the MFD panel also uses. Previously this drew
+    // id 25 there unconditionally (every frame, regardless of actual
+    // canopy damage) and time-cycled it — a real contributor to the
+    // "gauges cycling constantly" report. Not drawing canopy damage
+    // anywhere yet is a real gap (DETH/EJCT's sibling "show cracks as the
+    // canopy takes damage" feature), but drawing crack art mislabeled as
+    // an MFD background was actively wrong, so removed rather than left in
+    // place. vdu.combinedShapeId is left alone below — always -1 on every
+    // cockpit file checked so far, never actually exercised, but unclear
+    // whether the same mislabeling applies there too.
+    const RSCockpit::WC3VDULayout& vdu = useHud ? cockpit->svgaHudVDU : cockpit->svgaFrontVDU;
+    if (vdu.valid && vdu.combinedShapeId >= 0) {
+        auto it = cockpit->instrumentShapes.find((uint32_t)vdu.combinedShapeId);
+        if (it != cockpit->instrumentShapes.end()) {
+            drawShape(vdu.combinedShapeId, it->second, {vdu.leftX, vdu.leftY});
+        }
+    }
+
+    // MFD-relative records' mode high byte is a real page/group id (0x00-
+    // 0x06, 0x08 — 0x07 never appears; SYS's own slot-order byte uses this
+    // exact same 8-value set {0,1,2,3,4,5,6,8}, strong cross-chunk evidence
+    // it's one shared "page" concept, not two coincidentally-similar
+    // encodings). Page->key mapping, by confidence:
+    //   0x00 -> Shields: user-confirmed real page. Shape 59
+    //     (kRadarScreenGridSVGA — a generic grid-style panel background, not
+    //     exclusively "radar" as its name implies) is the real backdrop;
+    //     corroborated by SYS's own slot 0 being the real "Shields"
+    //     subsystem id (17) at the same page number. See RenderMFDSShield.
+    //   0x02 -> Radar: shares the same shape 59 grid backdrop as Shields,
+    //     plus shape 38 (close match for kTargetLockBoxSVGA), consistent
+    //     with a target-lock overlay drawn only in single-target radar
+    //     submode.
+    //   0x04 -> Comm: shape 53 (kSidePanel). Corroborated independently by
+    //     SYS's own page-4 slot being the real "Comm" subsystem id (16) —
+    //     two unrelated chunks agreeing. High confidence.
+    //   0x06 -> Power: confirmed separately, see RenderMFDSPower.
+    //   0x03 (shape 44, kSystemStatusIconsSVGA, 38 frames) and 0x05 (shape
+    //     43, kPilotHandAnimation2SVGA, 12 frames) have no corroborating
+    //     second source and no clearly-matching show_* page — left in the
+    //     idle/default bucket (drawn only when no dedicated page is
+    //     selected) rather than guessed onto Damage/Weapon/Camera and risk
+    //     showing plausible-looking but wrong art on the wrong page.
+    // This loop used to draw every MFD-relative record unconditionally,
+    // every frame, regardless of which (if any) page was active — so
+    // pressing e.g. 'p' got the real power bezels from RenderMFDSPower PLUS
+    // every other page's instruments all stacked in the same small panel.
+    // That's the reported "MFD sprites drawn over each other" bug.
+    bool leftMfdPageActive = this->show_radars || this->show_weapons || this->show_damage ||
+                              this->show_comm || this->show_cam || this->show_power || this->show_shield;
+    auto pageVisible = [&](uint16_t mode) -> bool {
+        uint8_t page = (uint8_t)(mode >> 8);
+        if (page == 0x00) return this->show_shield;
+        // Radar page content no longer draws on the left VDU at all — see
+        // the show_radars call site's own comment (RenderMFDSRadar now
+        // draws at GetCompassAreaScreenPos instead). leftMfdPageActive
+        // still includes show_radars so the idle/default bucket below
+        // correctly stays hidden while radar mode is active.
+        if (page == 0x02) return false;
+        if (page == 0x04) return this->show_comm;
+        if (page == 0x06) return this->show_power;
+        return !leftMfdPageActive;
+    };
+    auto& layouts = useHud ? cockpit->svgaHudInstruments : cockpit->svgaFrontInstruments;
+    for (auto& rec : layouts) {
+        auto it = cockpit->instrumentShapes.find(rec.shapeId);
+        if (it == cockpit->instrumentShapes.end()) continue;
+        if ((rec.mode >> 8) == 0xff) {
+            // Screen-absolute — draw directly at INST (x,y). Always on:
+            // these are fixed cockpit overlays (status lights, KPS/SET
+            // readouts, ...), not left-MFD page content.
+            Point2D pos = {rec.x, rec.y};
+            drawShape(rec.shapeId, it->second, pos);
+        } else if (vdu.valid && pageVisible(rec.mode)) {
+            Point2D leftPos = {(int16_t)(vdu.leftX + rec.x),
+                                (int16_t)(vdu.leftY + rec.y)};
+            drawShape(rec.shapeId, it->second, leftPos);
+        }
+    }
+    this->RenderVDUDamageOverlay(fb, vdu, /*isSVGA=*/true);
+
+    // Draw KPS (current speed) and SET (throttle setting) text labels in
+    // cockpit green. TEXT chunk records with id=0x01 (KPS) and id=0x02 (SET)
+    // at mode=0xff carry the format string and screen position.
+    // SET = target speed in KPS: 420 at 100% throttle (Hellcat), 1200 at
+    // afterburner; sourced from RSEntity::thrust_in_newton / weight_in_kg
+    // (despite those field names — see SCJdynPlane::computeThrust's comment).
+    auto& textEntries = useHud ? cockpit->svgaHudText : cockpit->svgaFrontText;
+    if (player_plane != nullptr && !textEntries.empty()) {
+        // GFSM is a general chunky UI-menu font (also used for options/
+        // quit-confirm/menu text elsewhere) — too tall/bold for a cockpit
+        // digit readout and visibly the wrong style. globals.iff's FONT
+        // form carries 9 fonts total; VSML ("V" = VDU, matching this
+        // engine's own COCK>VGA/SVGA>FRNT>TEXT naming) is a tiny 5px-tall
+        // blocky/LCD-style font — rendered and visually compared against
+        // GFSM/VLRG/SSML/SLRG offline, and it's the one that actually looks
+        // like a digital instrument-panel readout rather than menu text.
+        WC3Font* font = WC3Globals::getInstance().getFont("VSML");
+        if (font != nullptr && font->isLoaded()) {
+            // Find nearest palette index to WC3 cockpit green (R=0, G=200, B=50).
+            static uint8_t cockpitGreenIdx = 0;
+            static bool    cockpitGreenCached = false;
+            if (!cockpitGreenCached) {
+                cockpitGreenCached = true;
+                int best = 1 << 30;
+                for (int i = 0; i < 256; i++) {
+                    const Texel* c = this->palette.GetRGBColor(i);
+                    int dr = (int)c->r - 0, dg = (int)c->g - 200, db = (int)c->b - 50;
+                    int d = dr*dr + dg*dg + db*db;
+                    if (d < best) { best = d; cockpitGreenIdx = (uint8_t)i; }
+                }
+            }
+
+            int kps_val = (int)(-player_plane->vz);
+            if (kps_val < 0) kps_val = 0;
+
+            int set_val = 0;
+            if (player_plane->afterburner_engaged &&
+                player_plane->object != nullptr &&
+                player_plane->object->entity != nullptr) {
+                set_val = player_plane->object->entity->weight_in_kg;
+            } else {
+                // max_throttle is always 100 (see SCPlane::init).
+                set_val = (int)(player_plane->Mthrust * player_plane->GetThrottle() / 100);
+            }
+
+            char buf[32];
+            for (const auto& entry : textEntries) {
+                if (entry.mode != 0xff) continue;
+                if (entry.id != 0x01 && entry.id != 0x02) continue;
+                int val = (entry.id == 0x01) ? kps_val : set_val;
+                snprintf(buf, sizeof(buf), entry.text, (long)val);
+                font->drawTextColored(fb, buf, entry.x, entry.y, cockpitGreenIdx);
+            }
+        }
+    }
+}
+
+void SCCockpit::RenderWC3Instruments(FrameBuffer* fb, bool useHud) {
+    constexpr float kAnimFPS = 10.0f;
+    wc3_anim_time += GameTimer::getInstance().getDeltaTime();
+    if (wc3_anim_time >= 1.0f / kAnimFPS) {
+        wc3_anim_time -= 1.0f / kAnimFPS;
+        wc3_anim_frame++;
+    }
+
+    const auto& svgaInstruments = useHud ? cockpit->svgaHudInstruments : cockpit->svgaFrontInstruments;
+    if (!g_ifVGA && !svgaInstruments.empty()) {
+        RenderWC3InstrumentsSVGA(fb, useHud);
+        return;
+    }
+
+    auto& layouts = useHud ? cockpit->vgaHudInstruments : cockpit->vgaFrontInstruments;
+    if (!layouts.empty()) {
+        // Previously this loop always treated rec.x/rec.y as screen-
+        // absolute, even for MFD-relative (non-0xff mode) records — those
+        // are small local offsets (e.g. 6,8 or 16,32) meant to be added to
+        // the VDU panel's own origin (see vgaFrontVDU, and
+        // RenderWC3InstrumentsSVGA's matching comment), so they used to
+        // render bunched up near the screen's top-left corner instead of
+        // on the instrument panel. MFD-relative instruments draw on the
+        // left panel only — see RenderWC3InstrumentsSVGA's matching comment
+        // for why (right panel is dedicated to RenderMFDSTarget).
+        const RSCockpit::WC3VDULayout& vdu = useHud ? cockpit->vgaHudVDU : cockpit->vgaFrontVDU;
+        // See RenderWC3InstrumentsSVGA's selectStateFrame comment.
+        auto selectStateFrame = [&](uint32_t shapeId) -> int {
+            using namespace WC3CockpitShapeId;
+            if (shapeId == kBarMeterFillA || shapeId == kBarMeterFillB ||
+                shapeId == kBarMeterFillSmallA || shapeId == kBarMeterFillSmallB) {
+                return 0;
+            }
+            if (shapeId == kAutopilotLabel || shapeId == kAutopilotLabelSmall) {
+                return this->autopilot_available ? 1 : 0;
+            }
+            if (shapeId == kLockLabel || shapeId == kLockLabelSmall) {
+                return this->target_locked ? 1 : 0;
+            }
+            return -1;
+        };
+        auto drawAt = [&](RLEShape* shape, int16_t x, int16_t y) {
+            int16_t bx = shape->position.x;
+            int16_t by = shape->position.y;
+            Point2D pos = {(int16_t)(x + (bx < 0 && by < 0 ? bx : 0)),
+                           (int16_t)(y + (bx < 0 && by < 0 ? by : 0))};
+            shape->SetPosition(&pos);
+            fb->drawShape(shape);
+        };
+        // MFD-relative records (mode high byte != 0xff) belong to a real
+        // page/group — see RenderWC3InstrumentsSVGA's matching comment for
+        // the cross-chunk evidence and the confirmed/best-effort/unmapped
+        // page->key assignments (0x00->Shields, 0x02->Radar, 0x04->Comm,
+        // 0x06->Power, 0x03/0x05 left in the idle/default bucket). Drawing
+        // all of them unconditionally, every frame, on top of whichever
+        // dedicated page renderer was also active is what caused every
+        // left-MFD sprite to visibly stack.
+        bool leftMfdPageActive = this->show_radars || this->show_weapons || this->show_damage ||
+                                  this->show_comm || this->show_cam || this->show_power || this->show_shield;
+        auto pageVisible = [&](uint16_t mode) -> bool {
+            uint8_t page = (uint8_t)(mode >> 8);
+            if (page == 0x00) return this->show_shield;
+            // Radar page content no longer draws on the left VDU at all — see
+        // the show_radars call site's own comment (RenderMFDSRadar now
+        // draws at GetCompassAreaScreenPos instead). leftMfdPageActive
+        // still includes show_radars so the idle/default bucket below
+        // correctly stays hidden while radar mode is active.
+        if (page == 0x02) return false;
+            if (page == 0x04) return this->show_comm;
+            if (page == 0x06) return this->show_power;
+            return !leftMfdPageActive;
+        };
+        for (auto& rec : layouts) {
+            auto it = cockpit->instrumentShapes.find(rec.shapeId);
+            if (it == cockpit->instrumentShapes.end()) continue;
+            RSImageSet* imgset = it->second;
+            if (imgset == nullptr || imgset->GetNumImages() == 0) continue;
+            bool isAbsolute = (rec.mode >> 8) == 0xff || !vdu.valid;
+            if (!isAbsolute && !pageVisible(rec.mode)) continue;
+            // Throttle hand — see the SVGA path's matching comment
+            // (RenderWC3InstrumentsSVGA's drawShape): kThrottleHandAnimation
+            // (id 12, NOT kPilotHandAnimation/id 11 — that's the joystick
+            // hand, driven by joystick input instead). Frame-select by
+            // this->throttle instead of looping, anchor to the
+            // framebuffer's bottom-middle via the shape's own botDist
+            // instead of the file's fixed rec.x/rec.y.
+            if (rec.shapeId == WC3CockpitShapeId::kThrottleHandAnimation) {
+                size_t n = imgset->GetNumImages();
+                float frac = (std::max)(0.0f, (std::min)(1.0f, this->throttle / 100.0f));
+                int frame = (int)(frac * (float)(n > 1 ? n - 1 : 0) + 0.5f);
+                RLEShape* shape = imgset->GetShape(frame);
+                if (shape == nullptr) continue;
+                Point2D handPos = {(int16_t)(fb->width / 2), (int16_t)(fb->height - shape->botDist)};
+                shape->SetPosition(&handPos);
+                fb->drawShape(shape);
+                continue;
+            }
+            // kCenterMarker (id 5) — see the SVGA path's matching comment:
+            // should sit on the real dead-ahead boresight, same reference
+            // point as kTargetingReticle's (id 6) lead marker, not at
+            // whatever position its own file INST record supplies
+            // (off-center in practice).
+            if (rec.shapeId == WC3CockpitShapeId::kCenterMarker) {
+                RLEShape* shape = imgset->GetShape(wc3_anim_frame % imgset->GetNumImages());
+                if (shape == nullptr) continue;
+                Point2D centerPos = this->GetWC3BoresightScreenPos(fb);
+                shape->SetPosition(&centerPos);
+                fb->drawShape(shape);
+                continue;
+            }
+            // kTargetingReticle (id 6) — see the SVGA path's matching
+            // comment: drawn by RenderWC3TargetingReticle instead, skip
+            // it here.
+            if (rec.shapeId == WC3CockpitShapeId::kTargetingReticle) {
+                continue;
+            }
+            // kCompassDialMedium (id 24) — see the SVGA path's matching
+            // comment (RenderWC3InstrumentsSVGA's drawShape): a front-
+            // quadrant-damage indicator, not always-on background art.
+            if (rec.shapeId == WC3CockpitShapeId::kCompassDialMedium && !this->IsPlayerFrontQuadrantDamaged()) {
+                continue;
+            }
+            int stateFrame = selectStateFrame(rec.shapeId);
+            int frame = stateFrame >= 0 ? stateFrame : (wc3_anim_frame % imgset->GetNumImages());
+            RLEShape* shape = imgset->GetShape(frame);
+            if (shape == nullptr) continue;
+            if (isAbsolute) {
+                drawAt(shape, rec.x, rec.y);
+            } else {
+                drawAt(shape, (int16_t)(vdu.leftX + rec.x), (int16_t)(vdu.leftY + rec.y));
+            }
+        }
+        this->RenderVDUDamageOverlay(fb, vdu, /*isSVGA=*/false);
+    } else {
+        for (auto& [id, imgset] : cockpit->instrumentShapes) {
+            if (imgset == nullptr || imgset->GetNumImages() == 0) continue;
+            RLEShape* shape0 = imgset->GetShape(0);
+            if (shape0 == nullptr) continue;
+            int w = shape0->GetWidth(), h = shape0->GetHeight();
+            if ((w == 320 && h == 200) || (w == 640 && h == 480)) continue;
+            int frame = wc3_anim_frame % imgset->GetNumImages();
+            fb->drawShape(imgset->GetShape(frame));
+        }
+    }
+}
+
+void SCCockpit::RenderHighResBackground() {
+    RLEShape *shape = this->cockpit->ARTP_SVGA.GetShape(0);
+    if (shape == nullptr) {
+        return;
+    }
+    if (hires_bg_texture == nullptr) {
+        int w = shape->GetWidth();
+        int h = shape->GetHeight();
+        std::vector<uint8_t> indexBuf((size_t)w * h, 255);
+        // Same convention FrameBuffer::drawShape uses to pull raw indexed
+        // pixels out of an RLEShape built via InitFromPixels.
+        shape->buffer_size.x = w;
+        shape->buffer_size.y = h;
+        size_t byteRead = 0;
+        shape->Expand(indexBuf.data(), &byteRead);
+
+        // Local copy, not this->palette directly (same reasoning as
+        // RenderCockpitOverlayShape): the windshield area of this art is
+        // painted with palette index 255, meant as a transparent cutout
+        // that reveals the real-time 3D scene rendered underneath it this
+        // same frame (renderScene() draws the world/actors before calling
+        // cockpit->Render(), which reaches here) — same convention
+        // RSVGA::vSync uses for the low-res instrument overlay. Without
+        // this override, index 255 rendered fully opaque (this->palette's
+        // colors are loaded with alpha=255 — see VGAPalette::ReadPatch in
+        // Texture.cpp), painting over the whole 3D world with a solid
+        // color and leaving only the cockpit and static background
+        // visible, confirmed by live testing.
+        VGAPalette bgPalette = this->palette;
+        bgPalette.colors[255].a = 0;
+
+        RSImage img;
+        img.width = w;
+        img.height = h;
+        img.data = indexBuf.data();
+        img.palette = &bgPalette;
+        img.flags = 0;
+
+        hires_bg_texture = new Texture();
+        hires_bg_texture->set(&img);
+        hires_bg_texture->updateContent(&img);
+        // RSImage::~RSImage() frees `data`, but img.data merely points into
+        // indexBuf's vector-owned buffer — never something RSImage owns.
+        // Detach it here so ~RSImage() is a no-op instead of a double free
+        // when indexBuf's own destructor releases the same pointer.
+        img.data = nullptr;
+        hires_bg_w = w;
+        hires_bg_h = h;
+    }
+
+    // Same 4:3-letterboxed viewport convention RSVGA::displayBuffer uses for
+    // the 320x200 overlay, so this hi-res background aligns with the
+    // HUD/MFD/instrument layer composited on top of it afterward.
+    int winW = VGA.GetWindowWidth();
+    int winH = VGA.GetWindowHeight();
+    int w = (int)((float)winH * (4.0f / 3.0f));
+    int x = (winW - w) / 2;
+    glViewport(x, 0, w, winH);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, hires_bg_w, 0, hires_bg_h, -10, 10);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    if (!hires_bg_uploaded) {
+        glGenTextures(1, &hires_bg_gl_id);
+        glBindTexture(GL_TEXTURE_2D, hires_bg_gl_id);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hires_bg_w, hires_bg_h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     hires_bg_texture->data);
+        hires_bg_uploaded = true;
+    } else {
+        glBindTexture(GL_TEXTURE_2D, hires_bg_gl_id);
+    }
+
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_REPLACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    gb.color4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    gb.begin(GL_QUADS);
+    gb.texCoord2f(0, 1);
+    gb.vertex2d(0, 0);
+    gb.texCoord2f(1, 1);
+    gb.vertex2d(hires_bg_w, 0);
+    gb.texCoord2f(1, 0);
+    gb.vertex2d(hires_bg_w, hires_bg_h);
+    gb.texCoord2f(0, 0);
+    gb.vertex2d(0, hires_bg_h);
+    gb.end();
+
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+}
+
 void SCCockpit::RenderMFDSDamage(Point2D pmfd_left, FrameBuffer *fb) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
     }
     this->RenderMFDS(pmfd_left, fb);
-    Point2D damage_pos = {pmfd_left.x +25, pmfd_left.y +15};
-    RLEShape *damage_shape = this->cockpit->MONI.MFDS.DAMG.ARTS.GetShape(0);
-    damage_shape->SetPosition(&damage_pos);
-    fb->drawShape(damage_shape);
+    if (this->cockpit->instrumentShapes.empty()) {
+        Point2D damage_pos = {pmfd_left.x +25, pmfd_left.y +15};
+        RLEShape *damage_shape = this->cockpit->MONI.MFDS.DAMG.ARTS.GetShape(0);
+        damage_shape->SetPosition(&damage_pos);
+        fb->drawShape(damage_shape);
+        return;
+    }
+    // WC3 ('d' key): COCK>SHAP id 9 — 24-frame color-shift bar (yellow
+    // -> orange -> red, per its own doc comment). Frame-select by the
+    // player's own hull/shield damage fraction, same idiom as
+    // RenderShieldGauge's kBarMeterFillA usage (frame 0 = undamaged,
+    // last frame = most damaged — same unconfirmed-direction caveat).
+    // Moved to the top of the panel (was centered) to make room for the
+    // real per-subsystem list below.
+    auto it = this->cockpit->instrumentShapes.find(9);
+    if (it != this->cockpit->instrumentShapes.end() && it->second != nullptr && it->second->GetNumImages() > 0) {
+        float fraction = 1.0f;
+        if (this->player_plane != nullptr && this->player_plane->pilot != nullptr) {
+            SCMissionActors *pilot = this->player_plane->pilot;
+            if (pilot->max_shield_front > 0.0f) {
+                fraction = pilot->shield_front / pilot->max_shield_front;
+            } else if (pilot->object != nullptr && pilot->object->entity != nullptr && pilot->object->entity->health > 0) {
+                fraction = (float)pilot->health / (float)pilot->object->entity->health;
+            }
+        }
+        if (fraction < 0.0f) fraction = 0.0f;
+        if (fraction > 1.0f) fraction = 1.0f;
+        size_t numFrames = it->second->GetNumImages();
+        size_t frameIdx = (size_t)((1.0f - fraction) * (float)(numFrames - 1) + 0.5f);
+        if (frameIdx >= numFrames) frameIdx = numFrames - 1;
+        RLEShape *shape = it->second->GetShape(frameIdx);
+        if (shape != nullptr) {
+            Point2D mfdSize = this->GetWC3MfdSize();
+            Point2D pos = {pmfd_left.x + mfdSize.x / 2 - shape->GetWidth() / 2, pmfd_left.y + 4};
+            shape->SetPosition(&pos);
+            fb->drawShape(shape);
+        }
+    }
+
+    // Real per-subsystem damage-report list: COCK>FRNT>SYS gives the real
+    // on-screen slot order + subsystem id per row (see
+    // RSCockpit::WC3DamageSubsystemSlot for what's confirmed vs. still
+    // unconfirmed about its 10-byte record layout), cross-referenced
+    // against COCK>FRNT>DAMG>TEXT for the real subsystem name per id. Row
+    // *positions* here are computed (evenly spaced bottom-up), not
+    // file-derived — no chunk records individual row coordinates, only the
+    // label list and the slot order. No per-subsystem damage *state* is
+    // tracked anywhere in the simulation either (SCMissionActors only has
+    // aggregate shield_front/back/left/right + overall health, no
+    // per-subsystem hit points) — so this lists the real subsystem names in
+    // their real order but can't yet highlight which one is damaged.
+    const auto &slots = g_ifVGA ? this->cockpit->vgaFrontSys : this->cockpit->svgaFrontSys;
+    const auto &labels = g_ifVGA ? this->cockpit->vgaFrontDamageLabels : this->cockpit->svgaFrontDamageLabels;
+    if (!slots.empty() && !labels.empty() && this->font != nullptr) {
+        std::vector<RSCockpit::WC3DamageSubsystemSlot> ordered(slots.begin(), slots.end());
+        std::sort(ordered.begin(), ordered.end(), [](const RSCockpit::WC3DamageSubsystemSlot &a, const RSCockpit::WC3DamageSubsystemSlot &b) {
+            return a.slotOrder < b.slotOrder;
+        });
+        Point2D mfdSize = this->GetWC3MfdSize();
+        const int rowHeight = 8;
+        int startY = pmfd_left.y + mfdSize.y - (int)(ordered.size() * rowHeight) - 4;
+        if (startY < pmfd_left.y + 20) startY = pmfd_left.y + 20;
+        int row = 0;
+        for (const auto &slot : ordered) {
+            if (slot.subsystemId == 0xFF) continue;
+            const char *name = nullptr;
+            for (const auto &label : labels) {
+                if (label.id == slot.subsystemId) {
+                    name = label.label;
+                    break;
+                }
+            }
+            if (name == nullptr) continue;
+            Point2D textPos = {pmfd_left.x + 4, startY + row * rowHeight};
+            fb->printText(this->font, textPos, std::string(name), 0);
+            row++;
+        }
+    }
 }
 
 /**
@@ -1433,10 +3421,33 @@ void SCCockpit::Render(CockpitFace face) {
                             this->hud_framebuffer->height);
             }
         }
-        fb->drawShape(this->cockpit->ARTP.GetShape(this->face));
+        // Used to draw the SVGA background whenever that art existed at
+        // all, regardless of the player's actual VGA/SVGA preference — now
+        // gated on g_ifVGA (see commons/GraphicsSettings.h) so VGA mode
+        // genuinely renders at VGA scale instead of always preferring the
+        // higher-res art when present.
+        //
+        // HUD_ONLY (see WC3CockpitViewMode) skips this entirely — no
+        // cockpit background/frame at all, just whatever RenderWC3Instruments
+        // draws below (using the cockpit file's own separate HUD instrument
+        // layout, not FRNT's).
+        if (this->cockpit_view_mode != WC3CockpitViewMode::HUD_ONLY) {
+            if (!g_ifVGA && this->face == CockpitFace::CP_FRONT && this->cockpit->ARTP_SVGA.GetNumImages() > 0) {
+                // Draw the hi-res background via its own GL path instead of the
+                // low-res 320x200 software one; the rest of Render() below still
+                // composites HUD/MFD/instruments into the (alpha-transparent
+                // where unpainted) 320x200 fb layered on top of it.
+                this->RenderHighResBackground();
+            } else {
+                fb->drawShape(this->cockpit->ARTP.GetShape(this->face));
+            }
+        }
 
         if (this->face  == CockpitFace::CP_FRONT || this->face  == CockpitFace::CP_BIG) {
-            if (this->is_shooting && this->player_plane->weaps_load[this->player_plane->selected_weapon]->objct->wdat->weapon_id == ID_20MM) {
+            bool selected_is_20mm = this->player_plane->weaps_load.size() > 0 &&
+                this->player_plane->weaps_load[this->player_plane->selected_weapon] != nullptr &&
+                this->player_plane->weaps_load[this->player_plane->selected_weapon]->objct->wdat->weapon_id == ID_20MM;
+            if (this->is_shooting && selected_is_20mm) {
                 RSImageSet *muzzle_flash_set = nullptr;
                 if (this->face == CockpitFace::CP_FRONT) {
                     muzzle_flash_set = &this->cockpit->GUNF;
@@ -1490,25 +3501,78 @@ void SCCockpit::Render(CockpitFace face) {
                     }
                 }
             }
-            if (this->face ==CockpitFace::CP_FRONT) {
-                this->RenderRAWS({84, 112}, fb);
-                this->RenderAlti({161, 166}, fb);
-                this->RenderSpeedOmetter({125, 166}, fb);
-            } else if (this->face == CockpitFace::CP_BIG) {
-                this->RenderRAWSBig({84, 112}, fb);
-            }
-            Point2D pmfd_right = {0, 200 - this->cockpit->MONI.SHAP.GetHeight()};
-            Point2D pmfd_left = {320 - this->cockpit->MONI.SHAP.GetWidth() - 1,
-                                    200 - this->cockpit->MONI.SHAP.GetHeight()};
-            Point2D pmfd;
-            bool mfds = false;
-            if (this->show_radars) {
-                if (!mfds) {
-                    pmfd = pmfd_left;
-                    mfds = true;
+            // MONI.* (RAWS/ALTI/AIRS) is an SC-format field, only ever
+            // populated by parseMONI_SHAP-family parsers — WC3 cockpits
+            // (InitFromWC3Ram/parseWC3_COCK) never touch it, so RenderRAWS/
+            // RenderAlti/RenderSpeedOmetter/RenderRAWSBig all early-return
+            // unconditionally for a real WC3 cockpit file: pure no-op calls
+            // every frame. RenderSpeedOmetter's job is already done by the
+            // real KPS text readout RenderWC3InstrumentsSVGA/
+            // RenderWC3Instruments draw from the file's own TEXT chunk;
+            // RenderAlti/RenderRAWS/RenderRAWSBig have no WC3-native
+            // equivalent yet (a real altitude gauge / proximity-warning
+            // display is a genuine deferred gap, not solved here) — but
+            // calling their dead SC bodies doesn't fill that gap either, so
+            // there's nothing lost by no longer calling them for WC3.
+            bool isWC3Cockpit = !this->cockpit->instrumentShapes.empty();
+            if (this->face == CockpitFace::CP_FRONT) {
+                if (isWC3Cockpit) {
+                    this->RenderWC3Instruments(fb, this->cockpit_view_mode == WC3CockpitViewMode::HUD_ONLY);
+                    this->RenderWC3TargetingReticle(fb);
                 } else {
-                    pmfd = pmfd_right;
+                    this->RenderRAWS({84, 112}, fb);
+                    this->RenderAlti({161, 166}, fb);
+                    this->RenderSpeedOmetter({125, 166}, fb);
                 }
+            } else if (this->face == CockpitFace::CP_BIG) {
+                if (!isWC3Cockpit) {
+                    this->RenderRAWSBig({84, 112}, fb);
+                }
+            }
+            // Was pmfd_right=screen-x0/pmfd_left=screen-(width-...) — the
+            // names were swapped from their actual screen position (whoever
+            // wrote this mixed up which side is "left"). Renamed to match
+            // reality while restructuring this block for the right MFD's
+            // new dedicated purpose below.
+            //
+            // MFD panel origin/size: previously computed from
+            // MONI.SHAP.GetWidth()/GetHeight() for SC cockpits (a real,
+            // populated field there) but read as uninitialized memory for
+            // WC3 (RLEShape's dist fields have no default member
+            // initializer, and MONI.SHAP is never populated by
+            // InitFromWC3Ram), then later "fixed" to a hardcoded 115x95
+            // guess — neither used the real per-cockpit COCK>VDU chunk,
+            // which RenderWC3Instruments/RenderWC3InstrumentsSVGA already
+            // read for their own instrument-icon positioning. Using a
+            // different, disagreeing origin here meant every RenderMFDS*
+            // panel's background/gauges could be drawn misaligned with the
+            // cockpit art's actual VDU cutouts. Now sourced from the same
+            // real vgaFrontVDU/svgaFrontVDU data (selected the same way
+            // RenderTargetWithCam already picks targetHudVGA/SVGA), falling
+            // back to the old 115x95 screen-edge guess only if the file has
+            // no valid VDU chunk at all.
+            Point2D mfdSize = this->GetWC3MfdSize();
+            int mfdW = mfdSize.x;
+            int mfdH = mfdSize.y;
+            Point2D pmfd_left, pmfd_right;
+            const RSCockpit::WC3VDULayout &vdu = g_ifVGA ? this->cockpit->vgaFrontVDU : this->cockpit->svgaFrontVDU;
+            if (isWC3Cockpit && vdu.valid) {
+                pmfd_left = {vdu.leftX, vdu.leftY};
+                pmfd_right = vdu.GetRightOrigin(g_ifVGA ? 320 : 640);
+            } else {
+                if (!isWC3Cockpit) {
+                    mfdW = this->cockpit->MONI.SHAP.GetWidth();
+                    mfdH = this->cockpit->MONI.SHAP.GetHeight();
+                }
+                pmfd_left = {0, fb->height - mfdH};
+                pmfd_right = {fb->width - mfdW - 1, fb->height - mfdH};
+            }
+            // Right MFD is dedicated to the target scan/ID display now —
+            // always rendered, independent of show_weapons/etc, which used
+            // to double up onto both panels (the left MFD keeps that
+            // rotation below, but only ever draws to the left slot).
+            this->RenderMFDSTarget(pmfd_right, fb);
+            auto renderRadar = [&]() {
                 float range = 0.0f;
                 switch (this->radar_zoom) {
                 case 1:
@@ -1523,43 +3587,38 @@ void SCCockpit::Render(CockpitFace face) {
                     range = 18520.0f * 8.0f;
                     break;
                 }
-                this->RenderMFDSRadar(pmfd, range, this->radar_mode);
+                this->RenderMFDSRadar(pmfd_left, range, this->radar_mode);
+            };
+            // User-confirmed (2026-07 session), WC3 only: there is no
+            // toggle key for the radar — it always draws, at "the
+            // predefined compass area" (WC3CockpitShapeId::
+            // kCompassDialMedium's real position, self-computed inside
+            // RenderMFDSTargetRadarWC3 via GetCompassAreaRect),
+            // independent of the left-MFD page rotation below.
+            // show_radars/MDFS_RADAR's key press (SCStrike.cpp) is now a
+            // no-op for WC3 — kept, not removed, since SCStrike.cpp is
+            // shared and Strike Commander's own (non-WC3) radar page is
+            // unaffected: it keeps its original show_radars-gated
+            // left-MFD-panel behavior as the first branch of the rotation
+            // below, exactly as before this change — no equivalent user
+            // confirmation exists for SC.
+            if (isWC3Cockpit) {
+                renderRadar();
             }
-            if (this->show_weapons) {
-                if (!mfds) {
-                    pmfd = pmfd_left;
-                    mfds = true;
-                } else {
-                    pmfd = pmfd_right;
-                }
-                this->RenderMFDSWeapon(pmfd);
-            }
-            if (this->show_comm) {
-                if (!mfds) {
-                    pmfd = pmfd_left;
-                    mfds = true;
-                } else {
-                    pmfd = pmfd_right;
-                }
-                this->RenderMFDSComm(pmfd, this->comm_target);
-            }
-            if (this->show_damage) {
-                if (!mfds) {
-                    pmfd = pmfd_left;
-                    mfds = true;
-                } else {
-                    pmfd = pmfd_right;
-                }
-                this->RenderMFDSDamage(pmfd, fb);
-            }
-            if (this->show_cam) {
-                if (!mfds) {
-                    pmfd = pmfd_left;
-                    mfds = true;
-                } else {
-                    pmfd = pmfd_right;
-                }
-                this->RenderMFDSCamera(pmfd, fb);
+            if (!isWC3Cockpit && this->show_radars) {
+                renderRadar();
+            } else if (this->show_weapons) {
+                this->RenderMFDSWeapon(pmfd_left);
+            } else if (this->show_comm) {
+                this->RenderMFDSComm(pmfd_left, this->comm_target);
+            } else if (this->show_damage) {
+                this->RenderMFDSDamage(pmfd_left, fb);
+            } else if (this->show_cam) {
+                this->RenderMFDSCamera(pmfd_left, fb);
+            } else if (this->show_power) {
+                this->RenderMFDSPower(pmfd_left, fb);
+            } else if (this->show_shield) {
+                this->RenderMFDSShield(pmfd_left, fb);
             }
         }
         this->RenderCommMessages({0,200}, fb);
@@ -1567,7 +3626,7 @@ void SCCockpit::Render(CockpitFace face) {
     if (this->mouse_control) {
         Mouse.draw();
     }
-    if (debug_print) {  
+    if (debug_print) {
         VGA.getFrameBuffer()->blitWithMask(debug_framebuffer->framebuffer, 0, 0, debug_framebuffer->width, debug_framebuffer->height,255);
     }
     VGA.vSync();
@@ -1591,8 +3650,20 @@ void SCCockpit::Update() {
     this->flaps = this->player_plane->GetFlaps() > 0;
     this->airbrake = this->player_plane->GetSpoilers() > 0;
     this->player = this->player_plane->object;
-    this->weapoint_coords.x = this->current_mission->waypoints[*this->nav_point_id]->spot->position.x;
-    this->weapoint_coords.y = this->current_mission->waypoints[*this->nav_point_id]->spot->position.z;
+    // Waypoints are added dynamically as the mission's own scripted programs
+    // run (SCMissionActors::flyToWaypoint() etc., via OP_SET_OBJ_FLY_TO_WP/
+    // OP_SET_OBJ_FLY_TO_AREA) — the list can legitimately still be empty
+    // here, e.g. before any such command has fired yet. No nav-point target
+    // is a valid state, not a crash: fall back to the player's own position
+    // (zero direction/azimuth) instead of indexing out of bounds.
+    if (!this->current_mission->waypoints.empty() &&
+        *this->nav_point_id < this->current_mission->waypoints.size()) {
+        this->weapoint_coords.x = this->current_mission->waypoints[*this->nav_point_id]->spot->position.x;
+        this->weapoint_coords.y = this->current_mission->waypoints[*this->nav_point_id]->spot->position.z;
+    } else {
+        this->weapoint_coords.x = this->player_plane->x;
+        this->weapoint_coords.y = this->player_plane->z;
+    }
 
     Vector2D weapoint_direction = {this->weapoint_coords.x - this->player->position.x,
                                    this->weapoint_coords.y - this->player->position.z};
@@ -1659,12 +3730,15 @@ void SCCockpit::Update() {
                     this->player_plane->weaps_load[this->player_plane->selected_weapon]->objct->wdat->effective_range;
                 Vector3D dist_to_target = this->current_target->position - this->player_plane->object->position;
                 float distance = dist_to_target.Length();
-                if (distance <= weap_range) {
-                    this->target_in_range = true;
-                }
+                // Was missing the else branch entirely -- target_in_range
+                // only ever got SET true here and reset on current_target
+                // going null (below), so once true it stayed sticky-true
+                // even after the target moved back out of range.
+                this->target_in_range = (distance <= weap_range);
             } else {
                 this->target_in_range = false;
             }
+            this->updateLockOn();
             if (weapon_names.find(static_cast<weapon_ids>(weapon_id)) != weapon_names.end()) {
                 txt = weapon_names[static_cast<weapon_ids>(weapon_id)];
             } else {
@@ -1761,6 +3835,56 @@ void SCCockpit::Update() {
     this->cockpit_camera.update();
 
 }
+// See declaration comment (SCCockpit.h) and target_locked/lock_progress's
+// own comments for the full design. Called once per Update() tick, only
+// while a weapon is selected and target_in_range has just been computed
+// for it (see call site). Does its own current_target -> SCMissionActors*
+// lookup rather than reading current_target_actor, since that member isn't
+// refreshed for this frame until later in Update().
+void SCCockpit::updateLockOn() {
+    uint32_t nowTicks = SDL_GetTicks();
+    float dt = (this->m_lastLockTicks != 0) ? (float)(nowTicks - this->m_lastLockTicks) / 1000.0f : 0.0f;
+    this->m_lastLockTicks = nowTicks;
+
+    bool inCone = false;
+    if (this->target_in_range && this->current_target != nullptr &&
+        this->player_plane->weaps_load[this->player_plane->selected_weapon] != nullptr) {
+        int weaponId = this->player_plane->weaps_load[this->player_plane->selected_weapon]->objct->wdat->weapon_id;
+        SCMissionActors *targetActor = nullptr;
+        for (auto actor : this->current_mission->enemies) {
+            if (actor->object == this->current_target && actor->is_active) {
+                targetActor = actor;
+                break;
+            }
+        }
+        if (targetActor == nullptr) {
+            for (auto actor : this->current_mission->friendlies) {
+                if (actor->object == this->current_target && actor->is_active) {
+                    targetActor = actor;
+                    break;
+                }
+            }
+        }
+        if (targetActor != nullptr) {
+            if (weaponId == weapon_ids::ID_HSMISS) {
+                // Heatseeker: only locks while the target's engines face the
+                // player, i.e. the player is behind the target.
+                inCone = (SCMissionActors::ClassifyHitQuadrant(targetActor, this->player->position) == HitQuadrant::Back);
+            } else {
+                // IR/FF/Torpedo/T-bomb (and anything else lock-gated): just
+                // requires the target to be generally in front of the player.
+                inCone = (SCMissionActors::ClassifyHitQuadrant(this->current_mission->player, this->current_target->position) == HitQuadrant::Front);
+            }
+        }
+    }
+
+    if (inCone) {
+        this->lock_progress += dt;
+    } else {
+        this->lock_progress = 0.0f;
+    }
+    this->target_locked = (this->lock_progress >= kLockThresholdSeconds);
+}
 void SCCockpit::RenderHUD() {
     FrameBuffer *hud = this->hud_framebuffer;
     if (hud == nullptr) {
@@ -1817,6 +3941,61 @@ void SCCockpit::RenderAlti(Point2D pmfd_left = {177, 179}, FrameBuffer *fb = nul
     fb->line(center.x, center.y, thousandsEnd.x, thousandsEnd.y, 223); // Thousands needle
     fb->line(center.x, center.y, hundredsEnd.x, hundredsEnd.y, 90);    // Hundreds needle (different color)
 }
+void SCCockpit::RenderShieldGauge(Point2D top_left, FrameBuffer *fb) {
+    if (!fb) {
+        fb = VGA.getFrameBuffer();
+    }
+    if (this->cockpit == nullptr) {
+        return;
+    }
+    auto it = this->cockpit->instrumentShapes.find(WC3CockpitShapeId::kBarMeterFillA);
+    if (it == this->cockpit->instrumentShapes.end() || it->second == nullptr) {
+        return;
+    }
+    RSImageSet *fillSet = it->second;
+    size_t numFrames = fillSet->GetNumImages();
+    if (numFrames == 0) {
+        return;
+    }
+    if (this->player_plane == nullptr || this->player_plane->pilot == nullptr) {
+        return;
+    }
+    SCMissionActors *pilot = this->player_plane->pilot;
+    if (pilot->object == nullptr || pilot->object->entity == nullptr) {
+        return;
+    }
+    // Front-facing shield (the facing a pilot in combat cares about most) —
+    // see SCMissionActors::shield_front/max_shield_front, seeded from
+    // RSEntity::SHLD_FX and decremented per-hit in hasBeenHit. Falls back
+    // to the flat health fraction for any ship with no SHLD chunk at all
+    // (max_shield_front stays 0 for those — see WC3Mission.cpp's
+    // buildActorFromPart).
+    float fraction;
+    if (pilot->max_shield_front > 0.0f) {
+        fraction = pilot->shield_front / pilot->max_shield_front;
+    } else {
+        int maxHealth = pilot->object->entity->health;
+        if (maxHealth <= 0) {
+            return;
+        }
+        fraction = (float)pilot->health / (float)maxHealth;
+    }
+    if (fraction < 0.0f) fraction = 0.0f;
+    if (fraction > 1.0f) fraction = 1.0f;
+    // Frame-select-by-fraction, not time — same idea as kTargetHealthBar
+    // (see RenderTargetWithCam/WC3CockpitShapeId). Which end of the 12-frame
+    // sequence reads as "full" vs "empty" is an unconfirmed guess (frame 0 =
+    // full, last frame = empty) pending a live visual check — the header's
+    // own id-identification comments never pinned this down either.
+    size_t frameIdx = (size_t)((1.0f - fraction) * (float)(numFrames - 1) + 0.5f);
+    if (frameIdx >= numFrames) frameIdx = numFrames - 1;
+    RLEShape *shape = fillSet->GetShape(frameIdx);
+    if (shape == nullptr) {
+        return;
+    }
+    shape->SetPosition(&top_left);
+    fb->drawShape(shape);
+}
 void SCCockpit::RenderSpeedOmetter(Point2D pmfd_left = {125, 166}, FrameBuffer *fb = nullptr) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
@@ -1870,10 +4049,28 @@ bool SCCockpit::RenderCommMessages(Point2D pmfd_text, FrameBuffer *fb) {
         background_message->SetPosition(&b_message_pos);
         Point2D radio_text = {4, b_message_pos.y + 9};
         fb->drawShape(background_message);
-        RSFont *fnt = this->cockpit->PLAQ.fonts[1].font;
-        std::string radio_message = this->current_mission->radio_messages[0]->message;
-        std::transform(radio_message.begin(), radio_message.end(), radio_message.begin(), ::toupper);
-        fb->printText(fnt, &radio_text, (char *)radio_message.c_str(), 0, 0, (uint32_t)radio_message.size(), 2, 2);
+        // Was a hardcoded fonts[1] (crashed on any cockpit whose PLAQ only
+        // carries one FONT sub-chunk, e.g. Longbow/BOMPIT, live-tested
+        // 2026-07 session) — fonts isn't a fixed tiny/wide pair, its size
+        // matches however many FONT chunks that cockpit's file actually
+        // has, indexed in parse order, not by PlaqueFontSize. Look up the
+        // wide font by its real size tag instead, falling back to whatever
+        // font exists if no wide one was parsed.
+        RSFont *fnt = nullptr;
+        for (auto &plaqueFont : this->cockpit->PLAQ.fonts) {
+            if (plaqueFont.size == PlaqueFontSize::wide) {
+                fnt = plaqueFont.font;
+                break;
+            }
+        }
+        if (fnt == nullptr && !this->cockpit->PLAQ.fonts.empty()) {
+            fnt = this->cockpit->PLAQ.fonts[0].font;
+        }
+        if (fnt != nullptr) {
+            std::string radio_message = this->current_mission->radio_messages[0]->message;
+            std::transform(radio_message.begin(), radio_message.end(), radio_message.begin(), ::toupper);
+            fb->printText(fnt, &radio_text, (char *)radio_message.c_str(), 0, 0, (uint32_t)radio_message.size(), 2, 2);
+        }
         if (this->radio_mission_timer > 0) {
             this->radio_mission_timer--;
         }
@@ -1886,8 +4083,19 @@ bool SCCockpit::RenderCommMessages(Point2D pmfd_text, FrameBuffer *fb) {
 }
 
 void SCCockpit::RenderMFDSCamera(Point2D pmfd_left, FrameBuffer *fb) {
+    // No WC3-native camera MFD page exists yet (no chunk in the cockpit
+    // file carries camera-page layout data to build one from) — but this
+    // function's SC-only body below reads MONI.SHAP.GetWidth/Height(),
+    // uninitialized memory for a WC3 cockpit (RLEShape's dist fields have
+    // no default initializer, and MONI is never populated by
+    // InitFromWC3Ram), to size a buffer allocation. Bail out before that
+    // rather than risk a garbage-sized allocation/crash — show_cam is a
+    // real, reachable keybinding.
+    if (!this->cockpit->instrumentShapes.empty()) {
+        return;
+    }
     SCRenderer &renderer = SCRenderer::getInstance();
-    
+
     if (!fb) {
         fb = VGA.getFrameBuffer();
     }
@@ -2109,6 +4317,53 @@ void SCCockpit::RenderIrTargetHud(Point2D position, FrameBuffer *fb, CHUD *hud, 
         }
     }
 }
+// Primary target indicator, drawn unconditionally whenever current_target
+// is set (unlike RenderTargetingReticle's own target square, which only
+// ever draws under WM_HUD_LCOS). Complete square = target_hard_locked
+// (sticky, press-L lock); broken corner-bracket = auto-targeted only, per
+// the user's spec: each edge keeps its outer quarter on both ends, middle
+// half removed. Color: red for an enemy target, blue for a friendly one —
+// resolved via current_target_actor's team_id vs. the player's, same
+// enemies+friendlies scan Update() already does (SCCockpit.cpp:~2450).
+void SCCockpit::RenderTargetBox(FrameBuffer *fb, Point2D hudTopLeft, Point2D hudBottomRight, Point2D hudCenter) {
+    if (this->current_target == nullptr) {
+        return;
+    }
+    int hud_width = hudBottomRight.x - hudTopLeft.x;
+    int hud_height = hudBottomRight.y - hudTopLeft.y;
+    int hud_center_x = hud_width / 2;
+    int hud_center_y = hud_height / 2;
+    int Xtarget = 0, Ytarget = 0;
+    if (!project_to_screen(this->current_target->position, Xtarget, Ytarget)) {
+        return;
+    }
+    if (this->is_3d_cockpit == false) {
+        Xtarget = Xtarget - hudCenter.x + hud_center_x + hudTopLeft.x;
+        Ytarget = Ytarget - hudCenter.y + hud_center_y + hudTopLeft.y;
+    }
+    bool isFriendly = (this->current_target_actor != nullptr && this->current_mission != nullptr &&
+                        this->current_mission->player != nullptr &&
+                        this->current_target_actor->team_id == this->current_mission->player->team_id);
+    uint8_t color = isFriendly ? ClosestPaletteIndex(this->palette, 0, 0, 255)
+                                : ClosestPaletteIndex(this->palette, 255, 0, 0);
+    int box_size = (this->face == CockpitFace::CP_BIG) ? 10 : 8;
+    if (this->target_hard_locked) {
+        fb->lineWithBox(Xtarget - box_size, Ytarget - box_size, Xtarget + box_size, Ytarget - box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget + box_size, Ytarget - box_size, Xtarget + box_size, Ytarget + box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget + box_size, Ytarget + box_size, Xtarget - box_size, Ytarget + box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget - box_size, Ytarget + box_size, Xtarget - box_size, Ytarget - box_size, color, 0, fb->width, 0, fb->height);
+    } else {
+        int half = box_size / 2;
+        fb->lineWithBox(Xtarget - box_size, Ytarget - box_size, Xtarget - half, Ytarget - box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget + half, Ytarget - box_size, Xtarget + box_size, Ytarget - box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget - box_size, Ytarget + box_size, Xtarget - half, Ytarget + box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget + half, Ytarget + box_size, Xtarget + box_size, Ytarget + box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget - box_size, Ytarget - box_size, Xtarget - box_size, Ytarget - half, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget - box_size, Ytarget + half, Xtarget - box_size, Ytarget + box_size, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget + box_size, Ytarget - box_size, Xtarget + box_size, Ytarget - half, color, 0, fb->width, 0, fb->height);
+        fb->lineWithBox(Xtarget + box_size, Ytarget + half, Xtarget + box_size, Ytarget + box_size, color, 0, fb->width, 0, fb->height);
+    }
+}
 void SCCockpit::RenderHUD(Point2D position, FrameBuffer *fb) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
@@ -2186,7 +4441,8 @@ void SCCockpit::RenderHUD(Point2D position, FrameBuffer *fb) {
             default:
                 break;
         }
-    }    
+    }
+    this->RenderTargetBox(fb, hud_top_left, hud_bottom_right, hud_center);
 }
 void SCCockpit::RenderTextTags(Point2D position, FrameBuffer *fb, CHUD *hud, RSFont *font) {
     if (!fb) {

@@ -138,11 +138,14 @@ void Keyboard::TextEditor::setActive(bool active, const SDL_Rect* inputRect) {
     }
 }
 
-std::string Keyboard::TextEditor::getDisplayText() const {
+std::string Keyboard::TextEditor::getDisplayText(bool blink) const {
     if (!m_active) {
         return m_text;
     }
-    
+    if (blink && (SDL_GetTicks() % 1000) >= 500) {
+        return m_text;
+    }
+
     // Insérer le caractère '_' à la position du curseur
     std::string displayText = m_text;
     displayText.insert(m_cursorPosition, "_");

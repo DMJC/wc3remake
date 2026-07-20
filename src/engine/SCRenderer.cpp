@@ -7,6 +7,7 @@
 //
 
 #include "SCRenderer.h"
+#include "GLBatch.h"
 #include "Config.hpp"
 #include "../realspace/AssetManager.h"
 #include "../realspace/RSArea.h"
@@ -17,11 +18,14 @@
 #include "Texture.h"
 #include <SDL_opengl_glext.h>
 #include <SDL_opengl.h>
+#include <set>
 
 #include <unordered_map>
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <cstring>
+#include <string>
 
 SCRenderer &Renderer = SCRenderer::getInstance();
 
@@ -33,7 +37,33 @@ static inline void FixEntityWinding(RSEntity* obj) {
         float invN = 1.0f / (float)obj->vertices.size();
         center.x *= invN; center.y *= invN; center.z *= invN;
     }
+    // Interior geometry (RSEntity::is_interior_geometry, e.g. a capital
+    // ship's flight_deck_entity) is a corridor meant to be viewed from
+    // inside it, so its faces must point INWARD toward the mesh's own
+    // centroid instead of away from it like every exterior-viewed model.
+    float outwardSign = obj->is_interior_geometry ? -1.0f : 1.0f;
+    // Flipping a triangle/quad's winding here means swapping ids[1]/ids[2]
+    // (or ids[1]/ids[3] for a quad) in place — but the corresponding UV
+    // data (object->uvs/qmapuvs) is a SEPARATE array, indexed by
+    // triangleID, whose per-corner uv0/uv1/uv2 ordering was authored
+    // against the file's ORIGINAL (unflipped) ids order and is never
+    // touched here. Any face this heuristic flips becomes texture-mapped
+    // with its corners paired to the wrong UV coordinates — reads as a
+    // rotated/twisted texture — confirmed by live testing (player ship and
+    // Hobbes, both HELLCATP, showing rotated textures once they finally
+    // rendered lit/visible after other fixes). This used to only matter for
+    // hull (which already unconditionally skipped the flip, see below) and
+    // was partially papered over for the interior model with an empirical
+    // 180-degree UV rotation hack — but it silently hit every other model
+    // that underwent a flip, fighters included. Now that backface culling
+    // is unconditionally disabled and lighting is unconditionally two-sided
+    // for every model (see drawModel/drawModelColorPass/
+    // drawModelTexturePass), winding direction has no remaining effect on
+    // visibility or lighting — so this flip has nothing left to fix and
+    // only breaks UV alignment. Skip it for everything.
+    bool skipWindingFix = true;
     auto ensureTriOutward = [&](uint16_t ids[3]) {
+        if (skipWindingFix) return;
         const Vector3D& a = obj->vertices[ids[0]];
         const Vector3D& b = obj->vertices[ids[1]];
         const Vector3D& c = obj->vertices[ids[2]];
@@ -44,7 +74,7 @@ static inline void FixEntityWinding(RSEntity* obj) {
                     e1.x*e2.y - e1.y*e2.x };
         Vector3D faceC{ (a.x+b.x+c.x)/3.0f, (a.y+b.y+c.y)/3.0f, (a.z+b.z+c.z)/3.0f };
         Vector3D outward{ faceC.x-center.x, faceC.y-center.y, faceC.z-center.z };
-        float d = n.x*outward.x + n.y*outward.y + n.z*outward.z;
+        float d = outwardSign * (n.x*outward.x + n.y*outward.y + n.z*outward.z);
         if (d < 0.0f) std::swap(ids[1], ids[2]); // flip winding
     };
     for (auto& t : obj->triangles) ensureTriOutward(t.ids);
@@ -205,7 +235,15 @@ const AABB& SCRenderer::computeBlockAABB(RSArea* area, int LOD, int blockId) {
                 -std::numeric_limits<float>::infinity() };
 
     AreaBlock* block = area->GetAreaBlockByID(LOD, blockId);
-    if (!block) {
+    // Defense-in-depth alongside the real fix (WC3Mission.cpp's
+    // is_space_mission/world->tera check) — a block whose zip data never
+    // actually loaded (e.g. a bad/missing terrain filename) can exist as an
+    // object but with sideSize left uninitialized/corrupted rather than
+    // the real ≤20 (vertice is a fixed 400 = 20×20 array), which turned
+    // "x + y*sideSize" below into a genuine out-of-bounds read and
+    // segfault. Treat an out-of-range sideSize the same as "no block"
+    // rather than crashing.
+    if (!block || block->sideSize == 0 || block->sideSize > 20) {
         box.min = {0,0,0}; box.max = {0,0,0};
         return areaCache.emplace(key, box).first->second;
     }
@@ -271,7 +309,17 @@ void SCRenderer::PrecomputeAABBs(RSArea* area, int minLOD, int maxLOD) {
 }
 // Helpers: calcule les normales par sommet pour un LOD donné (Gouraud)
 static void AccumulateFaceNormal(const RSEntity* obj, int i0, int i1, int i2, const Point3D& camPos, std::vector<Vector3D>& acc) {
-    Vector3D e1 = obj->vertices[i0]; Vector3D pivot = obj->vertices[i1]; e1.Substract(&pivot);
+    // Must match FixEntityWinding's own cross-product convention
+    // (e1 = ids[1]-ids[0], e2 = ids[2]-ids[0]) exactly, since that function
+    // is what decides/fixes each triangle's winding to face outward. Using
+    // the previous pivot-at-i1 order here (e1 = i0-i1, e2 = i2-i1) computes
+    // the exact NEGATION of that outward normal for the same ids order —
+    // confirmed by live testing: single-sided-lit models (regular fighters,
+    // which don't get the two-sided/fabs lighting used for hull/interior
+    // geometry) rendered fully dark until directly facing away from the
+    // light, i.e. inverted normals.
+    Vector3D pivot = obj->vertices[i0];
+    Vector3D e1 = obj->vertices[i1]; e1.Substract(&pivot);
     Vector3D e2 = obj->vertices[i2]; e2.Substract(&pivot);
     Vector3D n = e1.CrossProduct(&e2);
     n.Normalize();
@@ -319,7 +367,11 @@ static void ComputeVertexNormalsForLOD(RSEntity* obj, size_t lodLevel, const Poi
         }
     }
 
-    // Normalisation finale
+    // Normalisation finale. A vertex never referenced by any triangle/quad
+    // actually included in this LOD (attachment/mount-point markers,
+    // vertices only used by a different LOD, etc.) never gets a face
+    // contribution above and stays the zero vector — see Vector3D::Normalize
+    // (Matrix.h) for why that used to poison lighting with NaN colors.
     for (auto& n : outNormals) {
         n.Normalize();
     }
@@ -451,17 +503,17 @@ void SCRenderer::drawTexturedQuad(Vector3D pos, Vector3D orientation, std::vecto
     glRotatef(orientation.x, 0, 1, 0);
     glRotatef(orientation.y, 0, 0, 1);
     glRotatef(orientation.z, 1, 0, 0);
-    glColor4f(1.0f, 1.0f, 1.0f, 0.0f);
-    glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, 0.0f);
-    glVertex3f(quad[0].x, quad[0].y, quad[0].z);
-    glTexCoord2f(1.0f, 0.0f);
-    glVertex3f(quad[1].x, quad[1].y, quad[1].z);
-    glTexCoord2f(1.0f, 1.0f);
-    glVertex3f(quad[2].x, quad[2].y, quad[2].z);
-    glTexCoord2f(0.0f, 1.0f);
-    glVertex3f(quad[3].x, quad[3].y, quad[3].z);
-    glEnd();
+    gb.color4f(1.0f, 1.0f, 1.0f, 0.0f);
+    gb.begin(GL_QUADS);
+    gb.texCoord2f(0.0f, 0.0f);
+    gb.vertex3f(quad[0].x, quad[0].y, quad[0].z);
+    gb.texCoord2f(1.0f, 0.0f);
+    gb.vertex3f(quad[1].x, quad[1].y, quad[1].z);
+    gb.texCoord2f(1.0f, 1.0f);
+    gb.vertex3f(quad[2].x, quad[2].y, quad[2].z);
+    gb.texCoord2f(0.0f, 1.0f);
+    gb.vertex3f(quad[3].x, quad[3].y, quad[3].z);
+    gb.end();
     glPopMatrix();
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_BLEND);
@@ -488,20 +540,20 @@ void SCRenderer::drawParticle(Vector3D pos, float alpha) {
     smoke_rotation.Identity();
     smoke_rotation.translateM(pos.x, pos.y, pos.z);
     glMultMatrixf((float *)smoke_rotation.v);
-    glBegin(GL_QUADS);
-    glColor4f(1.0f,1.0f,1.0f, alpha);
-    glVertex3f(1.0f,-1.0f,-1.0f);
-    glVertex3f(1.0f,1.0f,-1.0f);
-    glVertex3f(-1.0f,1.0f,-1.0f);
-    glVertex3f(-1.0f,-1.0f,1.0f);
-    glEnd();
-    glBegin(GL_QUADS);
-    glColor4f(1.0f,1.0f,1.0f, alpha);
-    glVertex3f(-1.0f,-1.0f,-1.0f);
-    glVertex3f(-1.0f,1.0f,-1.0f);
-    glVertex3f(1.0f,1.0f,1.0f);
-    glVertex3f(1.0f,-1.0f,1.0f);
-    glEnd();
+    gb.begin(GL_QUADS);
+    gb.color4f(1.0f,1.0f,1.0f, alpha);
+    gb.vertex3f(1.0f,-1.0f,-1.0f);
+    gb.vertex3f(1.0f,1.0f,-1.0f);
+    gb.vertex3f(-1.0f,1.0f,-1.0f);
+    gb.vertex3f(-1.0f,-1.0f,1.0f);
+    gb.end();
+    gb.begin(GL_QUADS);
+    gb.color4f(1.0f,1.0f,1.0f, alpha);
+    gb.vertex3f(-1.0f,-1.0f,-1.0f);
+    gb.vertex3f(-1.0f,1.0f,-1.0f);
+    gb.vertex3f(1.0f,1.0f,1.0f);
+    gb.vertex3f(1.0f,-1.0f,1.0f);
+    gb.end();
     glPopMatrix();
     glDisable( GL_BLEND );
 }
@@ -528,14 +580,260 @@ void SCRenderer::drawModel(RSEntity *object, size_t lodLevel, Vector3D position,
     drawModel(object, lodLevel);
     glPopMatrix(); 
 }
-void SCRenderer::drawModel(RSEntity *object, size_t lodLevel, Vector3D position, Vector3D orientation) {
+void SCRenderer::drawModelFlatColor(RSEntity *object, size_t lodLevel, Vector3D color) {
+    if (object == nullptr || object->vertices.empty() || object->lods.empty()) {
+        return;
+    }
+    size_t currentLodLevel = lodLevel;
+    if (currentLodLevel >= object->NumLods()) {
+        currentLodLevel = object->NumLods() - 1;
+    }
+    Lod *lod = &object->lods[currentLodLevel];
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_LIGHTING);
+    gb.color3f(color.x, color.y, color.z);
+    for (int i = 0; i < lod->numTriangles; i++) {
+        uint16_t id = lod->triangleIDs[i];
+        uint16_t realId = id;
+        char type = 'T';
+        bool hasAttr = object->attrs.size() > 0;
+        if (hasAttr) {
+            auto it = object->attrs.find(id);
+            if (it == object->attrs.end() || it->second == nullptr) {
+                continue;
+            }
+            type = it->second->type;
+            if (type == 'L') {
+                continue;
+            }
+            realId = it->second->id;
+        }
+        if (type == 'T' && realId < object->triangles.size()) {
+            Triangle &t = object->triangles[realId];
+            gb.begin(GL_TRIANGLES);
+            for (int j = 0; j < 3; j++) {
+                Vector3D v = object->vertices[t.ids[j]];
+                gb.vertex3f(v.x, v.y, v.z);
+            }
+            gb.end();
+        } else if (type == 'Q' && realId < object->quads.size()) {
+            Quads *q = object->quads[realId];
+            gb.begin(GL_QUADS);
+            for (int j = 0; j < 4; j++) {
+                Vector3D v = object->vertices[q->ids[j]];
+                gb.vertex3f(v.x, v.y, v.z);
+            }
+            gb.end();
+        }
+    }
+    // Do NOT re-enable GL_LIGHTING here: this engine never uses OpenGL's
+    // fixed-function lighting (no glLightfv/glMaterial calls exist anywhere
+    // in the codebase — every model's lighting is computed manually via
+    // ComputeLambertAt/ComputeLambertAtTwoSided and applied through
+    // glColor). With debugMagentaTurrets on, this function runs once per
+    // frame per capital-ship turret; the stray glEnable(GL_LIGHTING) that
+    // used to be here left lighting ON for every model drawn afterward in
+    // that same frame, and since no GL light/material is ever configured,
+    // GL's fallback (ambient-only, ~0.2 factor) rendered them nearly black —
+    // confirmed by live testing (player ship/Hobbes went solid black,
+    // reappearing only via the manual-lighting glColor when this state
+    // wasn't yet clobbered).
+    glEnable(GL_CULL_FACE);
+    glEnable(GL_TEXTURE_2D);
+}
+void SCRenderer::drawModel(RSEntity *object, size_t lodLevel, Vector3D position, Vector3D orientation,
+                            bool respectLodLevel) {
     glPushMatrix();
     glTranslatef(static_cast<GLfloat>(position.x), static_cast<GLfloat>(position.y),
                 static_cast<GLfloat>(position.z));
     glRotatef(orientation.x, 0, 1, 0);
     glRotatef(orientation.y, 0, 0, 1);
     glRotatef(orientation.z, 1, 0, 0);
-    drawModel(object, lodLevel);
+    drawModel(object, lodLevel, respectLodLevel);
+    // Capital-ship gun turrets (SSHP>WEAP>CPTL>TURT, e.g. VICTORY.IFF —
+    // see RSEntity::turrets/TURRET). Each mount sits at a fixed local
+    // offset on the hull. Both the mount/base mesh and the separate
+    // gun/barrel mesh get the same yaw+pitch and the same position —
+    // matching wc-iff-loader's own turret handling (applyRotation bakes
+    // the identical (yaw, pitch) into both baseM and gunM, then places
+    // both at the same basePos), not a hierarchical "mount yaws only, gun
+    // additionally pitches within that frame" scheme. No AI/targeting
+    // drives yaw/pitch yet, so turrets currently just render at their
+    // static mount orientation from the IFF data.
+    if (object != nullptr) {
+        for (auto turret : object->turrets) {
+            if (turret == nullptr || turret->mount_objct == nullptr) {
+                continue;
+            }
+            glPushMatrix();
+            // Derived from the one thing actually confirmed correct — the
+            // hull's own vertices (APPR>POLY>VERT): parsed 1st raw field
+            // -> vertex.z, 2nd -> vertex.x, 3rd -> vertex.y, then used
+            // directly with no further permutation at render time
+            // (gb.vertex3f(v.x, v.y, v.z)), and the hull renders correctly.
+            // TURT position is parsed in plain 1st->x, 2nd->y, 3rd->z order
+            // (confirmed by directly decoding VICTORY.IFF's raw TURT bytes
+            // — see parseREAL_OBJT_SSHP_WEAP_CPTL_TURT), so to land on the
+            // same engine axes as a vertex whose raw fields matched, this
+            // needs render_X = turret.y (2nd field), render_Y = turret.z
+            // (3rd field), render_Z = turret.x (1st field). (Previously
+            // tried matching RSEntity::AFTB's own render-time X/Z swap
+            // instead, but that convention was never independently
+            // confirmed correct either — don't propagate an unverified
+            // sibling's guess.)
+            glTranslatef(turret->y, turret->z, turret->x);
+            // Rotation axes must transform under the same raw->render
+            // permutation as position (raw1/x->renderZ, raw2/y->renderX,
+            // raw3/z->renderY — see the derivation above), since an axis of
+            // rotation is itself a direction in the same coordinate space.
+            // Yaw (turret swivel) rotating around the file's own raw-Z (its
+            // confirmed "up" axis, matching where vertex/position data
+            // lands) becomes renderY under that permutation — unchanged
+            // from before, and not implicated by the reported bug. Pitch
+            // (barrel elevation) was left rotating around renderX (raw-Y)
+            // by analogy to SCPlane's own pitch-around-X convention, but
+            // that's a different coordinate space (already-remapped engine
+            // space) and was never independently confirmed for turrets the
+            // way position was — user-reported (2026-07 session, screenshot)
+            // wrong-axis rotation on VICTORY.IFF's top turrets. Corrected to
+            // raw-X -> renderZ, following the same permutation as position.
+            // Bottom-mounted turrets are a real, distinct mount type — but
+            // detecting them by position (turret->z < 0, the raw field that
+            // maps to renderY) is unreliable: real TCRUISER.IFF data has 3
+            // turrets sitting almost exactly on the centerline (z of -3.0/
+            // -3.07/-3.0 — noise, not a real ventral mount) that a z<0 check
+            // wrongly caught, flipping/reversing turrets that should render
+            // like ordinary top-style ones (confirmed by their own yaw=0,
+            // identical to the real top turrets — user-reported, 2026-07
+            // session, "three turrets on TCRUISER look wrong"). The file's
+            // own yaw field is the real, unambiguous marker instead: every
+            // confirmed bottom turret (VICTORY.IFF and TCRUISER.IFF, 10
+            // turrets total across both) reads exactly yaw=180, while every
+            // top turret reads 0 or +-45 — never anything close to 180.
+            // isBottomMount keys off that instead of position.
+            bool isBottomMount = fabsf(turret->yaw - 180.0f) < 1.0f;
+            // Two confirmed-separate real symptoms of bottom mounts (user
+            // testing, 2026-07 session, VICTORY.IFF and TCRUISER.IFF): (1)
+            // the base rendered entirely upside down — fixed below via an
+            // extra 180-degree flip; (2) independently of that, they face
+            // backward instead of forward — applying the file's own yaw=180
+            // literally, on top of the flip, produces the opposite facing
+            // from what an unflipped yaw=0 top turret shows. Corrected by
+            // adding a further 180 degrees of yaw for bottom mounts
+            // (yaw+180+180 = yaw+360, i.e. the same effective horizontal
+            // facing as an ordinary yaw=0 top turret), independent of the
+            // base flip.
+            float turretYaw = turret->yaw + (isBottomMount ? 180.0f : 0.0f);
+            glRotatef(turretYaw, 0, 1, 0);
+            glRotatef(turret->pitch, 0, 0, 1);
+            // Base-upside-down fix: the mount/gun meshes are presumably
+            // authored assuming they sit on top of a surface; a ventral
+            // mount needs an extra flip around a horizontal axis to point
+            // away from the hull (downward) instead of into it. Applied as
+            // the innermost rotation (right before drawModel, so it
+            // corrects the mesh's own local orientation before yaw/pitch
+            // act on it) rather than folded into yaw/pitch themselves,
+            // since it's a structural mount correction, not part of the aim
+            // angle. Axis choice (renderX) is the one remaining axis not
+            // already used by yaw/pitch — confirmed correct by live testing
+            // (base no longer upside down). Separately, the reported
+            // "barrels point fore/aft instead of perpendicular to the mesh"
+            // symptom affects turrets with pitch=0 too, so it isn't
+            // explained by this fix or by pitch's rotation axis at all —
+            // still unresolved, needs more real data (e.g. the gun mesh's
+            // own default local facing direction) before guessing further.
+            if (isBottomMount) {
+                glRotatef(180.0f, 1, 0, 0);
+            }
+            if (this->debugMagentaTurrets) {
+                drawModelFlatColor(turret->mount_objct, 0, {1.0f, 0.0f, 1.0f});
+                if (turret->gun_objct != nullptr) {
+                    drawModelFlatColor(turret->gun_objct, 0, {1.0f, 0.0f, 1.0f});
+                }
+            } else {
+                drawModel(turret->mount_objct, 0);
+                if (turret->gun_objct != nullptr) {
+                    drawModel(turret->gun_objct, 0);
+                }
+            }
+            glPopMatrix();
+        }
+        // WEAP>CPTL>CRGO: flight-deck cargo (parked fighters, crates, a
+        // truck) — see RSEntity::cargo/CARGO_OBJECT. User-confirmed
+        // (2026-07 session): these sit on the ship's own hangar deck.
+        // deckY comes from flight_deck_entity's own real bounding box:
+        // its vertices already share the hull's coordinate space (both
+        // are drawn at the same actor position/orientation — see
+        // SCStrike.cpp's showHangarInterior), so its bb.min.y is a real,
+        // confirmed deck-floor height.
+        //
+        // X position (rowOffset, record-offset 29) is now REAL, decoded
+        // data — found by comparing KCARRIER.IFF's straight rows of
+        // Dralthi/Darket fighters (user: "KCARRIER.IFF has rows of
+        // Dralthi and Darket fighters lined up on the flight deck")
+        // against VICTORY.IFF: every KCARRIER record is byte-identical
+        // except this field, which steps by an exact constant (200.0)
+        // between consecutive fighters; VICTORY's own bay-row trio steps
+        // by a constant -126.0 the same way, and the diagonal hellcats +
+        // truck extend smoothly past the row's end — i.e. genuinely next
+        // to it, with no hand-tuned offset needed. Used directly as the
+        // local X coordinate (see CARGO_OBJECT's comment for the
+        // magnitude cross-check against VICTEST3.IFF's real bounding box).
+        //
+        // This replaces the entire previous approach (multiple rounds of
+        // hand-tuned slot/anchor/cluster placement based on yaw-sign
+        // grouping alone), which kept being wrong because it was guessing
+        // positions instead of reading them.
+        //
+        // Z (which wall a bay/cluster sits against) still has no decoded
+        // field, so it's still approximated via yaw + deckOffsetY
+        // grouping: cargo with yaw 0 sits against the bay-alcove wall
+        // (biased toward max.z — user-confirmed after an earlier wrong
+        // guess at min.z), including deckOffsetY-flagged equipment
+        // (drums/crates, user-confirmed same wall as the row); "tbol_h"
+        // (yaw +135, user: "the thunderbolt is on the side of the hangar
+        // which doesn't have the hangar bays on it") goes on the opposite
+        // wall — user-confirmed correct. The diagonal hellcats (yaw -135)
+        // and the truck were first placed at the Z midpoint (open floor,
+        // not against either wall) — user reported that was wrong, they
+        // should be against a wall too, like the thunderbolt — so they now
+        // share the thunderbolt's wall (noBayWallZ) instead of a separate
+        // open-floor position. "box7" is a single confirmed exception
+        // within the equipment group — user reported it specifically (not
+        // the other drums/crates) is on the wrong wall, so it's hand-
+        // pinned to noBayWallZ by name, same as "truck".
+        if (object->flight_deck_entity != nullptr && !object->cargo.empty()) {
+            BoudingBox *deckBB = object->flight_deck_entity->GetBoudingBpx();
+            float deckY = deckBB->min.y;
+            float deckZSpan = deckBB->max.z - deckBB->min.z;
+            float bayRowZ = deckBB->min.z + deckZSpan * 0.85f;
+            float noBayWallZ = deckBB->min.z + deckZSpan * 0.15f;
+
+            for (auto *c : object->cargo) {
+                if (c == nullptr || c->objct == nullptr) {
+                    continue;
+                }
+                float z;
+                if (c->name == "truck" || c->name == "box7" || c->yaw > 1.0f || c->yaw < -1.0f) {
+                    z = noBayWallZ;
+                } else {
+                    z = bayRowZ;
+                }
+                glPushMatrix();
+                glTranslatef(c->rowOffset, deckY, z);
+                glRotatef(c->yaw, 0, 1, 0);
+                // User-confirmed real behavior (2026-07 session): cargo
+                // objects (WEAP>CPTL>CRGO) default to their LOD 1, not
+                // LOD 0 — see drawModel(RSEntity*, size_t, bool)'s own
+                // respectLodLevel comment for why passing a real index
+                // requires that flag (otherwise this silently forces
+                // LOD 0 like every other model on the ship).
+                drawModel(c->objct, 1, true);
+                glPopMatrix();
+            }
+        }
+    }
     glPopMatrix();
 }
 void SCRenderer::drawPoint(Vector3D point, Vector3D color, Vector3D pos, Vector3D orientation) {
@@ -545,10 +843,10 @@ void SCRenderer::drawPoint(Vector3D point, Vector3D color, Vector3D pos, Vector3
     glRotatef(orientation.y, 0, 0, 1);
     glRotatef(orientation.z, 1, 0, 0);
     glPointSize(5.0f);
-    glBegin(GL_POINTS);
-    glColor3f(color.x, color.y, color.z);
-    glVertex3f(point.x, point.y, point.z);
-    glEnd();
+    gb.begin(GL_POINTS);
+    gb.color3f(color.x, color.y, color.z);
+    gb.vertex3f(point.x, point.y, point.z);
+    gb.end();
     glPopMatrix();
 }
 void SCRenderer::drawModel(RSEntity *object, Vector3D position, Vector3D orientation) {
@@ -565,6 +863,110 @@ void SCRenderer::drawModel(RSEntity *object, Vector3D position, Vector3D orienta
     drawModel(object, lodLevel);
     glPopMatrix();
 }
+// Energy bolt: a diamond-cross-section prism that tapers to a sharp point
+// at one end, reusing the exact vertex/face data authored in
+// Laser_bolt.obj verbatim (10 quad faces, long axis along local +X) --
+// replaces the old flat 2-quad cross-section shape from Energy_bolt.obj
+// (user-confirmed 2026-07 session: shared by every energy weapon via
+// getGunBoltColor's per-weapon recolor, same as before -- a shape swap
+// only, not a per-weapon lookup). NOT remapped to -Z. Unlike SCPlane::
+// forward (which treats ship-model -Z as forward, per ptw's own rotateM
+// convention), the azimuthf/elevationf this function receives comes from
+// GunSimulatedObject's cartesianToPolar(velocity): phi=atan2(x,z),
+// theta=acos(y/r), so azimuthf=elevationf=0 (identity rotation) corresponds
+// to a pure +X velocity, not -Z. Real WC3 missile meshes rendered through
+// this same orient={azimuthf,elevationf,0} path are therefore authored nose
+// along +X too -- confirmed the hard way: remapping to -Z put the bolt's
+// long axis 90 degrees off (across the cockpit instead of away from it).
+void SCRenderer::drawBolt(Vector3D position, Vector3D orientation, Vector3D color) {
+    glPushMatrix();
+    Matrix rotation;
+    rotation.Clear();
+    rotation.Identity();
+    rotation.translateM(position.x, position.y, position.z);
+    rotation.rotateM(orientation.x, 0.0f, 1.0f, 0.0f);
+    rotation.rotateM(orientation.y, 0.0f, 0.0f, 1.0f);
+    rotation.rotateM(orientation.z, 1.0f, 0.0f, 0.0f);
+    glMultMatrixf((float *)rotation.v);
+    // 1.5x scale per user direction (kept from the old Energy_bolt.obj
+    // shape, unchanged here) -- not derived from Laser_bolt.obj itself.
+    glScalef(1.5f, 1.5f, 1.5f);
+
+    // User-confirmed real behavior (2026-07 session): single-sided, with
+    // every normal facing inward instead of outward -- the reverse of a
+    // normal solid's convention, and the opposite of the old drawBolt
+    // behavior (which disabled culling entirely so both sides of every
+    // face always drew, winding/normal direction irrelevant). Saved/
+    // restored around this call like the old disable did, but now sets
+    // an explicit GL_CCW/GL_BACK convention rather than trusting whatever
+    // front-face state some earlier, unrelated draw call left behind --
+    // this shape's own winding is reversed below (see `quad`) to actually
+    // point inward under that explicit convention, not just whatever the
+    // ambient state happened to be.
+    GLboolean cullWasEnabled = glIsEnabled(GL_CULL_FACE);
+    GLint prevCullFaceMode = GL_BACK;
+    glGetIntegerv(GL_CULL_FACE_MODE, &prevCullFaceMode);
+    GLint prevFrontFace = GL_CCW;
+    glGetIntegerv(GL_FRONT_FACE, &prevFrontFace);
+    glFrontFace(GL_CCW);
+    glCullFace(GL_BACK);
+    glEnable(GL_CULL_FACE);
+
+    // Laser_bolt.obj's raw vertices (Blender export, 1-indexed v1..v12,
+    // X negated below -- same "point leads, not trails" fix the old
+    // Energy_bolt.obj shape needed, and for the same reason: +X is the
+    // direction of travel (see this function's own comment above), and
+    // the sharp taper (v9-v12, all coincident -- a real point in the raw
+    // file) sits at the file's own -X end, which would trail backward
+    // instead of leading if drawn as-authored. Unconfirmed against a live
+    // render -- flag if the point ends up trailing instead of leading.
+    Vector3D v1  = {5.960000f, -0.000000f, 0.565685f};
+    Vector3D v2  = {5.960000f, 0.565685f, 0.000000f};
+    Vector3D v3  = {5.960000f, -0.565685f, -0.000000f};
+    Vector3D v4  = {5.960000f, 0.000000f, -0.565685f};
+    Vector3D v5  = {-7.960000f, -0.000000f, 0.282843f};
+    Vector3D v6  = {-7.960000f, 0.282843f, 0.000000f};
+    Vector3D v7  = {-7.960000f, -0.282843f, -0.000000f};
+    Vector3D v8  = {-7.960000f, 0.000000f, -0.282843f};
+    Vector3D tip = {8.460001f, 0.000000f, 0.000000f}; // v9/v10/v11/v12: coincident in the source file
+
+    // Reversed vertex order (d,c,b,a instead of a,b,c,d): flips the
+    // winding computed under GL_CCW/GL_BACK above from outward- to
+    // inward-facing (confirmed by direct cross-product computation on the
+    // original a,b,c,d order, which came out outward-facing -- see this
+    // function's own history/discussion). Call sites below are left
+    // exactly as transcribed from Laser_bolt.obj's own face list for
+    // readability/traceability; the flip happens once, here.
+    auto quad = [&](Vector3D a, Vector3D b, Vector3D c, Vector3D d) {
+        gb.begin(GL_QUADS);
+        gb.color3f(color.x, color.y, color.z);
+        gb.vertex3f(d.x, d.y, d.z);
+        gb.vertex3f(c.x, c.y, c.z);
+        gb.vertex3f(b.x, b.y, b.z);
+        gb.vertex3f(a.x, a.y, a.z);
+        gb.end();
+    };
+    // Faces transcribed directly from Laser_bolt.obj's own face list
+    // (f 1 10 11 2 / f 3 7 8 4 / ... -- v10/v11/v12 all equal `tip`).
+    quad(v1, tip, tip, v2);
+    quad(v3, v7, v8, v4);
+    quad(v7, v5, v6, v8);
+    quad(v5, v1, v2, v6);
+    quad(v3, v1, v5, v7);
+    quad(v8, v6, v2, v4);
+    quad(tip, tip, tip, tip); // degenerate in the source file (v10 v9 v12 v11, all coincident) -- kept for fidelity, draws nothing
+    quad(v2, tip, tip, v4);
+    quad(v3, tip, tip, v1);
+    quad(v4, tip, tip, v3);
+
+    glFrontFace(prevFrontFace);
+    glCullFace(prevCullFaceMode);
+    if (!cullWasEnabled) {
+        glDisable(GL_CULL_FACE);
+    }
+
+    glPopMatrix();
+}
 void SCRenderer::drawLine(Vector3D start, Vector3D end, Vector3D color, Vector3D orientation) {
     glPushMatrix();
     glTranslatef(start.x, start.y, start.z);
@@ -572,11 +974,11 @@ void SCRenderer::drawLine(Vector3D start, Vector3D end, Vector3D color, Vector3D
     glRotatef(orientation.y, 0, 0, 1);
     glRotatef(orientation.z, 1, 0, 0);
     glLineWidth(1.2f);
-    glBegin(GL_LINES);
-    glColor3f(color.x, color.y, color.z);
-    glVertex3f(0.0f,0.0f,0.0f);
-    glVertex3f(end.x, end.y, end.z);
-    glEnd();
+    gb.begin(GL_LINES);
+    gb.color3f(color.x, color.y, color.z);
+    gb.vertex3f(0.0f,0.0f,0.0f);
+    gb.vertex3f(end.x, end.y, end.z);
+    gb.end();
     glPopMatrix();
 }
 void SCRenderer::drawLine(Vector3D start, Vector3D end, Vector3D color, Vector3D orientation, Vector3D position) {
@@ -586,22 +988,22 @@ void SCRenderer::drawLine(Vector3D start, Vector3D end, Vector3D color, Vector3D
     glRotatef(orientation.y, 0, 0, 1);
     glRotatef(orientation.z, 1, 0, 0);
     glLineWidth(1.2f);
-    glBegin(GL_LINES);
-    glColor3f(color.x, color.y, color.z);
-    glVertex3f(start.x, start.y, start.z);
-    glVertex3f(end.x, end.y, end.z);
-    glEnd();
+    gb.begin(GL_LINES);
+    gb.color3f(color.x, color.y, color.z);
+    gb.vertex3f(start.x, start.y, start.z);
+    gb.vertex3f(end.x, end.y, end.z);
+    gb.end();
     glPopMatrix();
 }
 void SCRenderer::drawLine(Vector3D start, Vector3D end, Vector3D color) {
     glPushMatrix();
     glTranslatef(start.x, start.y, start.z);
     glLineWidth(2.2f);
-    glBegin(GL_LINES);
-    glColor3f(color.x, color.y, color.z);
-    glVertex3f(0.0f,0.0f,0.0f);
-    glVertex3f(end.x, end.y, end.z);
-    glEnd();
+    gb.begin(GL_LINES);
+    gb.color3f(color.x, color.y, color.z);
+    gb.vertex3f(0.0f,0.0f,0.0f);
+    gb.vertex3f(end.x, end.y, end.z);
+    gb.end();
     glPopMatrix();
 }
 void SCRenderer::drawSprite(Vector3D pos, Texture *tex, float zoom) {
@@ -639,40 +1041,41 @@ void SCRenderer::drawSprite(Vector3D pos, Texture *tex, float zoom) {
         glBindTexture(GL_TEXTURE_2D, tex->id);
     }
     float smoke_size = 4.0f * zoom + 1.0f;
-    glBegin(GL_QUADS);
-    glColor4f(1.0f,1.0f,1.0f,0.0f);
-    glTexCoord2f (0.0, 0.0);
-    glVertex3f(smoke_size,-smoke_size,-smoke_size);
-    glTexCoord2f (1.0, 0.0);
-    glVertex3f(smoke_size,smoke_size,-smoke_size);
-    glTexCoord2f (1.0, 1.0);
-    glVertex3f(-smoke_size,smoke_size,-smoke_size);
-    glTexCoord2f (0.0, 1.0);
-    glVertex3f(-smoke_size,-smoke_size,smoke_size);
-    glEnd();
-    glBegin(GL_QUADS);
-    glColor4f(1.0f,1.0f,1.0f,0.0f);
-    glTexCoord2f (0.0, 0.0);
-    glVertex3f(-smoke_size,-smoke_size,-smoke_size);
-    glTexCoord2f (1.0, 0.0);
-    glVertex3f(-smoke_size,smoke_size,-smoke_size);
-    glTexCoord2f (1.0, 1.0);
-    glVertex3f(smoke_size,smoke_size,smoke_size);
-    glTexCoord2f (0.0, 1.0);
-    glVertex3f(smoke_size,-smoke_size,smoke_size);
-    glEnd();
+    gb.begin(GL_QUADS);
+    gb.color4f(1.0f,1.0f,1.0f,0.0f);
+    gb.texCoord2f(0.0, 0.0);
+    gb.vertex3f(smoke_size,-smoke_size,-smoke_size);
+    gb.texCoord2f(1.0, 0.0);
+    gb.vertex3f(smoke_size,smoke_size,-smoke_size);
+    gb.texCoord2f(1.0, 1.0);
+    gb.vertex3f(-smoke_size,smoke_size,-smoke_size);
+    gb.texCoord2f(0.0, 1.0);
+    gb.vertex3f(-smoke_size,-smoke_size,smoke_size);
+    gb.end();
+    gb.begin(GL_QUADS);
+    gb.color4f(1.0f,1.0f,1.0f,0.0f);
+    gb.texCoord2f(0.0, 0.0);
+    gb.vertex3f(-smoke_size,-smoke_size,-smoke_size);
+    gb.texCoord2f(1.0, 0.0);
+    gb.vertex3f(-smoke_size,smoke_size,-smoke_size);
+    gb.texCoord2f(1.0, 1.0);
+    gb.vertex3f(smoke_size,smoke_size,smoke_size);
+    gb.texCoord2f(0.0, 1.0);
+    gb.vertex3f(smoke_size,-smoke_size,smoke_size);
+    gb.end();
     glPopMatrix();
     glDisable( GL_BLEND );
     glDisable(GL_TEXTURE_2D);
 }
 void SCRenderer::drawModelWithChilds(
     RSEntity *object,
-    size_t lodLevel, 
+    size_t lodLevel,
     Vector3D position,
-    Vector3D orientation, 
-    int wheel_index, 
-    int thrust, 
-    std::vector<std::tuple<Vector3D, RSEntity *>> weaps_load
+    Vector3D orientation,
+    int wheel_index,
+    int thrust,
+    std::vector<std::tuple<Vector3D, RSEntity *>> weaps_load,
+    bool afterburnerEngaged
 ) {
     if (object != nullptr) {
         glPushMatrix();
@@ -685,7 +1088,7 @@ void SCRenderer::drawModelWithChilds(
         rotation.rotateM(orientation.z, 1.0f, 0.0f, 0.0f);
 
         glMultMatrixf((float *)rotation.v);
-        
+
         Renderer.drawModel(object, this->lodLevel);
         if (wheel_index) {
             if (object->chld.size() > wheel_index) {
@@ -703,6 +1106,44 @@ void SCRenderer::drawModelWithChilds(
                 glTranslatef(pos.z/250 , pos.y /250 , pos.x /250);
                 glScalef(1+thrust/100.0f,1,1);
                 Renderer.drawModel(object->chld[0]->objct, this->lodLevel);
+                glPopMatrix();
+            }
+        }
+        // WC3 engine-thrust cones (SSHP>AFTB — see RSEntity.h/.cpp): the
+        // named subobject (e.g. "AFBURN2") mounted at each of this ship's
+        // engine positions, picking one of its 8 DETA levels by throttle.
+        // LVL0-LVL6 are the 7 throttle-percentage thrust-glow states
+        // (0%..100%); LVL7 is the afterburner-engaged flame, now driven by
+        // the real AFTERBURNER key state (SCPlane::afterburner_engaged)
+        // instead of the old thrust>=60 approximation.
+        if (object->afterburner != nullptr && object->afterburner->objct != nullptr &&
+            !object->afterburner->positions.empty() && !object->afterburner->objct->lods.empty()) {
+            int clampedThrottle = thrust < 0 ? 0 : (thrust > 100 ? 100 : thrust);
+            size_t maxLod = object->afterburner->objct->lods.size() - 1;
+            size_t detaIndex;
+            if (afterburnerEngaged) {
+                detaIndex = (maxLod < 7) ? maxLod : 7;
+            } else {
+                size_t throttleMaxLod = (maxLod < 6) ? maxLod : 6;
+                detaIndex = ((size_t)clampedThrottle * throttleMaxLod) / 100;
+            }
+            for (auto &mount : object->afterburner->positions) {
+                glPushMatrix();
+                // Same derivation as the capital-ship turret mount fix
+                // (see the 4-arg drawModel(RSEntity*, size_t, Vector3D,
+                // Vector3D) overload above): AFTB positions are parsed in
+                // plain 1st->x, 2nd->y, 3rd->z order and already scaled to
+                // world units at parse time (see
+                // parseREAL_OBJT_SSHP_AFTB_DATA's /256.0f), so they need
+                // the same axis remap as the hull's own vertices
+                // (render_X = 2nd field, render_Y = 3rd field, render_Z =
+                // 1st field) and no further scaling — this previously
+                // divided by an extra 250 on top of the already-applied
+                // /256 parse-time scale, and used a different (X/Z swap)
+                // axis order that was never independently confirmed
+                // correct.
+                glTranslatef(mount.y, mount.z, mount.x);
+                Renderer.drawModel(object->afterburner->objct, detaIndex, true);
                 glPopMatrix();
             }
         }
@@ -724,6 +1165,53 @@ void SCRenderer::drawModelWithChilds(
 }
 void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vector<Vector3D> &vertexNormals, float ambientLamber, Vector3D lightEye, float *MV) {
     Lod *lod = &object->lods[lodLevel];
+    static int interior_colorpass_debug = 0;
+    static int hull_colorpass_debug = 0;
+    bool isHull = !object->is_interior_geometry && object->flight_deck_entity != nullptr;
+    static int dist_colorpass_debug = 0;
+    bool debugColorPass = (object->is_interior_geometry && interior_colorpass_debug < 3) ||
+                           (isHull && hull_colorpass_debug < 3) ||
+                           (isHull && this->forceDebugDumpFrames > 0) ||
+                           (object->entity_type == EntityType::dist && dist_colorpass_debug < 3);
+    // FixEntityWinding's "away from the whole mesh's centroid" heuristic
+    // isn't reliable for ANY model with concave detail relative to its own
+    // centroid — not just large non-convex hulls/interiors, but ordinary
+    // fighter models too (a canopy bubble, an intake recess): confirmed by
+    // live testing (HELLCATP, used by both the player ship and Hobbes,
+    // rendered with visible holes into its own interior from wrongly-culled
+    // faces). Culling is unconditionally disabled below (see drawModel) for
+    // every model now, so light every face two-sided here too rather than
+    // trusting a winding-dependent normal that may point either way.
+    bool forceTwoSidedLighting = true;
+    int drawnTris = 0, skippedTris = 0, drawnQuads = 0, skippedQuads = 0;
+    if (debugColorPass) {
+        if (object->entity_type == EntityType::dist) { dist_colorpass_debug++; }
+        else if (isHull) { hull_colorpass_debug++; } else { interior_colorpass_debug++; }
+        printf("DEBUG ATTR KEYS (first 15 of %zu):", object->attrs.size());
+        int n = 0;
+        for (auto &kv : object->attrs) {
+            if (n++ >= 15) break;
+            printf(" %u(type=%c,id=%u)", kv.first, kv.second ? kv.second->type : '?', kv.second ? kv.second->id : 0);
+        }
+        printf("\n");
+        printf("DEBUG LOD triangleIDs (first 15 of %u):", (unsigned)lod->numTriangles);
+        for (int i = 0; i < lod->numTriangles && i < 15; i++) {
+            printf(" %u", lod->triangleIDs[i]);
+        }
+        printf("\n");
+        printf("DEBUG DIRECT LOOKUP for triangleIDs[0..14]:");
+        for (int i = 0; i < lod->numTriangles && i < 15; i++) {
+            uint16_t id = lod->triangleIDs[i];
+            auto it = object->attrs.find(id);
+            if (it == object->attrs.end()) {
+                printf(" [%u:MISSING]", id);
+            } else {
+                Attr *a = it->second;
+                printf(" [%u:type=%c,props1=%u,props2=%u,mappedId=%u]", id, a ? a->type : '?', a ? a->props1 : 0, a ? a->props2 : 0, a ? a->id : 0);
+            }
+        }
+        printf("\n");
+    }
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     // Pass 1, draw color
@@ -745,24 +1233,25 @@ void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vect
             continue;
         }
         Triangle *triangle = &object->triangles[triangleID];
-        if (triangle->property == RSEntity::SC_TRANSPARENT)
+        if (triangle->property == RSEntity::SC_TRANSPARENT) {
             continue;
+        }
         float alpha = 1.0f;
         if (triangle->property == 6 && this->show_textured) {
             continue;
-            
+
         }
         if (triangle->property == 9 && this->show_textured) {
             continue;
         }
-        bool twoSided = false;
+        bool twoSided = forceTwoSidedLighting;
         if (triangle->flags[2] == 1) {
             twoSided = true; // If all vertices are at the same Z, we assume it's a 2D quad
         }
         if (twoSided) {
             glDisable(GL_CULL_FACE);
         }
-        glBegin(GL_TRIANGLES);
+        gb.begin(GL_TRIANGLES);
         for (int j = 0; j < 3; j++) {
             Vector3D vLocal = object->vertices[triangle->ids[j]];
             Vector3D nLocal = vertexNormals[triangle->ids[j]];
@@ -772,16 +1261,19 @@ void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vect
                 : ComputeLambertAt(vLocal, nLocal, MV, lightEye, ambientLamber);
 
             const Texel *texel = palette.GetRGBColor(triangle->color);
-            glColor4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
+            gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
                       texel->b / 255.0f * lambertianFactor, alpha);
 
-            glVertex3f(vLocal.x, vLocal.y, vLocal.z);
+            gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
         }
-        glEnd();
-        if (twoSided) {
-            glEnable(GL_CULL_FACE);
-        }
-        
+        gb.end();
+        drawnTris++;
+        // Culling is disabled for the whole model up in drawModel (every
+        // model is now lit/rendered two-sided — see forceTwoSidedLighting),
+        // so it must never be re-enabled mid-model here: doing so used to
+        // reintroduce the exact "wrongly culled face" holes that disabling
+        // it was meant to fix, once forceTwoSidedLighting stopped being
+        // conditional on model type.
     }
     if (object->quads.size() > 0) {
         for (int i = 0; i < lod->numTriangles; i++) {
@@ -789,6 +1281,9 @@ void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vect
             int prop1 = 0;
             int prop2 = 0;
             if (object->attrs.size() > 0) {
+                if (object->attrs[triangleID] == nullptr) {
+                    continue;
+                }
                 if (object->attrs[triangleID]->type == 'T') {
                     continue;
                 }
@@ -798,33 +1293,34 @@ void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vect
                 prop1 = object->attrs[triangleID]->props1;
                 prop2 = object->attrs[triangleID]->props2;
                 triangleID = object->attrs[triangleID]->id;
-                
+
             }
             if (triangleID >= object->quads.size()) {
                 continue;
             }
             Quads *triangle = object->quads[triangleID];
-    
-            if (triangle->property == RSEntity::SC_TRANSPARENT)
+
+            if (triangle->property == RSEntity::SC_TRANSPARENT) {
                 continue;
+            }
             float alpha = 1.0f;
             if (triangle->property == 6 && this->show_textured) {
                 continue;
-                
+
             }
             if (triangle->property == 9 && this->show_textured) {
                 continue;
-                
+
             }
 
-            bool twoSided = false;
-            
-            
-            twoSided = prop2 == 1;
+            bool twoSided = forceTwoSidedLighting;
+
+
+            twoSided = twoSided || (prop2 == 1);
             if (twoSided) {
                 glDisable(GL_CULL_FACE);
             }
-            glBegin(GL_QUADS);
+            gb.begin(GL_QUADS);
             for (int j = 0; j < 4; j++) {
                 Vector3D vLocal = object->vertices[triangle->ids[j]];
                 Vector3D nLocal = vertexNormals[triangle->ids[j]];
@@ -833,24 +1329,193 @@ void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vect
                 ? ComputeLambertAtTwoSided(vLocal, nLocal, MV, lightEye, ambientLamber)
                 : ComputeLambertAt(vLocal, nLocal, MV, lightEye, ambientLamber);
 
-                const Texel *texel = palette.GetRGBColor(triangle->color-1);
-                glColor4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
+                // No -1 here — matches this same function's triangle loop
+                // above (palette.GetRGBColor(triangle->color), no offset)
+                // and DebugObjectViewer.cpp's reference implementation
+                // (palette.GetRGBColor(quad->color)). This quad loop was the
+                // only one of the two using triangle->color-1, which for
+                // color=0 wraps (uint8_t 0-1) to palette index 255 instead
+                // of index 0.
+                const Texel *texel = palette.GetRGBColor(triangle->color);
+                gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
                           texel->b / 255.0f * lambertianFactor, alpha);
                 
                 
-                glVertex3f(vLocal.x, vLocal.y, vLocal.z);
+                gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
             }
-            glEnd();
-            if (twoSided) {
-                glEnable(GL_CULL_FACE);
-            }
+            gb.end();
+            drawnQuads++;
+            // Culling is disabled for the whole model up in drawModel
+            // (every model is now rendered two-sided), so never re-enable
+            // it mid-model here.
         }
+    }
+    if (debugColorPass) {
+        printf("DEBUG COLORPASS: lod->numTriangles=%u drawnTris=%d drawnQuads=%d attrs.size=%zu triangles.size=%zu quads.size=%zu\n",
+               (unsigned)lod->numTriangles, drawnTris, drawnQuads, object->attrs.size(), object->triangles.size(), object->quads.size());
     }
     glDisable(GL_BLEND);
 }
 void SCRenderer::drawModelTexturePass(RSEntity *object, size_t lodLevel, std::vector<Vector3D> &vertexNormals, float ambientLamber, Vector3D lightEye, float *MV) {
-    // Texture pass
-    if (lodLevel == 0) {
+    static int interior_texpass_debug = 0;
+    static int hull_texpass_debug = 0;
+    bool isHullTex = !object->is_interior_geometry && object->flight_deck_entity != nullptr;
+    static int dist_texpass_debug = 0;
+    bool debugTexPass = (object->is_interior_geometry && interior_texpass_debug < 3) ||
+                         (isHullTex && hull_texpass_debug < 3) ||
+                         (isHullTex && this->forceDebugDumpFrames > 0) ||
+                         (object->entity_type == EntityType::dist && dist_texpass_debug < 3);
+    // Capital-ship hulls (flight_deck_entity != nullptr, e.g. VICTORY.IFF)
+    // share the hangar-interior submesh's "packed texture atlas" shape: a
+    // face's raw UV pixel coordinates only span a sub-rectangle of the
+    // source image, not its full width/height. Dividing by the full
+    // dimensions (the plain-fighter-model path below) under-fills the face
+    // and samples past the sprite into the atlas's magenta colorkey
+    // padding — confirmed by live testing (hull rendered as solid
+    // magenta/black/white instead of its ship-panel texture). Per-face
+    // min/max UV normalization (same fix already applied to the interior
+    // model) fixes both the same way.
+    bool usePerFaceUVNorm = object->is_interior_geometry || object->flight_deck_entity != nullptr;
+    // FixEntityWinding's "away from the whole mesh's centroid" heuristic
+    // isn't just unreliable for large non-convex hulls — it's also wrong
+    // for ordinary fighter models with any concave detail relative to their
+    // own centroid (a canopy bubble, an intake recess, a wingroot fillet):
+    // confirmed by live testing (HELLCATP, used by both the player ship and
+    // Hobbes, rendered with visible holes into its own interior — some
+    // faces wrongly classified as backfaces and culled). Since culling is
+    // now unconditionally disabled below (drawModel) for every model, not
+    // just hull/interior, light every face two-sided here too rather than
+    // trusting a winding-dependent normal that may point either way.
+    bool forceTwoSidedLighting = true;
+    // Some ships' texture atlases carry placeholder/reference images
+    // literally named BACK/FRONT/BMD9/BSD1/BMDX5 (e.g. VICTORY.IFF's own
+    // flight-deck-entrance opening) that were never meant to actually
+    // render — confirmed against wc-iff-loader, which suppresses these same
+    // named textures deliberately (isBackOrFrontLabel). Precompute which of
+    // this model's own images match so both UV loops below can skip them.
+    std::vector<bool> skipTextureImage(object->images.size(), false);
+    for (size_t i = 0; i < object->images.size(); i++) {
+        std::string imgName(object->images[i]->name, strnlen(object->images[i]->name, 8));
+        while (!imgName.empty() && (imgName.back() == '\0' || imgName.back() == ' ')) {
+            imgName.pop_back();
+        }
+        std::transform(imgName.begin(), imgName.end(), imgName.begin(), ::toupper);
+        if (imgName == "BACK" || imgName == "FRONT" || imgName == "BMD9" || imgName == "BSD1" || imgName == "BMDX5") {
+            skipTextureImage[i] = true;
+        }
+    }
+    // drawModelColorPass and drawModelTransparentPass both only draw faces
+    // that appear in the current LOD's own triangleIDs list; this pass used
+    // to iterate object->uvs/qmapuvs directly instead, which cover every
+    // UV-mapped face across the WHOLE model (all LOD levels' geometry
+    // combined, not just this one) — so a multi-LOD capital ship like
+    // VICTORY.IFF had every LOD's textured geometry drawn simultaneously
+    // and overlapping, not just LOD0's. Confirmed by live testing (reported
+    // as "3 linked cubes"/multiple LODs visibly overlapping) and by the
+    // data itself: LOD0 here only selects 433 of the model's 623 total
+    // triangle+quad entries, yet this pass drew UV data for all of them
+    // unconditionally. Build the same LOD-membership set colorPass/
+    // transparentPass already compute (raw triangleIDs -> attrs type/id
+    // remap) and skip anything not actually part of this LOD.
+    Lod *lod = &object->lods[lodLevel];
+    std::vector<bool> triInLod(object->triangles.size(), false);
+    std::vector<bool> quadInLod(object->quads.size(), false);
+    for (int i = 0; i < lod->numTriangles; i++) {
+        uint16_t id = lod->triangleIDs[i];
+        if (object->attrs.size() > 0) {
+            auto it = object->attrs.find(id);
+            if (it == object->attrs.end() || it->second == nullptr) continue;
+            if (it->second->type == 'T') {
+                uint16_t realId = it->second->id;
+                if (realId < triInLod.size()) triInLod[realId] = true;
+            } else if (it->second->type == 'Q') {
+                uint16_t realId = it->second->id;
+                if (realId < quadInLod.size()) quadInLod[realId] = true;
+            }
+        } else {
+            // No attrs metadata to disambiguate triangle vs quad — match
+            // colorPass's own no-attrs fallback (raw id used directly as
+            // the array index into whichever array is non-empty) by
+            // marking both; permissive, but no worse than the old
+            // fully-unfiltered behavior for models built this way.
+            if (id < triInLod.size()) triInLod[id] = true;
+            if (id < quadInLod.size()) quadInLod[id] = true;
+        }
+    }
+    // Per-texture (not per-face) UV min/max, for usePerFaceUVNorm below.
+    // Real user-reported bug (2026-07 session, VICTORY.IFF's hull): a
+    // texture can legitimately be split across several adjacent faces —
+    // e.g. one "40" marking image sliced in half across two neighboring
+    // hull quads, confirmed by direct extraction (the two quads share an
+    // edge in world space, and their raw UV ranges are non-overlapping,
+    // contiguous halves of the same source image). Normalizing each face's
+    // own min/max independently (the original per-FACE version of this)
+    // stretches each half to fill its own face completely, so the same
+    // image renders twice instead of split once — exactly the "texture
+    // repeated twice" report. Aggregating the min/max across every face
+    // that shares a texture ID fixes that (each half now normalizes against
+    // the true combined span, so it lands at its real fractional position)
+    // while leaving the original single-face "packed atlas" case (the one
+    // usePerFaceUVNorm was first written for — a face using a small corner
+    // of a much bigger shared sheet) unchanged, since a texture used by
+    // only one face has an aggregate span identical to that face's own.
+    std::unordered_map<uint16_t, std::pair<UV, UV>> texUVSpan;
+    if (usePerFaceUVNorm) {
+        auto foldSpan = [&](uint16_t texID, const UV* uvs, int count) {
+            auto it = texUVSpan.find(texID);
+            UV mn = uvs[0], mx = uvs[0];
+            for (int k = 1; k < count; k++) {
+                mn.u = std::min(mn.u, uvs[k].u); mx.u = std::max(mx.u, uvs[k].u);
+                mn.v = std::min(mn.v, uvs[k].v); mx.v = std::max(mx.v, uvs[k].v);
+            }
+            if (it == texUVSpan.end()) {
+                texUVSpan[texID] = {mn, mx};
+            } else {
+                it->second.first.u = std::min(it->second.first.u, mn.u);
+                it->second.first.v = std::min(it->second.first.v, mn.v);
+                it->second.second.u = std::max(it->second.second.u, mx.u);
+                it->second.second.v = std::max(it->second.second.v, mx.v);
+            }
+        };
+        for (int i = 0; i < object->NumUVs(); i++) {
+            uvxyEntry* t = &object->uvs[i];
+            if (t->triangleID >= triInLod.size() || !triInLod[t->triangleID]) continue;
+            foldSpan(t->textureID, t->uvs, 3);
+        }
+        for (auto* quv : object->qmapuvs) {
+            if (quv->triangleID >= quadInLod.size() || !quadInLod[quv->triangleID]) continue;
+            foldSpan(quv->textureID, quv->uvs, 4);
+        }
+    }
+    int skippedBadTexId = 0, skippedBadTriId = 0, drawnTexTris = 0, alphaZeroTris = 0, skippedNotInLodTris = 0;
+    if (debugTexPass) {
+        if (object->entity_type == EntityType::dist) { dist_texpass_debug++; }
+        else if (isHullTex) { hull_texpass_debug++; } else { interior_texpass_debug++; }
+        printf("DEBUG TEXPASS: NumUVs=%zu images.size=%zu triangles.size=%zu qmapuvs.size=%zu quads.size=%zu\n",
+               object->NumUVs(), object->images.size(), object->triangles.size(), object->qmapuvs.size(), object->quads.size());
+        for (int i = 0; i < object->NumUVs() && i < 15; i++) {
+            uvxyEntry *t = &object->uvs[i];
+            printf("DEBUG TEXPASS UV[%d]: triangleID=%u textureID=%u uv0=(%u,%u) uv1=(%u,%u) uv2=(%u,%u)\n",
+                   i, t->triangleID, t->textureID, t->uvs[0].u, t->uvs[0].v, t->uvs[1].u, t->uvs[1].v, t->uvs[2].u, t->uvs[2].v);
+        }
+    }
+    // Texture pass. This whole body used to be gated behind `lodLevel ==
+    // 0` — a second, independent hardcoding of the same "every caller
+    // always passes LOD 0" assumption drawModel(RSEntity*, size_t, bool)
+    // used to bake in globally (see that function's own respectLodLevel
+    // comment). Harmless as long as that was true, but once AFTB's
+    // throttle/afterburner selection started actually requesting LOD 1-7
+    // (respectLodLevel=true), this silently skipped the entire textured
+    // draw for every one of those states — the engine-cone geometry was
+    // still correctly selected/lit (drawModelColorPass has no such gate),
+    // but property 6 covers 100% of this model's faces (user-reported,
+    // 2026-07 session: confirmed via a live AFTB dump), and colorPass
+    // defers every property-6/9 face to this pass — so with this pass
+    // skipped, nothing drew at all for LOD>0. The triInLod/quadInLod
+    // membership check below already correctly restricts rendering to
+    // just the requested LOD's own faces, making this extra gate not just
+    // wrong but redundant even for its original LOD-0-only use case.
+    {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_BLEND);
         for (int i = 0; i < object->NumUVs(); i++) {
@@ -858,40 +1523,110 @@ void SCRenderer::drawModelTexturePass(RSEntity *object, size_t lodLevel, std::ve
             uvxyEntry *textInfo = &object->uvs[i];
 
             // Seems we have a textureID that we don't have :( !
-            if (textInfo->textureID >= object->images.size())
+            if (textInfo->textureID >= object->images.size()) {
+                skippedBadTexId++;
                 continue;
+            }
+            if (textInfo->triangleID >= object->triangles.size()) {
+                skippedBadTriId++;
+                continue;
+            }
+            if (!triInLod[textInfo->triangleID]) {
+                skippedNotInLodTris++;
+                continue;
+            }
+            if (skipTextureImage[textInfo->textureID]) {
+                continue;
+            }
 
             RSImage *image = object->images[textInfo->textureID];
 
             Texture *texture = image->GetTexture();
             Triangle *triangle = &object->triangles[textInfo->triangleID];
+            drawnTexTris++;
             float alpha = 1.0f;
-            bool twoSided = false;
-            if (triangle->property == 6) {
-                alpha = 0.0f;
+            bool twoSided = forceTwoSidedLighting;
+            // property 6/9's alpha=0/depth-primed-duplicate treatment
+            // assumes something else already drew depth at these faces
+            // first (e.g. a canopy/glass overlay riding on the hull it
+            // covers) — true for the rare ship faces this was built for,
+            // but breaks any model where property 6/9 covers most/all of
+            // its faces instead of a handful: nothing primes depth for
+            // them, so they fail the depth test and never draw. Already
+            // confirmed and bypassed for the hangar-interior submesh
+            // (VICTEST3.IFF, 100% property 6) and capital-ship hulls; now
+            // also confirmed for regular fighter models (HELLCATP: an
+            // isolated flat-color test — bypassing this pass entirely —
+            // rendered fine under the exact same transform, proving the
+            // transform was never the problem) — bypass it everywhere
+            // rather than guessing which models are "rare" enough to need
+            // it.
+            if (alpha == 0.0f) {
+                alphaZeroTris++;
             }
-            if (triangle->property == 9) {
-                alpha = 0.0f;
-            }
-            
+
             if (triangle->flags[2] == 1) {
                 twoSided = true; // If all vertices are at the same Z, we assume it's a 2D quad
             }
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, texture->id);
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+            // These two branches were swapped: alpha==1 (opaque, the normal
+            // case — nearly every textured face) got GL_EQUAL with depth
+            // writes off, which only passes where the depth buffer already
+            // holds that exact value. Nothing primes it first (the color
+            // pass defers property 6/9 faces to this pass instead of
+            // drawing them), so every opaque textured triangle failed the
+            // depth test and never drew — confirmed by live testing (valid
+            // geometry/textures reached this code, zero visible pixels).
+            // Opaque faces need depth writes on; only the alpha==0
+            // (property 6/9) faces want the old EQUAL/no-write behavior, to
+            // avoid disturbing depth already settled by whatever they're an
+            // invisible/collision-only stand-in for. GL_LEQUAL (not
+            // GL_LESS) for the opaque case: drawModelColorPass runs first
+            // and already fills every non-6/9 face with a flat/solid color
+            // at this exact same geometry (and therefore this exact same
+            // depth) — models where most faces aren't property 6/9 (e.g.
+            // VICTORY.IFF's actual hull, unlike the hangar-interior submesh
+            // that happens to be 100% property 6) had their own texture
+            // pass consistently lose the depth test against that identical
+            // already-written depth, leaving only the flat color pass
+            // visible — confirmed by live testing (hull rendered as
+            // untextured solid-color polygons). LEQUAL lets the texture
+            // pass legitimately win that tie instead of losing it.
             if (alpha == 0.0f) {
-                glDepthFunc(GL_LESS);
-                glDepthMask(GL_TRUE);
-            } else {
                 glDepthFunc(GL_EQUAL);
                 glDepthMask(GL_FALSE);
+            } else {
+                glDepthFunc(GL_LEQUAL);
+                glDepthMask(GL_TRUE);
             }
-            
+
             if (twoSided) {
                 glDisable(GL_CULL_FACE);
             }
-            glBegin(GL_TRIANGLES);
+            // For interior geometry, normalize this face's UV span, using
+            // the min/max aggregated across every face that shares this
+            // texture ID (texUVSpan, computed above) rather than just this
+            // one face's own 3 corners — see texUVSpan's own comment for
+            // why (a texture split across multiple faces must normalize
+            // against the combined span, not fill each face independently).
+            // Rather than dividing by the texture's full pixel dimensions:
+            // a face's raw pixel coordinates only cover a sub-rectangle of
+            // the source texture, so dividing by the full width/height
+            // under-fills the face and the remaining gap repeats/tiles
+            // under GL_REPEAT — confirmed by live testing (fine repeating
+            // vertical stripes instead of one clean image spanning the
+            // wall's full top-to-bottom extent).
+            uint8_t triUMin = 255, triUMax = 0, triVMin = 255, triVMax = 0;
+            if (usePerFaceUVNorm) {
+                auto it = texUVSpan.find(textInfo->textureID);
+                if (it != texUVSpan.end()) {
+                    triUMin = it->second.first.u; triUMax = it->second.second.u;
+                    triVMin = it->second.first.v; triVMax = it->second.second.v;
+                }
+            }
+            gb.begin(GL_TRIANGLES);
             for (int j = 0; j < 3; j++) {
                 Vector3D vLocal = object->vertices[triangle->ids[j]];
                 Vector3D nLocal = vertexNormals[triangle->ids[j]];
@@ -901,64 +1636,135 @@ void SCRenderer::drawModelTexturePass(RSEntity *object, size_t lodLevel, std::ve
                 : ComputeLambertAt(vLocal, nLocal, MV, lightEye, ambientLamber);
 
                 const Texel *texel = palette.GetRGBColor(triangle->color-1);
-                
-                glColor4f(lambertianFactor, lambertianFactor, lambertianFactor, 1.0f);
-                
-                glTexCoord2f(textInfo->uvs[j].u / (float)texture->width, textInfo->uvs[j].v / (float)texture->height);
-                glVertex3f(vLocal.x, vLocal.y, vLocal.z);
+
+                gb.color4f(lambertianFactor, lambertianFactor, lambertianFactor, 1.0f);
+
+                if (usePerFaceUVNorm) {
+                    float uRange = (triUMax > triUMin) ? (float)(triUMax - triUMin) : 1.0f;
+                    float vRange = (triVMax > triVMin) ? (float)(triVMax - triVMin) : 1.0f;
+                    float uNorm = (textInfo->uvs[j].u - triUMin) / uRange;
+                    float vNorm = (textInfo->uvs[j].v - triVMin) / vRange;
+                    if (isHullTex) {
+                        // Capital-ship hulls need per-face UV min/max
+                        // normalization (packed texture atlas — see
+                        // usePerFaceUVNorm) but NOT the axis-swap rotation
+                        // below: that rotation is specific to the
+                        // hangar-interior model's own texture authoring,
+                        // not a general "packed atlas" requirement.
+                        // Confirmed by live testing: neither the interior's
+                        // rotation direction nor its opposite looked right
+                        // on VICTORY.IFF's hull; the plain (unrotated)
+                        // mapping is what's actually needed here.
+                        gb.texCoord2f(uNorm, vNorm);
+                    } else {
+                        // Hangar-interior model only (not the hull, not
+                        // ship models — see isHullTex branch above and the
+                        // plain-mapping else below). Rotation history (live
+                        // user feedback, 2026-07 session, each step relative
+                        // to the previous): started at (1-v, u) -> rotated
+                        // 90 more to (1-u, 1-v) -> rotated 180 more, which
+                        // lands back on the plain (u, v) mapping. Per-face
+                        // min/max normalization (this whole usePerFaceUVNorm
+                        // branch) still applies here even with no rotation —
+                        // that's the separate "packed atlas" tiling fix, not
+                        // this axis orientation.
+                        gb.texCoord2f(uNorm, vNorm);
+                    }
+                } else {
+                    float uNorm = textInfo->uvs[j].u / (float)texture->width;
+                    float vNorm = textInfo->uvs[j].v / (float)texture->height;
+                    gb.texCoord2f(uNorm, vNorm);
+                }
+                gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
             }
-            glEnd();
+            gb.end();
             glDepthFunc(GL_LESS);
             glDepthMask(GL_TRUE);
             glDisable(GL_TEXTURE_2D);
-            if (twoSided) {
-                glEnable(GL_CULL_FACE);
+            // Culling is disabled for the whole model up in drawModel
+            // (every model is now rendered two-sided), so never re-enable
+            // it mid-model here.
+        }
+        if (debugTexPass) {
+            printf("DEBUG TEXPASS TRI SUMMARY: drawnTexTris=%d skippedBadTexId=%d skippedBadTriId=%d alphaZeroTris=%d skippedNotInLodTris=%d\n",
+                   drawnTexTris, skippedBadTexId, skippedBadTriId, alphaZeroTris, skippedNotInLodTris);
+            int n = 0;
+            for (auto quv : object->qmapuvs) {
+                if (n++ >= 15) break;
+                printf("DEBUG TEXPASS QUV[%d]: triangleID=%u textureID=%u uv0=(%u,%u) uv1=(%u,%u) uv2=(%u,%u) uv3=(%u,%u)\n",
+                       n - 1, quv->triangleID, quv->textureID,
+                       quv->uvs[0].u, quv->uvs[0].v, quv->uvs[1].u, quv->uvs[1].v,
+                       quv->uvs[2].u, quv->uvs[2].v, quv->uvs[3].u, quv->uvs[3].v);
             }
         }
-
+        int skippedBadQuadTexId = 0, skippedBadQuadTriId = 0, drawnTexQuads = 0, alphaZeroQuads = 0, skippedNotInLodQuads = 0;
         for (auto quv: object->qmapuvs) {
-            if (quv->textureID >= object->images.size())
+            if (quv->textureID >= object->images.size()) {
+                skippedBadQuadTexId++;
                 continue;
+            }
+            if (quv->triangleID >= object->quads.size()) {
+                skippedBadQuadTriId++;
+                continue;
+            }
+            if (!quadInLod[quv->triangleID]) {
+                skippedNotInLodQuads++;
+                continue;
+            }
+            if (skipTextureImage[quv->textureID]) {
+                continue;
+            }
 
             RSImage *image = object->images[quv->textureID];
 
             Texture *texture = image->GetTexture();
             Quads *triangle = object->quads[quv->triangleID];
+            drawnTexQuads++;
             float alpha = 1.0f;
-            
-            if (triangle->property == 6) {
-                alpha = 0.0f;
-            }
-            if (triangle->property == 9) {
-                alpha = 0.0f;
+            // See the matching triangle-loop comment above — property 6/9's
+            // depth-priming assumption is bypassed for every model now, not
+            // just interiors/hulls.
+            if (alpha == 0.0f) {
+                alphaZeroQuads++;
             }
 
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, texture->id);
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-            
+            // Same swapped-branches/depth-race issue as the triangle loop
+            // above — see that comment (GL_LEQUAL, not GL_LESS).
             if (alpha == 0.0f) {
-                glDepthFunc(GL_LESS);
-                glDepthMask(GL_TRUE);
-            } else {
                 glDepthFunc(GL_EQUAL);
                 glDepthMask(GL_FALSE);
+            } else {
+                glDepthFunc(GL_LEQUAL);
+                glDepthMask(GL_TRUE);
             }
 
-            bool twoSided = false;
+            bool twoSided = forceTwoSidedLighting;
             for (auto attr : object->attrs) {
                 if (attr.second->id == quv->triangleID && attr.second->type == 'Q') {
                     int prop1 = attr.second->props1;
                     int prop2 = attr.second->props2;
-                    
-                    twoSided = prop2 == 1;
+
+                    twoSided = twoSided || (prop2 == 1);
                     break;
                 }
             }
             if (twoSided) {
                 glDisable(GL_CULL_FACE);
             }
-            glBegin(GL_QUADS);
+            // See texUVSpan's own comment (triangle loop above) — aggregated
+            // across every face sharing this texture ID, not just this quad.
+            uint8_t quadUMin = 255, quadUMax = 0, quadVMin = 255, quadVMax = 0;
+            if (usePerFaceUVNorm) {
+                auto it = texUVSpan.find(quv->textureID);
+                if (it != texUVSpan.end()) {
+                    quadUMin = it->second.first.u; quadUMax = it->second.second.u;
+                    quadVMin = it->second.first.v; quadVMax = it->second.second.v;
+                }
+            }
+            gb.begin(GL_QUADS);
             for (int j = 0; j < 4; j++) {
                 Vector3D vLocal = object->vertices[triangle->ids[j]];
                 Vector3D nLocal = vertexNormals[triangle->ids[j]];
@@ -968,17 +1774,40 @@ void SCRenderer::drawModelTexturePass(RSEntity *object, size_t lodLevel, std::ve
                 : ComputeLambertAt(vLocal, nLocal, MV, lightEye, ambientLamber);
 
                 const Texel *texel = palette.GetRGBColor(triangle->color-1);
-                glColor4f(lambertianFactor, lambertianFactor, lambertianFactor, 1.0f);                glTexCoord2f(quv->uvs[j].u / (float)texture->width, quv->uvs[j].v / (float)texture->height);
-                glVertex3f(vLocal.x, vLocal.y, vLocal.z);
+                gb.color4f(lambertianFactor, lambertianFactor, lambertianFactor, 1.0f);
+                if (usePerFaceUVNorm) {
+                    float uRange = (quadUMax > quadUMin) ? (float)(quadUMax - quadUMin) : 1.0f;
+                    float vRange = (quadVMax > quadVMin) ? (float)(quadVMax - quadVMin) : 1.0f;
+                    float uNorm = (quv->uvs[j].u - quadUMin) / uRange;
+                    float vNorm = (quv->uvs[j].v - quadVMin) / vRange;
+                    if (isHullTex) {
+                        // See the matching triangle-loop comment above —
+                        // capital-ship hulls use the plain (unrotated)
+                        // per-face-normalized mapping.
+                        gb.texCoord2f(uNorm, vNorm);
+                    } else {
+                        // See the matching triangle-loop comment above.
+                        gb.texCoord2f(uNorm, vNorm);
+                    }
+                } else {
+                    float uNorm = quv->uvs[j].u / (float)texture->width;
+                    float vNorm = quv->uvs[j].v / (float)texture->height;
+                    gb.texCoord2f(uNorm, vNorm);
+                }
+                gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
             }
-            glEnd();
+            gb.end();
 
-            if (twoSided) {
-                glEnable(GL_CULL_FACE);
-            }
+            // Culling is disabled for the whole model up in drawModel
+            // (every model is now rendered two-sided), so never re-enable
+            // it mid-model here.
             glDepthFunc(GL_LESS);
             glDepthMask(GL_TRUE);
             glDisable(GL_TEXTURE_2D);
+        }
+        if (debugTexPass) {
+            printf("DEBUG TEXPASS QUAD SUMMARY: drawnTexQuads=%d skippedBadQuadTexId=%d skippedBadQuadTriId=%d alphaZeroQuads=%d skippedNotInLodQuads=%d\n",
+                   drawnTexQuads, skippedBadQuadTexId, skippedBadQuadTriId, alphaZeroQuads, skippedNotInLodQuads);
         }
         glDisable(GL_BLEND);
     }
@@ -1023,7 +1852,7 @@ void SCRenderer::drawModelTransparentPass(RSEntity *object, size_t lodLevel, std
         if (twoSided) {
             glDisable(GL_CULL_FACE);
         }
-        glBegin(GL_TRIANGLES);
+        gb.begin(GL_TRIANGLES);
         for (int j = 0; j < 3; j++) {
             Vector3D vLocal = object->vertices[triangle->ids[j]];
             Vector3D nLocal = vertexNormals[triangle->ids[j]];
@@ -1033,15 +1862,14 @@ void SCRenderer::drawModelTransparentPass(RSEntity *object, size_t lodLevel, std
                 : ComputeLambertAt(vLocal, nLocal, MV, lightEye, ambientLamber);
 
             const Texel *texel = palette.GetRGBColor(triangle->color-1);
-            glColor4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
+            gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
                       texel->b / 255.0f * lambertianFactor, texel->a);
 
-            glVertex3f(vLocal.x, vLocal.y, vLocal.z);
+            gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
         }
-        glEnd();
-        if (twoSided) {
-            glEnable(GL_CULL_FACE);
-        }
+        gb.end();
+        // Culling is disabled for the whole model up in drawModel, so never
+        // re-enable it mid-model here.
     }
 
     if (object->quads.size() > 0) {
@@ -1073,7 +1901,7 @@ void SCRenderer::drawModelTransparentPass(RSEntity *object, size_t lodLevel, std
             if (twoSided) {
                 glDisable(GL_CULL_FACE);
             }
-            glBegin(GL_QUADS);
+            gb.begin(GL_QUADS);
             for (int j = 0; j < 4; j++) {
                 Vector3D vLocal = object->vertices[triangle->ids[j]];
                 Vector3D nLocal = vertexNormals[triangle->ids[j]];
@@ -1083,33 +1911,109 @@ void SCRenderer::drawModelTransparentPass(RSEntity *object, size_t lodLevel, std
                 : ComputeLambertAt(vLocal, nLocal, MV, lightEye, ambientLamber);
 
                 const Texel *texel = palette.GetRGBColor(triangle->color-1);
-                glColor4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
+                gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
                           texel->b / 255.0f * lambertianFactor, texel->a);
 
-                glVertex3f(vLocal.x, vLocal.y, vLocal.z);
+                gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
             }
-            glEnd();
-            if (twoSided) {
-                glEnable(GL_CULL_FACE);
-            }
+            gb.end();
+            // Culling is disabled for the whole model up in drawModel
+            // (every model is now rendered two-sided), so never re-enable
+            // it mid-model here.
         }    
     }
     
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_BLEND);
 }
-void SCRenderer::drawModel(RSEntity *object, size_t lodLevel) {
+void SCRenderer::drawModel(RSEntity *object, size_t lodLevel, bool respectLodLevel) {
     if (!initialized)
         return;
+
+    // TEMP DEBUG: galaxy skybox (DIST) billboards confirmed positioned
+    // correctly (magenta-quad test) but the real textured drawModel draw
+    // still isn't visible — dump everything the LOD-membership filter in
+    // drawModelColorPass/drawModelTexturePass actually needs, right here
+    // (rate-limited per unique entity pointer, not a global call count —
+    // the earlier unconditional version printed every frame for every one
+    // of the 6 skybox entities and buried the one-time debugColorPass/
+    // debugTexPass dumps, which never showed up in the captured output).
+    static std::set<RSEntity*> distDebugSeen;
+    if (object->entity_type == EntityType::dist && distDebugSeen.find(object) == distDebugSeen.end() && distDebugSeen.size() < 6) {
+        distDebugSeen.insert(object);
+        printf("DEBUG DIST: verts=%zu tris=%zu quads=%zu attrs=%zu images=%zu lods=%zu prepared=%d\n",
+               object->vertices.size(), object->triangles.size(), object->quads.size(),
+               object->attrs.size(), object->images.size(), object->lods.size(), object->prepared);
+        // Which local-space plane the flat quad actually lies in by default
+        // (which axis is ~constant across all 4 corners) — renderSkybox's
+        // rotation table assumes it knows this without ever having checked.
+        for (size_t vi = 0; vi < object->vertices.size(); vi++) {
+            Vector3D &v = object->vertices[vi];
+            printf("DEBUG DIST VERT[%zu]: (%.2f, %.2f, %.2f)\n", vi, v.x, v.y, v.z);
+        }
+        for (auto img : object->images) {
+            printf("DEBUG DIST IMG: w=%zu h=%zu texId=%u\n", img->width, img->height, img->GetTexture()->getTextureID());
+        }
+        for (auto &kv : object->attrs) {
+            printf("DEBUG DIST ATTR: key=%u type=%c id=%u props1=%u props2=%u\n",
+                   kv.first, kv.second ? kv.second->type : '?', kv.second ? kv.second->id : 0,
+                   kv.second ? kv.second->props1 : 0, kv.second ? kv.second->props2 : 0);
+        }
+        for (auto quv : object->qmapuvs) {
+            printf("DEBUG DIST QMAPUV: triangleID(quadIdx)=%u textureID=%u\n", quv->triangleID, quv->textureID);
+        }
+        if (object->lods.size() > 0) {
+            Lod &lod0 = object->lods[0];
+            printf("DEBUG DIST LOD0: numTriangles(faceIDs)=%u ids=[", (unsigned)lod0.numTriangles);
+            for (int i = 0; i < lod0.numTriangles; i++) printf("%u ", lod0.triangleIDs[i]);
+            printf("]\n");
+        }
+    }
 
     if (object->vertices.size() == 0)
         return;
 
-    size_t currentLodLevel = lodLevel;
+    // One-time per-entity setup (texture upload + winding fix) that every
+    // caller of this, the real gameplay draw path, always skipped — only
+    // the debug-only displayModel() ever called prepare()/FixEntityWinding.
+    // Without a winding fix, raw WC3 model data whose triangle winding
+    // doesn't already match glFrontFace(GL_CW) below gets entirely
+    // backface-culled: confirmed by live testing — real geometry loaded
+    // fine (vertices/LODs present, drawModel reached, no early return) but
+    // nothing was visible, while simple non-mesh primitives (a debug
+    // Renderer.drawPoint, the parametric background sphere) rendered fine.
+    if (!object->IsPrepared()) {
+        prepare(object);
+    }
+
+    static int interior_debug_count = 0;
+    static int hull_debug_count = 0;
+    bool isHullCall = !object->is_interior_geometry && object->flight_deck_entity != nullptr;
+    bool debugThisCall = (object->is_interior_geometry && interior_debug_count < 3) ||
+                          (isHullCall && hull_debug_count < 3) ||
+                          (isHullCall && this->forceDebugDumpFrames > 0);
+    if (debugThisCall) {
+        if (isHullCall) { hull_debug_count++; } else { interior_debug_count++; }
+        printf("DEBUG INTERIOR: prepared=%d verts=%zu tris=%zu quads=%zu attrs=%zu images=%zu lods=%zu\n",
+               object->prepared, object->vertices.size(), object->triangles.size(), object->quads.size(),
+               object->attrs.size(), object->images.size(), object->lods.size());
+        for (auto img : object->images) {
+            printf("DEBUG INTERIOR IMG: w=%zu h=%zu texId=%u\n",
+                   img->width, img->height, img->GetTexture()->getTextureID());
+        }
+    }
+
+    // Wing Commander 3 shipped in 1995; even its highest-detail LOD is
+    // trivial for any modern GPU, so always use it rather than the
+    // passed-in/config-driven level (ignoring `lodLevel` entirely here) —
+    // unless the caller explicitly says `lodLevel` is a real state
+    // selector, not a quality tier (see this overload's own header
+    // comment).
+    size_t currentLodLevel = respectLodLevel ? lodLevel : LOD_LEVEL_MAX;
     if (currentLodLevel >= object->NumLods()) {
         currentLodLevel = object->NumLods() - 1;
     }
-    
+
     for (auto img: object->images) {
         if (img->nbframes > 1) {
             img->GetNextFrame();
@@ -1129,24 +2033,47 @@ void SCRenderer::drawModel(RSEntity *object, size_t lodLevel) {
     Vector3D lightWorld{light.x, light.y, light.z};
     Vector3D lightEye = TransformPointCM(V, lightWorld);
 
-    glPolygonMode(GL_FRONT, GL_FILL);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-    glFrontFace(GL_CW);
+    glPolygonMode(GL_FRONT_AND_BACK, this->wireframeMode ? GL_LINE : GL_FILL);
+    // FixEntityWinding's centroid-based "face outward" heuristic can't
+    // reliably orient every face of a non-convex shape — true for a
+    // hangar-bay interior corridor (viewed from inside its own volume) and
+    // for capital-ship exterior hulls (hangar tunnel carved through them,
+    // turret mounts), which is why culling was already disabled for those.
+    // But it's ALSO unreliable for ordinary fighter models with any concave
+    // detail relative to their own centroid (a canopy bubble, an intake
+    // recess) — confirmed by live testing (HELLCATP, used by both the
+    // player ship and Hobbes, rendered with visible holes into its own
+    // interior: faces wrongly classified as backfaces and culled). Rather
+    // than trying to special-case every concave shape, disable backface
+    // culling unconditionally — every model here is now lit two-sided
+    // (see forceTwoSidedLighting in drawModelColorPass/drawModelTexturePass)
+    // so nothing depends on winding being correct anymore.
+    glDisable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
     glEnable(GL_ALPHA_TEST);
     glAlphaFunc(GL_GREATER, 0.1f);
-    
+
+    if (debugThisCall) {
+        printf("DEBUG INTERIOR: currentLod=%zu lod->numTriangles=%u MV_translate=(%.1f,%.1f,%.1f) show_textured=%d glErr_before=0x%x\n",
+               currentLodLevel, (unsigned)lod->numTriangles, MV[12], MV[13], MV[14], this->show_textured, glGetError());
+    }
 
     drawModelColorPass(object, currentLodLevel, vertexNormals, ambientLamber, lightEye, MV);
 
     if (this->show_textured) {
         drawModelTexturePass(object, currentLodLevel, vertexNormals, ambientLamber, lightEye, MV);
     }
-    
+
     drawModelTransparentPass(object, currentLodLevel, vertexNormals, ambientLamber, lightEye, MV);
-    
+
+    if (debugThisCall) {
+        printf("DEBUG INTERIOR: glErr_after=0x%x\n", glGetError());
+    }
+    if (isHullCall && this->forceDebugDumpFrames > 0) {
+        this->forceDebugDumpFrames--;
+    }
+
     glDisable(GL_ALPHA_TEST);
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
@@ -1200,10 +2127,10 @@ void SCRenderer::displayModel(RSEntity *object, size_t lodLevel) {
 
         glPointSize(6);
 
-        glBegin(GL_POINTS);
-        glColor4f(1, 1, 0, 1);
-        glVertex3f(light.x, light.y, light.z);
-        glEnd();
+        gb.begin(GL_POINTS);
+        gb.color4f(1, 1, 0, 1);
+        gb.vertex3f(light.x, light.y, light.z);
+        gb.end();
     }
 }
 
@@ -1242,51 +2169,51 @@ void SCRenderer::renderTexturedTriangle(MapVertex *tri0, MapVertex *tri1, MapVer
         mainColor = 1;
         if (tri1->type > tri0->type)
             if (tri1->type > tri2->type)
-                glColor4fv(tri1->color);
+                gb.color4fv(tri1->color);
             else
-                glColor4fv(tri2->color);
+                gb.color4fv(tri2->color);
         else if (tri0->type > tri2->type)
-            glColor4fv(tri0->color);
+            gb.color4fv(tri0->color);
         else
-            glColor4fv(tri2->color);
+            gb.color4fv(tri2->color);
     }
 
     if (image->width < 128) {
-        glTexCoord2fv(textTrianCoo64[triangleType][0]);
+        gb.texCoord2fv(textTrianCoo64[triangleType][0]);
         if (!mainColor) {
-            glColor4fv(tri0->color);
+            gb.color4fv(tri0->color);
         }
-        glVertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
+        gb.vertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
 
         if (!mainColor) {
-            glColor4fv(tri1->color);
+            gb.color4fv(tri1->color);
         }
-        glTexCoord2fv(textTrianCoo64[triangleType][1]);
-        glVertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
+        gb.texCoord2fv(textTrianCoo64[triangleType][1]);
+        gb.vertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
 
         if (!mainColor) {
-            glColor4fv(tri2->color);
+            gb.color4fv(tri2->color);
         }
-        glTexCoord2fv(textTrianCoo64[triangleType][2]);
-        glVertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
+        gb.texCoord2fv(textTrianCoo64[triangleType][2]);
+        gb.vertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
     } else {
-        glTexCoord2fv(textTrianCoo[triangleType][0]);
+        gb.texCoord2fv(textTrianCoo[triangleType][0]);
         if (!mainColor) {
-            glColor4fv(tri0->color);
+            gb.color4fv(tri0->color);
         }
-        glVertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
+        gb.vertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
 
-        glTexCoord2fv(textTrianCoo[triangleType][1]);
+        gb.texCoord2fv(textTrianCoo[triangleType][1]);
         if (!mainColor) {
-            glColor4fv(tri1->color);
+            gb.color4fv(tri1->color);
         }
-        glVertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
+        gb.vertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
 
-        glTexCoord2fv(textTrianCoo[triangleType][2]);
+        gb.texCoord2fv(textTrianCoo[triangleType][2]);
         if (!mainColor) {
-            glColor4fv(tri2->color);
+            gb.color4fv(tri2->color);
         }
-        glVertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
+        gb.vertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
     }
 }
 
@@ -1304,28 +2231,28 @@ void SCRenderer::renderColoredTriangle(MapVertex *tri0, MapVertex *tri1, MapVert
 
         if (tri1->type > tri0->type)
             if (tri1->type > tri2->type)
-                glColor4fv(tri1->color);
+                gb.color4fv(tri1->color);
             else
-                glColor4fv(tri2->color);
+                gb.color4fv(tri2->color);
         else if (tri0->type > tri2->type)
-            glColor4fv(tri0->color);
+            gb.color4fv(tri0->color);
         else
-            glColor4fv(tri2->color);
+            gb.color4fv(tri2->color);
 
-        glVertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
+        gb.vertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
 
-        glVertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
+        gb.vertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
 
-        glVertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
+        gb.vertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
     } else {
-        glColor4fv(tri0->color);
-        glVertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
+        gb.color4fv(tri0->color);
+        gb.vertex3f(tri0->v.x, tri0->v.y, tri0->v.z);
 
-        glColor4fv(tri1->color);
-        glVertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
+        gb.color4fv(tri1->color);
+        gb.vertex3f(tri1->v.x, tri1->v.y, tri1->v.z);
 
-        glColor4fv(tri2->color);
-        glVertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
+        gb.color4fv(tri2->color);
+        gb.vertex3f(tri2->v.x, tri2->v.y, tri2->v.z);
     }
 }
 
@@ -1491,16 +2418,16 @@ void SCRenderer::renderSkydome(int rings, int slices) {
         sampleSky(t0, r0,g0,b0);
         sampleSky(t1, r1,g1,b1);
 
-        glBegin(GL_TRIANGLE_STRIP);
+        gb.begin(GL_TRIANGLE_STRIP);
         for (int s = 0; s <= slices; ++s) {
             float theta = 2.0f*(float)M_PI*s/slices;
             float cosT=cosf(theta), sinT=sinf(theta);
-            glColor3f(r0,g0,b0);
-            glVertex3f(cam.x+radius*cosf(phi0)*cosT, cam.y+radius*sinf(phi0), cam.z+radius*cosf(phi0)*sinT);
-            glColor3f(r1,g1,b1);
-            glVertex3f(cam.x+radius*cosf(phi1)*cosT, cam.y+radius*sinf(phi1), cam.z+radius*cosf(phi1)*sinT);
+            gb.color3f(r0,g0,b0);
+            gb.vertex3f(cam.x+radius*cosf(phi0)*cosT, cam.y+radius*sinf(phi0), cam.z+radius*cosf(phi0)*sinT);
+            gb.color3f(r1,g1,b1);
+            gb.vertex3f(cam.x+radius*cosf(phi1)*cosT, cam.y+radius*sinf(phi1), cam.z+radius*cosf(phi1)*sinT);
         }
-        glEnd();
+        gb.end();
     }
 
     // ── Hémisphère inférieure (masque depth + sol) ───────────────────────
@@ -1512,16 +2439,16 @@ void SCRenderer::renderSkydome(int rings, int slices) {
         float phi1 = -(float)M_PI_2 * t1;
         float e0 = t0*t0, e1 = t1*t1; // ease-in quadratique
 
-        glBegin(GL_TRIANGLE_STRIP);
+        gb.begin(GL_TRIANGLE_STRIP);
         for (int s = 0; s <= slices; ++s) {
             float theta = 2.0f*(float)M_PI*s/slices;
             float cosT=cosf(theta), sinT=sinf(theta);
-            glColor3f(1.f+e0*(nadirRGB[0]-1.f), 1.f+e0*(nadirRGB[1]-1.f), 1.f+e0*(nadirRGB[2]-1.f));
-            glVertex3f(cam.x+radius*cosf(phi0)*cosT, cam.y+radius*sinf(phi0), cam.z+radius*cosf(phi0)*sinT);
-            glColor3f(1.f+e1*(nadirRGB[0]-1.f), 1.f+e1*(nadirRGB[1]-1.f), 1.f+e1*(nadirRGB[2]-1.f));
-            glVertex3f(cam.x+radius*cosf(phi1)*cosT, cam.y+radius*sinf(phi1), cam.z+radius*cosf(phi1)*sinT);
+            gb.color3f(1.f+e0*(nadirRGB[0]-1.f), 1.f+e0*(nadirRGB[1]-1.f), 1.f+e0*(nadirRGB[2]-1.f));
+            gb.vertex3f(cam.x+radius*cosf(phi0)*cosT, cam.y+radius*sinf(phi0), cam.z+radius*cosf(phi0)*sinT);
+            gb.color3f(1.f+e1*(nadirRGB[0]-1.f), 1.f+e1*(nadirRGB[1]-1.f), 1.f+e1*(nadirRGB[2]-1.f));
+            gb.vertex3f(cam.x+radius*cosf(phi1)*cosT, cam.y+radius*sinf(phi1), cam.z+radius*cosf(phi1)*sinT);
         }
-        glEnd();
+        gb.end();
     }
 
     glDepthFunc(GL_LESS);
@@ -1535,7 +2462,7 @@ void SCRenderer::renderEllipsoid(float cx, float cy, float cz, float rx, float r
         float phi0 = (float)M_PI * ring / rings - (float)M_PI_2;
         float phi1 = (float)M_PI * (ring + 1) / rings - (float)M_PI_2;
 
-        glBegin(GL_TRIANGLE_STRIP);
+        gb.begin(GL_TRIANGLE_STRIP);
         for (int s = 0; s <= slices; ++s) {
             float theta = 2.0f * (float)M_PI * s / slices;
             float cosT = cosf(theta), sinT = sinf(theta);
@@ -1545,13 +2472,13 @@ void SCRenderer::renderEllipsoid(float cx, float cy, float cz, float rx, float r
                 float cosPhi = cosf(phi), sinPhi = sinf(phi);
                 // Dégradé : bas transparent, haut opaque
                 float t = (sinPhi + 1.0f) * 0.5f;
-                glColor4f(r, g, b, baseAlpha * t);
-                glVertex3f(cx + rx * cosPhi * cosT,
+                gb.color4f(r, g, b, baseAlpha * t);
+                gb.vertex3f(cx + rx * cosPhi * cosT,
                            cy + ry * sinPhi,
                            cz + rz * cosPhi * sinT);
             }
         }
-        glEnd();
+        gb.end();
     }
 }
 void SCRenderer::renderClouds(RSArea *area) {
@@ -1601,26 +2528,508 @@ void SCRenderer::renderClouds(RSArea *area) {
     glDisable(GL_BLEND);
 }
 void SCRenderer::renderWorldSkyAndGround() {
-    this->renderSkydome(12, 48);
+    if (this->show_starfield)
+        this->renderStarfield();
+    else
+        this->renderSkydome(12, 48);
+    this->renderSkybox();
+    this->renderSpaceDust();
+}
 
+// WC3 space-mission galaxy skybox — 6 distant textured billboards (WRLD's
+// own SKYS chunk: named DIST/DFLT entities + a direction vector each,
+// reverse-engineered against WORLD.IFF; see RSWorld.h) positioned along
+// their assigned axis at a fixed distance from the camera and reoriented to
+// lie in the plane perpendicular to that axis.
+//
+// The mesh's actual default plane was previously guessed (comment used to
+// claim face normal along +Y) rather than checked — live-dumping one
+// galaxy entity's real object-space vertices showed every vertex has X=0,
+// i.e. the quad lies flat in the Y-Z plane, default normal along +X, not Y.
+// Combined with the specific (and non-obvious) axis remapping the 4-arg
+// drawModel(...) overload applies — glRotatef(orientation.x,0,1,0) (Y-axis),
+// then glRotatef(orientation.y,0,0,1) (Z-axis), then
+// glRotatef(orientation.z,1,0,0) (X-axis), i.e. field x->Y-axis, field
+// y->Z-axis, field z->X-axis, NOT a direct x/y/z-to-axis correspondence —
+// the old table was wrong for all 6 directions: verified numerically
+// (composing the exact same rotation order/axes in Python against the real
+// default normal) that the old values sent 2 faces to face Y instead of X,
+// and left the other 4 facing X permanently (an X-axis-only rotation can
+// never redirect a vector already on the X axis) — every billboard ended
+// up edge-on to its own placement direction regardless of which way the
+// camera looked, which is why none of them were ever visible. Below is
+// re-solved for the confirmed default normal (1,0,0) against this exact
+// rotation order; each sends the normal to (or onto the same plane as)
+// the real target direction (sign doesn't matter for visibility — culling
+// is disabled — only which plane the quad ends up in).
+//
+// WRLD>SKYS's own (dirX,dirY,dirZ) is in the FILE's coordinate convention,
+// not this engine's world axes directly — confirmed by live comparison
+// against the original game: COMET (file dir (0,0,1)) belongs above the
+// TCS Victory, not behind it, so file Y and file Z are swapped relative to
+// this engine's (X=right, Y=up, Z=forward/back) — file X maps straight
+// across, file Z is this engine's up/down (confirmed correct as-is: COMET,
+// blkgal1), and file Y is this engine's forward/back but NEGATED (the
+// front/behind pair — darkgal2/darkgal3 — came out swapped otherwise;
+// confirmed by live testing). Both position and the orientation-selection
+// below are driven from the same swapped engineDir so they can't drift out
+// of sync with each other again.
+void SCRenderer::renderSkybox() {
+    if (this->skyFaces == nullptr || this->skyEntities == nullptr) return;
+    Vector3D cameraPos = this->camera.getPosition();
+    glDisable(GL_DEPTH_TEST);
+
+    for (size_t i = 0; i < this->skyFaces->size() && i < this->skyEntities->size(); i++) {
+        RSEntity* ent = (*this->skyEntities)[i];
+        if (ent == nullptr) continue;
+        WorldSkyFace& face = (*this->skyFaces)[i];
+        // file Y <-> engine Z (negated), file Z <-> engine Y; file X
+        // unchanged. COMET/blkgal1 (file Z, up/down) confirmed correct
+        // as-is; darkgal2/darkgal3 (file Y, front/back) were swapped —
+        // negated per live-testing feedback.
+        Vector3D engineDir = { (float)face.dirX, (float)face.dirZ, -(float)face.dirY };
+        Vector3D position = {
+            cameraPos.x + engineDir.x * (float)face.distance,
+            cameraPos.y + engineDir.y * (float)face.distance,
+            cameraPos.z + engineDir.z * (float)face.distance
+        };
+        // orientation.z is a roll around the quad's own face-normal (see
+        // drawModel's glRotatef(orientation.z,1,0,0) — the X-axis, this
+        // mesh's default normal), i.e. purely an in-plane texture spin
+        // that doesn't change which world direction the quad faces. Set
+        // to 90 uniformly per live-testing feedback (the plane/position
+        // fix above was right, but every texture read rotated 90 degrees).
+        constexpr float kTextureRoll = -90.0f;
+        Vector3D orientation = {0.0f, 0.0f, kTextureRoll};
+        if (engineDir.x < 0)      orientation = {0.0f, 180.0f, kTextureRoll};
+        else if (engineDir.x > 0) orientation = {0.0f, 0.0f, kTextureRoll};
+        else if (engineDir.y < 0) orientation = {0.0f, 270.0f, kTextureRoll};
+        else if (engineDir.y > 0) orientation = {0.0f, 90.0f, kTextureRoll};
+        else if (engineDir.z < 0) orientation = {90.0f, 0.0f, kTextureRoll};
+        else if (engineDir.z > 0) orientation = {90.0f, 180.0f, kTextureRoll};
+        // Scaled proportionally to each face's own placement distance,
+        // not a flat multiplier — WORLD.IFF's SKYS records don't all sit at
+        // the same distance (COMET is at 12800, the other 5 galaxy faces
+        // at 25600, exactly double), so a flat scale made COMET look right
+        // while the other 5 — twice as far away, same apparent angular
+        // size only if also scaled twice as large — read as too small.
+        // 16x at the 12800 reference distance (COMET, confirmed a good
+        // size at that scale) keeps every face's apparent screen size
+        // consistent regardless of its individual distance.
+        constexpr float kReferenceDistance = 12800.0f;
+        constexpr float kReferenceScale = 16.0f;
+        float scale = kReferenceScale * ((float)face.distance / kReferenceDistance);
+        // The distance-proportional formula alone wasn't enough — darkgal1
+        // (and the other 4 galaxy faces sharing its 25600 distance) still
+        // read as tiny even at the resulting 32x. Bumped an extra 16x for
+        // faces beyond the reference distance specifically. Applying that
+        // same extra 16x to COMET too (reference distance) made it way too
+        // big — reverted back to just the base 16x for COMET, which was
+        // already confirmed a good size on its own.
+        if (face.distance != (int32_t)kReferenceDistance) {
+            scale *= 16.0f;
+        }
+        this->drawModel(ent, 0, position, orientation, Vector3D{0.0f, 0.0f, 0.0f}, scale);
+    }
+    glEnable(GL_DEPTH_TEST);
+}
+
+// Grey motion-dust particles (WRLD>DUST — see RSWorld.h/dustCount/
+// dustSpawnRadius field comments) — spawn near the player and drift
+// backward as they fly, confirmed against live gameplay. Particles are
+// mostly static in world space (dustPositions persists across frames, not
+// recomputed) — the player's own forward motion through them is what
+// produces the "drifting backward" look — but now also partially follow
+// the camera each frame (see dustFollowFactor) to slow that apparent drift
+// down from the original 1:1 coupling with real ship speed, per user
+// feedback. The other active logic here is respawning: once a particle
+// falls outside dustSpawnRadius of the player's current position, it's
+// teleported to a fresh random point within the radius so it reappears
+// ahead instead of staying lost behind. Runs depth-tested (unlike the
+// skybox/starfield, which render at "infinity" with depth testing
+// disabled) since these particles are a real, near-field part of the scene
+// and should be occluded by nearby ships/the carrier same as anything else.
+void SCRenderer::renderSpaceDust() {
+    if (!this->show_dust || this->dustCount <= 0) return;
+
+    Vector3D camPos = this->camera.getPosition();
+    float radiusSq = this->dustSpawnRadius * this->dustSpawnRadius;
+
+    if ((int)this->dustPositions.size() != this->dustCount) {
+        // Force every particle to look "expired" on this first pass so the
+        // respawn loop below spreads them out immediately instead of
+        // drawing dustCount particles piled at one spot for a frame.
+        this->dustPositions.assign(this->dustCount,
+            Vector3D{camPos.x + this->dustSpawnRadius * 10.0f, camPos.y, camPos.z});
+        this->dustCamPosInitialized = false;
+    }
+
+    // Partially follow the camera to slow the apparent drift speed — see
+    // dustFollowFactor's own comment. Skipped on the very first frame (no
+    // prior camera position yet) so particles don't jump.
+    if (!this->dustCamPosInitialized) {
+        this->lastDustCamPos = camPos;
+        this->dustCamPosInitialized = true;
+    } else {
+        Vector3D camDelta = {camPos.x - this->lastDustCamPos.x,
+                              camPos.y - this->lastDustCamPos.y,
+                              camPos.z - this->lastDustCamPos.z};
+        Vector3D follow = {camDelta.x * this->dustFollowFactor,
+                            camDelta.y * this->dustFollowFactor,
+                            camDelta.z * this->dustFollowFactor};
+        for (auto &p : this->dustPositions) {
+            p.x += follow.x;
+            p.y += follow.y;
+            p.z += follow.z;
+        }
+        this->lastDustCamPos = camPos;
+    }
+
+    for (auto &p : this->dustPositions) {
+        float dx = p.x - camPos.x, dy = p.y - camPos.y, dz = p.z - camPos.z;
+        if (dx * dx + dy * dy + dz * dz > radiusSq) {
+            float u = (float)rand() / (float)RAND_MAX;
+            float v = (float)rand() / (float)RAND_MAX;
+            float theta = 2.0f * 3.14159f * u;
+            float phi = acosf(2.0f * v - 1.0f);
+            // Never right on top of the player (0.3x-1.0x of the radius).
+            float r = this->dustSpawnRadius * (0.3f + 0.7f * ((float)rand() / (float)RAND_MAX));
+            p.x = camPos.x + sinf(phi) * cosf(theta) * r;
+            p.y = camPos.y + sinf(phi) * sinf(theta) * r;
+            p.z = camPos.z + cosf(phi) * r;
+        }
+    }
+
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glEnable(GL_POINT_SMOOTH);
+    glPointSize(6.0f);  // doubled from the original 3.0f per user feedback
+    gb.color3f(0.6f, 0.6f, 0.6f); // grey, per live gameplay observation
+    gb.begin(GL_POINTS);
+    for (auto &p : this->dustPositions) {
+        gb.vertex3f(p.x, p.y, p.z);
+    }
+    gb.end();
+    glDisable(GL_POINT_SMOOTH);
+}
+
+// Builds one GL texture per WRLD>STAR glint sprite (see RSWorld.h) from its
+// palette-indexed RLEShape pixels, mirroring the exact pattern used for
+// SCCockpit's hi-res background texture: pull raw indices out via
+// RLEShape::Expand(), wrap them in a throwaway RSImage against the current
+// VGA palette, and let Texture::set/updateContent do the palette lookup.
+// Rebuilt only when starSprites points somewhere new (e.g. a fresh mission).
+//
+// User-reported "blue pixels that move with the stars" / "starfield too
+// dark, stars should be white" investigated by extracting a real WORLD.IFF
+// (missions.tre) and its real PALT-format palette and decoding the STAR
+// glint frames directly (see git history for the throwaway probe, since
+// removed): the colorkey/background index (255) correctly resolves to
+// alpha=0 (magenta, per this engine's transparency convention — see
+// AlphaBleedRGBA8's comment) in every frame, so the alpha pipeline itself
+// was never the bug. But the glint frames' real foreground pixels turned
+// out to be a graduated, honestly pretty dim/blue-tinted palette (e.g.
+// index 136 = rgb(69,74,80), index 28 = rgb(159,181,239) — nothing reaches
+// pure white, brightest is ~239/255 on one channel), and every opaque texel
+// has alpha=255 uniformly (no soft/graduated alpha edge) — so the shape's
+// only brightness falloff comes from that dim, off-white RGB gradation.
+// Drawn via GL_MODULATE (texture RGB * vertex RGB), a texture that's never
+// actually white can't produce a white star no matter the vertex color, and
+// the generally-dim palette explains "too dark". A first attempt fixed this
+// by decolorizing every texel to a neutral grey (luminance only) before
+// contrast-stretching — that fixed "too dark" but overcorrected "wrong
+// colour": real stars (and this glint art) legitimately range from white to
+// blue-white, and forcing everything to flat grey/white erased that
+// variation entirely, which is its own "wrong colour" complaint. The fix
+// now scales each frame's RGB *channels* up by the same per-frame factor
+// (headroom to the brightest single channel value in that frame) instead of
+// collapsing to luminance — this boosts overall brightness so the
+// brightest texel reaches full-intensity on its dominant channel, while
+// preserving each texel's original R:G:B ratio, so texels that were
+// genuinely blue-tinted (e.g. index 28's rgb(159,181,239)) stay blue-tinted
+// (scaled toward blue-white) rather than becoming neutral grey.
+void SCRenderer::buildStarSpriteTextures() {
+    for (auto* tex : this->starSpriteTextures) {
+        delete tex;
+    }
+    this->starSpriteTextures.clear();
+    this->starSpriteTexturesSource = this->starSprites;
+    if (this->starSprites == nullptr) {
+        return;
+    }
+    VGAPalette* palette = RSVGA::getInstance().getPalette();
+    for (size_t i = 0; i < this->starSprites->GetNumImages(); i++) {
+        RLEShape* shape = this->starSprites->GetShape(i);
+        int w = shape->GetWidth();
+        int h = shape->GetHeight();
+        if (w <= 0 || h <= 0) {
+            continue;
+        }
+        std::vector<uint8_t> indexBuf((size_t)w * h, 255);
+        shape->buffer_size.x = w;
+        shape->buffer_size.y = h;
+        size_t byteRead = 0;
+        shape->Expand(indexBuf.data(), &byteRead);
+
+        RSImage img;
+        img.width = w;
+        img.height = h;
+        img.data = indexBuf.data();
+        img.palette = palette;
+        img.flags = 0;
+
+        Texture* tex = new Texture();
+        tex->set(&img);
+        tex->updateContent(&img);
+        // RSImage::~RSImage() frees `data`, which here just points into
+        // indexBuf's vector-owned buffer — detach before img goes out of
+        // scope to avoid a double free (see SCCockpit::RenderHighResBackground
+        // for the same fix, same underlying gotcha).
+        img.data = nullptr;
+
+        // Hue-preserving contrast stretch — see this function's own doc
+        // comment above for why the raw decoded RGB is too dim to reach
+        // white on its own, and why a flat luminance desaturation (an
+        // earlier attempt) was the wrong fix.
+        if (tex->data != nullptr) {
+            size_t pixelCount = (size_t)w * (size_t)h;
+            uint8_t maxChannel = 0;
+            for (size_t p = 0; p < pixelCount; p++) {
+                uint8_t* px = tex->data + p * 4;
+                if (px[3] == 0) continue;  // fully transparent, leave alone
+                uint8_t m = std::max({px[0], px[1], px[2]});
+                if (m > maxChannel) maxChannel = m;
+            }
+            if (maxChannel > 0) {
+                for (size_t p = 0; p < pixelCount; p++) {
+                    uint8_t* px = tex->data + p * 4;
+                    if (px[3] == 0) continue;
+                    for (int c = 0; c < 3; c++) {
+                        px[c] = (uint8_t)std::min(255, (int)px[c] * 255 / maxChannel);
+                    }
+                }
+            }
+        }
+        this->starSpriteTextures.push_back(tex);
+    }
+}
+
+void SCRenderer::renderStarfield() {
+    // Strip translation from modelview so stars are infinitely far — must
+    // read the CURRENT modelview (the real camera view matrix, set by
+    // bindCameraProjectionAndViewViewport just before renderWorldSolid
+    // called into here) before touching it. This used to glLoadIdentity()
+    // first and only then glGetFloatv the "current" matrix — capturing
+    // identity, not the camera's real rotation — so the star sphere/skybox
+    // were drawn in a fixed frame that never actually followed the ship's
+    // orientation, leaving them out of the view frustum (and so invisible)
+    // for most of the directions the player actually looked.
+    glMatrixMode(GL_MODELVIEW);
+    float camMv[16];
+    glGetFloatv(GL_MODELVIEW_MATRIX, camMv);
+    camMv[12] = camMv[13] = camMv[14] = 0.0f;
+    glPushMatrix();
+    glLoadMatrixf(camMv);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_FOG);
+
+    // Background sphere — WRLD>BACK's palette-indexed color (a dark navy
+    // blue for most missions, not pure black; see spaceBackgroundColor).
+    float radius = 50000.0f;
+    gb.color3f(this->spaceBackgroundColor.x, this->spaceBackgroundColor.y, this->spaceBackgroundColor.z);
+    int rings = 8, slices = 16;
+    for (int i = 0; i < rings; i++) {
+        float phi0 = 3.14159f * (-0.5f + (float)i / rings);
+        float phi1 = 3.14159f * (-0.5f + (float)(i + 1) / rings);
+        gb.begin(GL_QUAD_STRIP);
+        for (int j = 0; j <= slices; j++) {
+            float theta = 2.0f * 3.14159f * (float)j / slices;
+            float x0 = cosf(phi0) * cosf(theta), y0 = sinf(phi0), z0 = cosf(phi0) * sinf(theta);
+            float x1 = cosf(phi1) * cosf(theta), y1 = sinf(phi1), z1 = cosf(phi1) * sinf(theta);
+            gb.vertex3f(x0 * radius, y0 * radius, z0 * radius);
+            gb.vertex3f(x1 * radius, y1 * radius, z1 * radius);
+        }
+        gb.end();
+    }
+
+    bool useSprites = this->starSprites != nullptr && this->starSprites->GetNumImages() > 0;
+    if (useSprites && this->starSpriteTexturesSource != this->starSprites) {
+        this->buildStarSpriteTextures();
+    }
+    useSprites = useSprites && !this->starSpriteTextures.empty();
+
+    if (useSprites) {
+        // WRLD>STAR's own diamond/glint sprites (see RSWorld.h), drawn as
+        // camera-facing billboards instead of flat GL_POINTS — same
+        // deterministic LCG position/brightness sequence as the fallback
+        // below (so star *placement* is unchanged either way), bucketed by
+        // brightness into one of the (2-3) available glint sizes. One pass
+        // per sprite texture so each can be bound once and drawn in a single
+        // GL_QUADS block rather than rebinding mid-star.
+        //
+        // Camera-facing basis: camMv has translation stripped (see above),
+        // so its rows give the camera's own right/up axes in world space —
+        // the standard technique for billboarding without per-star matrix
+        // math.
+        float rightX = camMv[0], rightY = camMv[4], rightZ = camMv[8];
+        float upX = camMv[1], upY = camMv[5], upZ = camMv[9];
+
+        glEnable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+
+        size_t numSprites = this->starSpriteTextures.size();
+        // World-space size of one screen pixel at the star sphere's render
+        // distance, derived from the actual fovy/window height instead of a
+        // fixed fraction of `radius` — a prior attempt tried radius*0.006f
+        // (~1800-unit stars, 90% the width of the whole galaxy skybox
+        // backdrop) then radius*0.0003f (so small it visually disappeared
+        // entirely), both uncalibrated guesses confirmed wrong by live
+        // testing. Computing directly from the projection means the
+        // per-bucket pixel sizes below are exactly what they say, regardless
+        // of `radius` or fovy changing.
+        float starSphereDistance = radius * 0.99f;
+        float fovyRad = this->camera.fovy * 3.14159f / 180.0f;
+        int screenH = RSVGA::getInstance().GetWindowHeight();
+        if (screenH <= 0) screenH = 1080;
+        float worldPerPixel = 2.0f * starSphereDistance * tanf(fovyRad * 0.5f) / (float)screenH;
+        // Dimmest bucket -> minPixelSize, brightest -> maxPixelSize, linearly
+        // interpolated across however many glint sizes this WRLD's STAR
+        // chunk actually provided (2-3 in practice) rather than a fixed
+        // per-bucket step, so the range is exactly [min,max] regardless of
+        // numSprites.
+        constexpr float minPixelSize = 1.0f;   // halved again from 2.0f per user feedback
+        constexpr float maxPixelSize = 3.5f;   // halved again from 7.0f per user feedback
+        for (size_t spriteIdx = 0; spriteIdx < numSprites; spriteIdx++) {
+            Texture* tex = this->starSpriteTextures[spriteIdx];
+            if (!tex->initialized) {
+                glGenTextures(1, &tex->id);
+                glBindTexture(GL_TEXTURE_2D, tex->id);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)tex->width, (GLsizei)tex->height, 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, tex->data);
+                tex->initialized = true;
+            } else {
+                glBindTexture(GL_TEXTURE_2D, tex->id);
+            }
+            // Bigger/brighter sprites (index 0) drawn visibly larger: full
+            // quad width ranges [minPixelSize,maxPixelSize] screen pixels
+            // across the available buckets — see the screen-space
+            // derivation above.
+            float t = (numSprites > 1) ? (float)spriteIdx / (float)(numSprites - 1) : 0.0f;
+            float sizePixels = maxPixelSize - (maxPixelSize - minPixelSize) * t;
+            float halfSize = 0.5f * sizePixels * worldPerPixel;
+
+            uint32_t seed = 0x12345678;
+            gb.begin(GL_QUADS);
+            for (int i = 0; i < 800; i++) {
+                seed = seed * 1103515245 + 12345;
+                float u = (float)(seed & 0xFFFF) / 65535.0f;
+                seed = seed * 1103515245 + 12345;
+                float v = (float)(seed & 0xFFFF) / 65535.0f;
+                seed = seed * 1103515245 + 12345;
+                float brightness = 0.4f + 0.6f * ((float)(seed & 0xFF) / 255.0f);
+
+                float bucketWidth = 1.0f / (float)numSprites;
+                size_t bucket = (size_t)((1.0f - (brightness - 0.4f) / 0.6f) / bucketWidth);
+                if (bucket >= numSprites) bucket = numSprites - 1;
+                if (bucket != spriteIdx) continue;
+
+                float theta = 2.0f * 3.14159f * u;
+                float phi = acosf(2.0f * v - 1.0f);
+                float cx = sinf(phi) * cosf(theta) * radius * 0.99f;
+                float cy = sinf(phi) * sinf(theta) * radius * 0.99f;
+                float cz = cosf(phi) * radius * 0.99f;
+
+                gb.color4f(brightness, brightness, brightness * 0.95f, 1.0f);
+                gb.texCoord2f(0, 1);
+                gb.vertex3f(cx - rightX * halfSize - upX * halfSize, cy - rightY * halfSize - upY * halfSize,
+                           cz - rightZ * halfSize - upZ * halfSize);
+                gb.texCoord2f(1, 1);
+                gb.vertex3f(cx + rightX * halfSize - upX * halfSize, cy + rightY * halfSize - upY * halfSize,
+                           cz + rightZ * halfSize - upZ * halfSize);
+                gb.texCoord2f(1, 0);
+                gb.vertex3f(cx + rightX * halfSize + upX * halfSize, cy + rightY * halfSize + upY * halfSize,
+                           cz + rightZ * halfSize + upZ * halfSize);
+                gb.texCoord2f(0, 0);
+                gb.vertex3f(cx - rightX * halfSize + upX * halfSize, cy - rightY * halfSize + upY * halfSize,
+                           cz - rightZ * halfSize + upZ * halfSize);
+            }
+            gb.end();
+        }
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_BLEND);
+    } else {
+        // Fallback (Strike Commander, or a WC3 mission whose WRLD didn't
+        // resolve): stars as flat-colored points at the same fixed
+        // deterministic positions.
+        glEnable(GL_POINT_SMOOTH);
+        glPointSize(8.0f); // mid-point of the sprite path's 4-14px range (doubled from 4.0f)
+        gb.begin(GL_POINTS);
+        uint32_t seed = 0x12345678;
+        for (int i = 0; i < 800; i++) {
+            // Simple LCG for deterministic positions
+            seed = seed * 1103515245 + 12345;
+            float u = (float)(seed & 0xFFFF) / 65535.0f;
+            seed = seed * 1103515245 + 12345;
+            float v = (float)(seed & 0xFFFF) / 65535.0f;
+            seed = seed * 1103515245 + 12345;
+            float brightness = 0.4f + 0.6f * ((float)(seed & 0xFF) / 255.0f);
+
+            float theta = 2.0f * 3.14159f * u;
+            float phi = acosf(2.0f * v - 1.0f);
+            float x = sinf(phi) * cosf(theta);
+            float y = sinf(phi) * sinf(theta);
+            float z = cosf(phi);
+
+            gb.color3f(brightness, brightness, brightness * 0.95f);
+            gb.vertex3f(x * radius * 0.99f, y * radius * 0.99f, z * radius * 0.99f);
+        }
+        gb.end();
+        glDisable(GL_POINT_SMOOTH);
+    }
+
+    glEnable(GL_DEPTH_TEST);
+    glPopMatrix();
 }
 
 void SCRenderer::renderWorldSolid(RSArea *area, int LOD, int verticesPerBlock) {
+    if (this->show_starfield) {
+        glClearColor(this->spaceBackgroundColor.x, this->spaceBackgroundColor.y, this->spaceBackgroundColor.z, 1.0f);
+    }
+
     GLfloat fogColor[4] = {0.89f, 0.89f, 0.98f, 1.0f};
-    if (this->show_fog) {
+    if (this->show_fog && this->show_ground) {
         glFogi(GL_FOG_MODE, GL_LINEAR);
         glFogfv(GL_FOG_COLOR, fogColor);
-        glFogf(GL_FOG_START, this->max_view_distance * 0.40f); // début du fondu
-        glFogf(GL_FOG_END,   this->max_view_distance * 0.93f); // finit AVANT le dôme
+        glFogf(GL_FOG_START, this->max_view_distance * 0.40f);
+        glFogf(GL_FOG_END,   this->max_view_distance * 0.93f);
         glHint(GL_FOG_HINT, GL_DONT_CARE);
         glEnable(GL_FOG);
     } else {
         glDisable(GL_FOG);
     }
-    
+
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDisable(GL_CULL_FACE);
     this->renderWorldSkyAndGround();
+
+    // area is null for missions with no terrain (e.g. pure-space training
+    // missions whose world has no `tera` file, see [[project_wc3_sim_missions]])
+    // — every block/cloud/overlay path below assumes a real RSArea, so treat
+    // a missing area the same as "nothing to draw" rather than crashing.
+    if (!this->show_ground || area == nullptr) {
+        glEnable(GL_DEPTH_TEST);
+        return;
+    }
     if (this->show_clouds) {
         this->renderClouds(area);
     }
@@ -1665,12 +3074,12 @@ void SCRenderer::renderWorldSolid(RSArea *area, int LOD, int verticesPerBlock) {
     }
     glFrontFace(terrainFront);
     // Passe géométrie (non texturée)
-    glBegin(GL_TRIANGLES);
+    gb.begin(GL_TRIANGLES);
     textureSortedVertex.clear();
     for (int id : visibleHiLOD) {
         renderBlock(area, LOD, id, true);
     }
-    glEnd();
+    gb.end();
 
     // Passe textures: réutilise les mêmes listes visibles (pas de culling)
     glEnable(GL_TEXTURE_2D);
@@ -1683,7 +3092,7 @@ void SCRenderer::renderWorldSolid(RSArea *area, int LOD, int verticesPerBlock) {
             continue;
         }
         glBindTexture(GL_TEXTURE_2D, image->GetTexture()->getTextureID());
-        glBegin(GL_TRIANGLES);
+        gb.begin(GL_TRIANGLES);
         for (int i = 0; i < (int)x.second.size(); i++) {
             VertexCache v = x.second.at(i);
             if (v.lv1 != NULL && v.lv1->lowerImageID == x.first) {
@@ -1693,7 +3102,7 @@ void SCRenderer::renderWorldSolid(RSArea *area, int LOD, int verticesPerBlock) {
                 renderTexturedTriangle(v.uv1, v.uv2, v.uv3, area, UPPER_TRIANGE, image);
             }
         }
-        glEnd();
+        gb.end();
     }
     glDisable(GL_TEXTURE_2D);
     // Overlay: inversion de Z -> winding mirroir, on inverse temporairement la front face
@@ -1703,16 +3112,16 @@ void SCRenderer::renderWorldSolid(RSArea *area, int LOD, int verticesPerBlock) {
     glPolygonOffset(-1.0f, -1.0f);
     glFrontFace(GL_CCW);
     const auto& skirts = area->GetSkirts();
-    glBegin(GL_TRIANGLES);
+    gb.begin(GL_TRIANGLES);
     for (const auto& tri : skirts.tris) {
-        glColor3f(tri.v[0].r, tri.v[0].g, tri.v[0].b);
-        glVertex3f(tri.v[0].x, tri.v[0].y, tri.v[0].z);
-        glColor3f(tri.v[1].r, tri.v[1].g, tri.v[1].b);
-        glVertex3f(tri.v[1].x, tri.v[1].y, tri.v[1].z);
-        glColor3f(tri.v[2].r, tri.v[2].g, tri.v[2].b);
-        glVertex3f(tri.v[2].x, tri.v[2].y, tri.v[2].z);
+        gb.color3f(tri.v[0].r, tri.v[0].g, tri.v[0].b);
+        gb.vertex3f(tri.v[0].x, tri.v[0].y, tri.v[0].z);
+        gb.color3f(tri.v[1].r, tri.v[1].g, tri.v[1].b);
+        gb.vertex3f(tri.v[1].x, tri.v[1].y, tri.v[1].z);
+        gb.color3f(tri.v[2].r, tri.v[2].g, tri.v[2].b);
+        gb.vertex3f(tri.v[2].x, tri.v[2].y, tri.v[2].z);
     }
-    glEnd();
+    gb.end();
     glDisable(GL_POLYGON_OFFSET_FILL);
     glDepthFunc(GL_LESS);
     glFrontFace(terrainFront);
@@ -1736,10 +3145,10 @@ void SCRenderer::renderObjects(RSArea *area, size_t blockID) {
             drawModel(object.entity, this->lodLevel);
         } else {
             printf("OBJECT [%s] NOT FOUND\n", object.name);
-            glBegin(GL_POINTS);
-            glColor3f(0, 1, 0);
-            glVertex3d(0, 0, 0);
-            glEnd();
+            gb.begin(GL_POINTS);
+            gb.color3f(0, 1, 0);
+            gb.vertex3d(0, 0, 0);
+            gb.end();
         }
 
         glPopMatrix();
@@ -1762,12 +3171,20 @@ void SCRenderer::renderWorldToTexture(RSArea *area) {
     glDepthFunc(GL_LESS);
 
     this->renderWorldSkyAndGround();
+
+    // Space missions have no terrain block grid (area is null — see
+    // is_space_mission in WC3Mission::loadMission()); mirrors the identical
+    // show_ground guard in the main (non-render-to-texture) world renderer.
+    if (!this->show_ground || area == nullptr) {
+        return;
+    }
+
     /**/
     bool save_is_textured = this->show_textured;
     this->show_textured = false;
     textureSortedVertex.clear();
     // Render your scene here
-    glBegin(GL_TRIANGLES);
+    gb.begin(GL_TRIANGLES);
     renderBlock(area, 0, block_id, false);
     renderBlock(area, 0, block_id+1, false);
     renderBlock(area, 0, block_id-1, false);
@@ -1777,7 +3194,7 @@ void SCRenderer::renderWorldToTexture(RSArea *area) {
     renderBlock(area, 0, block_id+1-1*18, false);
     renderBlock(area, 0, block_id-1+1*18, false);
     renderBlock(area, 0, block_id-1-1*18, false);
-    glEnd();
+    gb.end();
     glEnable(GL_TEXTURE_2D);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_DECAL);
     renderBlock(area, 0, block_id, true);
@@ -1790,7 +3207,7 @@ void SCRenderer::renderWorldToTexture(RSArea *area) {
         }
         glBindTexture(GL_TEXTURE_2D, image->GetTexture()->getTextureID());
 
-        glBegin(GL_TRIANGLES);
+        gb.begin(GL_TRIANGLES);
         for (int i = 0; i < x.second.size(); i++) {
             VertexCache v = x.second.at(i);
             if (v.lv1 != NULL && v.lv1->lowerImageID == x.first) {
@@ -1800,7 +3217,7 @@ void SCRenderer::renderWorldToTexture(RSArea *area) {
                 renderTexturedTriangle(v.uv1, v.uv2, v.uv3, area, UPPER_TRIANGE, image);
             }
         }
-        glEnd();
+        gb.end();
     }
     glDisable(GL_TEXTURE_2D);
     this->show_textured = save_is_textured;
@@ -1851,10 +3268,10 @@ void SCRenderer::renderMissionObjects(RSMission *mission) {
             drawModel(object->entity, this->lodLevel);
         } else {
             printf("OBJECT [%s] NOT FOUND\n", object->member_name.c_str());
-            glBegin(GL_POINTS);
-            glColor3f(0, 1, 0);
-            glVertex3d(0, 0, 0);
-            glEnd();
+            gb.begin(GL_POINTS);
+            gb.color3f(0, 1, 0);
+            gb.vertex3d(0, 0, 0);
+            gb.end();
         }
         glPopMatrix();
     }
@@ -1863,82 +3280,82 @@ void SCRenderer::renderLineCube(Vector3D position, int32_t size) {
     glPushMatrix();
     glTranslatef(position.x, position.y, position.z);
     glScalef((float)size, (float)size, (float)size);
-    glBegin(GL_LINES);
+    gb.begin(GL_LINES);
     // Front face
-    glColor3f(1.0f, 0.0f, 0.0f); // Red
-    glVertex3f(-0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f,  0.5f,  0.5f);
-    glVertex3f( 0.5f,  0.5f,  0.5f);
-    glVertex3f(-0.5f,  0.5f,  0.5f);
-    glVertex3f(-0.5f,  0.5f,  0.5f);
-    glVertex3f(-0.5f, -0.5f,  0.5f);
+    gb.color3f(1.0f, 0.0f, 0.0f); // Red
+    gb.vertex3f(-0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f,  0.5f,  0.5f);
+    gb.vertex3f( 0.5f,  0.5f,  0.5f);
+    gb.vertex3f(-0.5f,  0.5f,  0.5f);
+    gb.vertex3f(-0.5f,  0.5f,  0.5f);
+    gb.vertex3f(-0.5f, -0.5f,  0.5f);
 
     // Back face
-    glColor3f(0.0f, 1.0f, 0.0f); // Green
-    glVertex3f(-0.5f, -0.5f, -0.5f);
-    glVertex3f(-0.5f,  0.5f, -0.5f);
-    glVertex3f(-0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f, -0.5f, -0.5f);
-    glVertex3f( 0.5f, -0.5f, -0.5f);
-    glVertex3f(-0.5f, -0.5f, -0.5f);
+    gb.color3f(0.0f, 1.0f, 0.0f); // Green
+    gb.vertex3f(-0.5f, -0.5f, -0.5f);
+    gb.vertex3f(-0.5f,  0.5f, -0.5f);
+    gb.vertex3f(-0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f, -0.5f, -0.5f);
+    gb.vertex3f( 0.5f, -0.5f, -0.5f);
+    gb.vertex3f(-0.5f, -0.5f, -0.5f);
 
     // Edges
-    glColor3f(0.0f, 0.0f, 1.0f); // Blue
-    glVertex3f(-0.5f, -0.5f, -0.5f);
-    glVertex3f(-0.5f, -0.5f,  0.5f);
-    glVertex3f(-0.5f,  0.5f, -0.5f);
-    glVertex3f(-0.5f,  0.5f,  0.5f);
-    glVertex3f( 0.5f, -0.5f, -0.5f);
-    glVertex3f( 0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f,  0.5f,  0.5f);
+    gb.color3f(0.0f, 0.0f, 1.0f); // Blue
+    gb.vertex3f(-0.5f, -0.5f, -0.5f);
+    gb.vertex3f(-0.5f, -0.5f,  0.5f);
+    gb.vertex3f(-0.5f,  0.5f, -0.5f);
+    gb.vertex3f(-0.5f,  0.5f,  0.5f);
+    gb.vertex3f( 0.5f, -0.5f, -0.5f);
+    gb.vertex3f( 0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f,  0.5f,  0.5f);
 
-    glEnd();
+    gb.end();
     glPopMatrix();
 }
 void SCRenderer::renderBBox(Vector3D position, Point3D min, Point3D max) {
     glPushMatrix();
     glTranslatef(position.x, position.y, position.z);
     glScalef(max.x - min.x, max.y - min.y, max.z - min.z);
-    glBegin(GL_LINES);
+    gb.begin(GL_LINES);
     // Front face
-    glColor3f(1.0f, 0.0f, 0.0f); // Red
-    glVertex3f(-0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f,  0.5f,  0.5f);
-    glVertex3f( 0.5f,  0.5f,  0.5f);
-    glVertex3f(-0.5f,  0.5f,  0.5f);
-    glVertex3f(-0.5f,  0.5f,  0.5f);
-    glVertex3f(-0.5f, -0.5f,  0.5f);
+    gb.color3f(1.0f, 0.0f, 0.0f); // Red
+    gb.vertex3f(-0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f,  0.5f,  0.5f);
+    gb.vertex3f( 0.5f,  0.5f,  0.5f);
+    gb.vertex3f(-0.5f,  0.5f,  0.5f);
+    gb.vertex3f(-0.5f,  0.5f,  0.5f);
+    gb.vertex3f(-0.5f, -0.5f,  0.5f);
 
     // Back face
-    glColor3f(0.0f, 1.0f, 0.0f); // Green
-    glVertex3f(-0.5f, -0.5f, -0.5f);
-    glVertex3f(-0.5f,  0.5f, -0.5f);
-    glVertex3f(-0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f, -0.5f, -0.5f);
-    glVertex3f( 0.5f, -0.5f, -0.5f);
-    glVertex3f(-0.5f, -0.5f, -0.5f);
+    gb.color3f(0.0f, 1.0f, 0.0f); // Green
+    gb.vertex3f(-0.5f, -0.5f, -0.5f);
+    gb.vertex3f(-0.5f,  0.5f, -0.5f);
+    gb.vertex3f(-0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f, -0.5f, -0.5f);
+    gb.vertex3f( 0.5f, -0.5f, -0.5f);
+    gb.vertex3f(-0.5f, -0.5f, -0.5f);
 
     // Edges
-    glColor3f(0.0f, 0.0f, 1.0f); // Blue
-    glVertex3f(-0.5f, -0.5f, -0.5f);
-    glVertex3f(-0.5f, -0.5f,  0.5f);
-    glVertex3f(-0.5f,  0.5f, -0.5f);
-    glVertex3f(-0.5f,  0.5f,  0.5f);
-    glVertex3f( 0.5f, -0.5f, -0.5f);
-    glVertex3f( 0.5f, -0.5f,  0.5f);
-    glVertex3f( 0.5f,  0.5f, -0.5f);
-    glVertex3f( 0.5f,  0.5f,  0.5f);
+    gb.color3f(0.0f, 0.0f, 1.0f); // Blue
+    gb.vertex3f(-0.5f, -0.5f, -0.5f);
+    gb.vertex3f(-0.5f, -0.5f,  0.5f);
+    gb.vertex3f(-0.5f,  0.5f, -0.5f);
+    gb.vertex3f(-0.5f,  0.5f,  0.5f);
+    gb.vertex3f( 0.5f, -0.5f, -0.5f);
+    gb.vertex3f( 0.5f, -0.5f,  0.5f);
+    gb.vertex3f( 0.5f,  0.5f, -0.5f);
+    gb.vertex3f( 0.5f,  0.5f,  0.5f);
 
-    glEnd();
+    gb.end();
     glPopMatrix();
 }
 void SCRenderer::renderMapOverlay(RSArea *area) {
@@ -1955,13 +3372,13 @@ void SCRenderer::renderMapOverlay(RSArea *area) {
             v1 = area->objectOverlay[i].vertices[area->objectOverlay[i].trianles[j].verticesIdx[0]];
             v2 = area->objectOverlay[i].vertices[area->objectOverlay[i].trianles[j].verticesIdx[1]];
             v3 = area->objectOverlay[i].vertices[area->objectOverlay[i].trianles[j].verticesIdx[2]];
-            glBegin(GL_TRIANGLES);
+            gb.begin(GL_TRIANGLES);
             const Texel *texel = palette.GetRGBColor(area->objectOverlay[i].trianles[j].color);
-            glColor4f(texel->r / 255.0f, texel->g / 255.0f, texel->b / 255.0f, 1);
-            glVertex3f((GLfloat)v1.x, (GLfloat)v1.y, (GLfloat)-v1.z);
-            glVertex3f((GLfloat)v2.x, (GLfloat)v2.y, (GLfloat)-v2.z);
-            glVertex3f((GLfloat)v3.x, (GLfloat)v3.y, (GLfloat)-v3.z);
-            glEnd();
+            gb.color4f(texel->r / 255.0f, texel->g / 255.0f, texel->b / 255.0f, 1);
+            gb.vertex3f((GLfloat)v1.x, (GLfloat)v1.y, (GLfloat)-v1.z);
+            gb.vertex3f((GLfloat)v2.x, (GLfloat)v2.y, (GLfloat)-v2.z);
+            gb.vertex3f((GLfloat)v3.x, (GLfloat)v3.y, (GLfloat)-v3.z);
+            gb.end();
         }
     }
     glDisable(GL_POLYGON_OFFSET_FILL);
@@ -1979,9 +3396,9 @@ void SCRenderer::renderWorldByID(RSArea *area, int LOD, int verticesPerBlock, in
     //
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
-    glBegin(GL_TRIANGLES);
+    gb.begin(GL_TRIANGLES);
     renderBlock(area, LOD, blockId, false);
-    glEnd();
+    gb.end();
 
     renderBlock(area, LOD, blockId, true);
     glEnable(GL_TEXTURE_2D);
@@ -1996,7 +3413,7 @@ void SCRenderer::renderWorldByID(RSArea *area, int LOD, int verticesPerBlock, in
         }
         glBindTexture(GL_TEXTURE_2D, image->GetTexture()->getTextureID());
 
-        glBegin(GL_TRIANGLES);
+        gb.begin(GL_TRIANGLES);
         for (int i = 0; i < x.second.size(); i++) {
             VertexCache v = x.second.at(i);
             if (v.lv1 != NULL && v.lv1->lowerImageID == x.first) {
@@ -2006,7 +3423,7 @@ void SCRenderer::renderWorldByID(RSArea *area, int LOD, int verticesPerBlock, in
                 renderTexturedTriangle(v.uv1, v.uv2, v.uv3, area, UPPER_TRIANGE, image);
             }
         }
-        glEnd();
+        gb.end();
     }
     glDisable(GL_TEXTURE_2D);
     renderObjects(area, blockId);
@@ -2085,21 +3502,21 @@ void SCRenderer::drawBillboard(Vector3D pos, Texture *tex, float size, float alp
     topLeft.z = pos.z - right.z * halfSize + up.z * halfSize;
     
     // Draw the billboard quad
-    glBegin(GL_QUADS);
-    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+    gb.begin(GL_QUADS);
+    gb.color4f(1.0f, 1.0f, 1.0f, alpha);
     
-    glTexCoord2f(0.0f, 0.0f);
-    glVertex3f(bottomLeft.x, bottomLeft.y, bottomLeft.z);
+    gb.texCoord2f(0.0f, 0.0f);
+    gb.vertex3f(bottomLeft.x, bottomLeft.y, bottomLeft.z);
     
-    glTexCoord2f(1.0f, 0.0f);
-    glVertex3f(bottomRight.x, bottomRight.y, bottomRight.z);
+    gb.texCoord2f(1.0f, 0.0f);
+    gb.vertex3f(bottomRight.x, bottomRight.y, bottomRight.z);
     
-    glTexCoord2f(1.0f, 1.0f);
-    glVertex3f(topRight.x, topRight.y, topRight.z);
+    gb.texCoord2f(1.0f, 1.0f);
+    gb.vertex3f(topRight.x, topRight.y, topRight.z);
     
-    glTexCoord2f(0.0f, 1.0f);
-    glVertex3f(topLeft.x, topLeft.y, topLeft.z);
-    glEnd();
+    gb.texCoord2f(0.0f, 1.0f);
+    gb.vertex3f(topLeft.x, topLeft.y, topLeft.z);
+    gb.end();
     glDisable(GL_ALPHA_TEST);
     glDisable(GL_BLEND);
     glEnable(GL_CULL_FACE);

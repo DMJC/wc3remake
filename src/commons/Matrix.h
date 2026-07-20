@@ -127,6 +127,18 @@ public:
     inline void Normalize(void){
         float ilength;
         ilength = DotProduct(this);
+        // A zero-length vector has no direction to normalize to. Leaving
+        // this unguarded computes InvSqrt(0) == 1/sqrtf(0) == +inf, then
+        // Scale(inf) turns (0,0,0) into (NaN,NaN,NaN) (0 * inf is NaN under
+        // IEEE754) — which then poisons anything downstream (e.g. lighting
+        // math built on vertex normals that are legitimately zero for
+        // vertices no triangle/quad in the current LOD references) —
+        // confirmed by live testing (NaN color components rendered solid
+        // black while a separately-set alpha stayed valid). Leave the zero
+        // vector as-is rather than manufacturing a direction.
+        if (ilength <= 1e-12f) {
+            return;
+        }
         float invSqrtLength = InvSqrt(ilength);
         Scale(invSqrtLength);
     };

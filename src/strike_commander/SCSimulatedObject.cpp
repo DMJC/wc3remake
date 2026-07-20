@@ -31,16 +31,44 @@ void SCSimulatedObject::Render() {
     Vector3D orientaton = { this->azimuthf, this->elevationf, 0.0f };
 
     Renderer.drawModel(this->obj, position, orientaton);
-    
-    if (this->obj->dynn_miss != nullptr && this->obj->dynn_miss->velovity_m_per_sec > 0) {
-    
+
+    // Engine thrust cone (OBJT>MISL>AFTB, user-confirmed real chunk
+    // meaning, 2026-07 session) — every WC3 missile/torpedo has one
+    // except mines (WDAT::is_guided_flight == false), which drop and sit
+    // stationary instead of flying, so they have no thrust to show a
+    // flame for. Drawn at the missile's own body position/orientation
+    // rather than composing in AFTB::positions' per-mount local offset
+    // (unlike the ship-hull afterburner rendering in SCRenderer.cpp,
+    // which runs inside that model's own already-open GL matrix — there's
+    // no equivalent context here, and that offset was already flagged as
+    // unconfirmed/low-confidence when parsed — parseREAL_OBJT_MISL_AFTB_
+    // DATA's own comment). Always the model's highest LOD (full burn —
+    // missiles don't have a throttle to scale it by, unlike a ship's
+    // engine).
+    bool isFlying = this->obj->wdat == nullptr || this->obj->wdat->is_guided_flight;
+    if (isFlying && this->obj->afterburner != nullptr && this->obj->afterburner->objct != nullptr &&
+        !this->obj->afterburner->objct->lods.empty()) {
+        size_t lod = this->obj->afterburner->objct->lods.size() - 1;
+        Renderer.drawModel(this->obj->afterburner->objct, lod, position, orientaton, true);
+    }
+
+    // missile_smoke_textures is an SC1-specific asset set that's never
+    // loaded for WC3 missions -- guarded here (rather than only at the
+    // load site) since this whole Render() path is shared between both
+    // games; without this check, any WC3 missile with dynn_miss velocity
+    // data (parsed straight off its own OBJT>MISL>DYNM chunk) crashed on
+    // the very first frame it rendered (missile_smoke_textures[0] on an
+    // empty vector).
+    if (this->obj->dynn_miss != nullptr && this->obj->dynn_miss->velovity_m_per_sec > 0 &&
+        !this->SmokeSet.missile_smoke_textures.empty()) {
+
         int cpt=0;
         int nb_smoke = (int) this->smoke_positions.size();
         int cpt_smoke = 0;
         for (auto pos: this->smoke_positions) {
             float alpha = (nb_smoke - cpt_smoke) / ((float) nb_smoke);
             cpt_smoke++;
-            if (cpt > this->SmokeSet.missile_smoke_textures.size()-1) {
+            if (cpt >= (int)this->SmokeSet.missile_smoke_textures.size()) {
                 cpt = 0;
             }
             Renderer.drawBillboard(pos, this->SmokeSet.missile_smoke_textures[cpt], 10, alpha);
@@ -120,6 +148,18 @@ std::tuple<Vector3D, Vector3D> SCSimulatedObject::ComputeTrajectory(int tps) {
 
     Vector3D position = { this->x, this->y, this->z };
     Vector3D velocity = { this->vx, this->vy, this->vz };
+
+    // Mines (WDAT::is_guided_flight == false — user-confirmed real
+    // behavior): fired from a missile hardpoint like any other missile,
+    // but they drop from the ship and stay stationary instead of flying
+    // out, waiting for an enemy to come near. No thrust/steer/drag/lift —
+    // just hold position exactly where SCPlane::Shoot() spawned it. The
+    // existing dumbfire-scan-every-actor collision path in Simulate()
+    // (target == nullptr) already gives proximity detonation against any
+    // in-range enemy for free once this returns zero velocity here.
+    if (this->obj != nullptr && this->obj->wdat != nullptr && !this->obj->wdat->is_guided_flight) {
+        return { position, { 0.0f, 0.0f, 0.0f } };
+    }
 
     Vector3D to_target = { 0.0f, 0.0f, 0.0f };
     if (this->target != nullptr) {
@@ -210,35 +250,106 @@ std::tuple<Vector3D, Vector3D> SCSimulatedObject::ComputeTrajectory(int tps) {
     this->run_iterations++;
     return { position, velocity };
 }
-bool SCSimulatedObject::CheckCollision(SCMissionActors *entity) { 
-    BoudingBox *bb{nullptr};
-    Vector3D position = { this->x, this->y, this->z };
+// Slab-method swept segment-vs-AABB test (both in the same space — callers
+// pass a target-relative segment against the target's own local bounding
+// box). Standard algorithm (Kay/Kajiya slab test): clip the segment's
+// parametric [0,1] range against each axis's pair of planes in turn: the
+// segment hits the box iff the intersection of all three per-axis ranges
+// is non-empty.
+static bool SegmentIntersectsAABB(const Vector3D &a, const Vector3D &b, const Point3D &boxMin, const Point3D &boxMax) {
+    Vector3D d = { b.x - a.x, b.y - a.y, b.z - a.z };
+    float axisOrigin[3] = { a.x, a.y, a.z };
+    float axisDir[3] = { d.x, d.y, d.z };
+    float axisMin[3] = { boxMin.x, boxMin.y, boxMin.z };
+    float axisMax[3] = { boxMax.x, boxMax.y, boxMax.z };
+    float tmin = 0.0f, tmax = 1.0f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(axisDir[i]) < 1e-6f) {
+            if (axisOrigin[i] < axisMin[i] || axisOrigin[i] > axisMax[i]) {
+                return false;
+            }
+            continue;
+        }
+        float invDir = 1.0f / axisDir[i];
+        float t1 = (axisMin[i] - axisOrigin[i]) * invDir;
+        float t2 = (axisMax[i] - axisOrigin[i]) * invDir;
+        if (t1 > t2) {
+            std::swap(t1, t2);
+        }
+        tmin = (std::max)(tmin, t1);
+        tmax = (std::min)(tmax, t2);
+        if (tmin > tmax) {
+            return false;
+        }
+    }
+    return true;
+}
+// Shortest distance from point p to the segment [a,b] — used as the
+// fallback hit test for targets with no real bounding box data.
+static float PointToSegmentDistance(const Vector3D &p, const Vector3D &a, const Vector3D &b) {
+    Vector3D ab = { b.x - a.x, b.y - a.y, b.z - a.z };
+    Vector3D ap = { p.x - a.x, p.y - a.y, p.z - a.z };
+    float abLenSq = ab.x * ab.x + ab.y * ab.y + ab.z * ab.z;
+    float t = (abLenSq > 1e-9f) ? ((ap.x * ab.x + ap.y * ab.y + ap.z * ab.z) / abLenSq) : 0.0f;
+    t = (std::max)(0.0f, (std::min)(1.0f, t));
+    Vector3D closest = { a.x + ab.x * t, a.y + ab.y * t, a.z + ab.z * t };
+    Vector3D diff = { p.x - closest.x, p.y - closest.y, p.z - closest.z };
+    return sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+}
+// User-direction (2026-07 session, "calculate bolt intersection"): was a
+// single-point test against this frame's *current* position only — a
+// fast-moving bolt or missile could tunnel straight through a target
+// between two simulation ticks without either tick's sampled point ever
+// landing inside the target's box/threshold. Now sweeps the whole segment
+// travelled since the previous tick (last_px/py/pz -> x/y/z) against the
+// target's bounding box (or, lacking one, the closest distance from the
+// target to that swept segment rather than just to its endpoint).
+// Applies identically regardless of which side is shooting, so player,
+// friendly, and hostile targets are all hit through this same one path
+// (see the self-exclusion-only comment below on the team check removal).
+bool SCSimulatedObject::CheckCollision(SCMissionActors *entity) {
+    // User-confirmed (2026-07 session): WC3 has real friendly fire (shooting
+    // your own wingmen has actual gameplay consequences), so same-team
+    // targets are no longer skipped here — only the shooter itself is
+    // excluded, to stop a bolt/missile from colliding with its own origin.
+    if (entity == shooter) {
+        return false;
+    }
+    Vector3D segStart = { this->last_px, this->last_py, this->last_pz };
+    Vector3D segEnd = { this->x, this->y, this->z };
     Vector3D targetPos = {
         static_cast<float>(entity->object->position.x),
         static_cast<float>(entity->object->position.y),
         static_cast<float>(entity->object->position.z)
     };
-    const float distanceThreshold = 50.0f; // Seuil de distance pour la collision
-    if (entity->team_id == this->shooter->team_id) {
-        return false;
-    }
-    if (entity == shooter) {
-        return false;
-    }
-    bb = entity->object->entity->GetBoudingBpx();
+    BoudingBox *bb = entity->object->entity->GetBoudingBpx();
     if (bb != nullptr) {
-        if (this->x >= targetPos.x + bb->min.x && this->x <= targetPos.x + bb->max.x &&
-            this->y >= targetPos.y+bb->min.y && this->y   <= targetPos.y + bb->max.y &&
-            this->z >= targetPos.z+bb->min.z && this->z <= targetPos.z + bb->max.z) {
-            // Collision detected: mark both objects as not alive and update score.
+        // Bounding box is target-local — move the segment into that same
+        // local space instead of offsetting the box into world space.
+        Vector3D localStart = { segStart.x - targetPos.x, segStart.y - targetPos.y, segStart.z - targetPos.z };
+        Vector3D localEnd = { segEnd.x - targetPos.x, segEnd.y - targetPos.y, segEnd.z - targetPos.z };
+        if (SegmentIntersectsAABB(localStart, localEnd, bb->min, bb->max)) {
             return true;
         }
     }
-    float distance = (targetPos - position).Length();
-    if (distance < distanceThreshold) {
-        return true;
+    const float distanceThreshold = 50.0f;
+    return PointToSegmentDistance(targetPos, segStart, segEnd) < distanceThreshold;
+}
+// Explosion visual (OBJT>MISL>EXPL, user-confirmed real chunk meaning,
+// 2026-07 session) + impact sound for an actual hit — factored out since
+// Simulate() needs it from both hit-detection branches below (locked-
+// target and dumbfire-scan-every-actor) as well as its own pre-existing
+// expiry/ground-hit branches further down.
+static void PlayImpactEffects(SCMission *mission, RSMixer &Mixer, RSEntity *obj, Vector3D position) {
+    if (obj->explos != nullptr && obj->explos->objct != nullptr) {
+        mission->explosions.push_back(new SCExplosion(obj->explos->objct, position));
     }
-    return false;
+    if (mission->sound.sounds.size() > 0) {
+        MemSound *sound = (obj->entity_type == EntityType::tracer)
+            ? mission->sound.sounds[SoundEffectIds::GUN_IMPACT_1]
+            : mission->sound.sounds[SoundEffectIds::EXPLOSION_1];
+        Mixer.playSoundVoc(sound->data, sound->size);
+    }
 }
 void SCSimulatedObject::Simulate(int tps) {
     Vector3D position, velocity;
@@ -248,6 +359,9 @@ void SCSimulatedObject::Simulate(int tps) {
         if (this->CheckCollision(this->target)) {
             this->alive = false;
             this->target->hasBeenHit(this, this->shooter);
+            if (!this->is_simulated) {
+                PlayImpactEffects(this->mission, Mixer, this->obj, position);
+            }
             return;
         }
     } else {
@@ -255,6 +369,9 @@ void SCSimulatedObject::Simulate(int tps) {
             if (this->CheckCollision(entity)) {
                 entity->hasBeenHit(this, this->shooter);
                 this->alive = false;
+                if (!this->is_simulated) {
+                    PlayImpactEffects(this->mission, Mixer, this->obj, position);
+                }
                 break;
             }
         }
@@ -301,9 +418,22 @@ void SCSimulatedObject::Simulate(int tps) {
             this->obj->dynn_miss->velovity_m_per_sec = 0;
         }
     }
-    if (this->y < this->mission->area->getY(this->x, this->z)) {
+    // this->mission->area is only allocated for atmospheric missions
+    // (WC3Mission.cpp: `if (!this->is_space_mission) { this->area = new
+    // RSArea(); ... }`) -- stays null for space missions, which is most
+    // WC3 combat. This was unconditionally dereferenced with no null
+    // check, so every projectile fired in a space mission hit undefined
+    // behavior on its very first simulation tick (there's no ground to
+    // collide with in space anyway, so skipping this check entirely is
+    // correct, not just crash-safe).
+    if (this->mission->area != nullptr && this->y < this->mission->area->getY(this->x, this->z)) {
         if (!this->is_simulated) {
-            this->mission->explosions.push_back(new SCExplosion(this->obj->explos->objct, position));
+            // WC3 synthetic weapon entities (RSEntity::getWC3SyntheticWeapon)
+            // carry no explos data (no on-disk asset to source it from) --
+            // guarded rather than crashing; just skip the visual explosion.
+            if (this->obj->explos != nullptr) {
+                this->mission->explosions.push_back(new SCExplosion(this->obj->explos->objct, position));
+            }
             if (this->mission->sound.sounds.size() > 0) {
                 MemSound *sound;
                 sound = this->mission->sound.sounds[SoundEffectIds::EXPLOSION_1];
@@ -396,7 +526,12 @@ void GunSimulatedObject::Simulate(int tps) {
 
     Vector3D length_vect = { this->x - this->last_px, this->y - this->last_py, this->z - this->last_pz };
     this->distance += length_vect.Length();
-    if (this->distance > this->obj->wdat->effective_range * 10.0f && this->obj->entity_type == EntityType::tracer) {
+    // User-direction (2026-07 session): dropped the unexplained x10
+    // multiplier that used to sit on top of effective_range here --
+    // effective_range is already real per-weapon data (RSEntity::
+    // parseREAL_OBJT_GUNS_DATA, confirmed exact against real Tachyon Gun
+    // stats: 3200), so this now expires a bolt at its actual real range.
+    if (this->distance > this->obj->wdat->effective_range && this->obj->entity_type == EntityType::tracer) {
         this->alive = false;
     }
     if (!this->is_simulated) {
@@ -407,7 +542,9 @@ void GunSimulatedObject::Simulate(int tps) {
                 break;
             }
         }
-        if (this->y < this->mission->area->getY(this->x, this->z)) {
+        // See the same guard's own comment in SCSimulatedObject::Simulate()
+        // above -- mission->area is null for space missions.
+        if (this->mission->area != nullptr && this->y < this->mission->area->getY(this->x, this->z)) {
             this->alive = false;
             if (this->obj->wdat->radius > 5 && this->obj->entity_type == EntityType::bomb) {
                 for (auto entity : this->mission->actors) {
@@ -434,21 +571,31 @@ void GunSimulatedObject::Simulate(int tps) {
     }
 }
 
+// Per-weapon bolt tint. WC3's own weapon data carries no color field --
+// APPR>LASR>INFO is byte-identical between differently-colored weapons
+// (confirmed: LASER vs MESOGUN) -- so these are hardcoded from the real
+// in-game bolt colors (user-supplied). Keyed on RSEntity::weapon_display_name
+// (the GUNS>DATA display name, e.g. "Laser", "Neutron Gun"), which is exact
+// and unambiguous, unlike the .IFF filename (5 separate files are all named
+// "Laser": LASER/RLASER/TURLASER/YLASER/CYLASER).
+static Vector3D getGunBoltColor(const std::string &weaponDisplayName) {
+    if (weaponDisplayName == "Laser") return {227.0f / 255.0f, 16.0f / 255.0f, 16.0f / 255.0f};
+    if (weaponDisplayName == "Ion Gun") return {239.0f / 255.0f, 16.0f / 255.0f, 239.0f / 255.0f};
+    if (weaponDisplayName == "Neutron Gun") return {239.0f / 255.0f, 130.0f / 255.0f, 48.0f / 255.0f};
+    if (weaponDisplayName == "Plasma Gun") return {32.0f / 255.0f, 203.0f / 255.0f, 166.0f / 255.0f};
+    if (weaponDisplayName == "Meson Gun") return {73.0f / 255.0f, 215.0f / 255.0f, 20.0f / 255.0f};
+    if (weaponDisplayName == "Photon Gun") return {219.0f / 255.0f, 227.0f / 255.0f, 24.0f / 255.0f};
+    if (weaponDisplayName == "Reaper Gun") return {239.0f / 255.0f, 16.0f / 255.0f, 239.0f / 255.0f};
+    if (weaponDisplayName == "Tachyon Gun") return {195.0f / 255.0f, 199.0f / 255.0f, 207.0f / 255.0f};
+    return {1.0f, 1.0f, 0.0f}; // unmapped weapon: previous default bolt color
+}
+
 void GunSimulatedObject::Render() {
+    Vector3D pos = {this->x, this->y, this->z};
+    Vector3D orient = {this->azimuthf, this->elevationf, 0.0f};
     if (this->obj->vertices.size() == 0) {
-        Vector3D pos = {this->x, this->y, this->z};
-        Vector3D end = {this->vx, this->vy, this->vz};
-        if (this->smoke_positions.size() >= 1) {
-            end = this->smoke_positions[0];
-            end = end - pos;
-        }
-        end.Normalize();
-        end = end * 20.0f;
-        Vector3D color = {1.0f, 1.0f, 0.0f};
-        Renderer.drawLine(pos, end, color);
+        Renderer.drawBolt(pos, orient, getGunBoltColor(this->obj->weapon_display_name));
     } else {
-        Vector3D pos = {this->x, this->y, this->z};
-        Vector3D orient = {this->azimuthf, this->elevationf, 0.0f};
         Renderer.drawModel(this->obj, pos, orient);
     }
 }

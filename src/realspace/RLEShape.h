@@ -60,6 +60,7 @@ public:
     void init(uint8_t *data, size_t size);
     void InitWithPosition(uint8_t *data, size_t size, Point2D *position);
     void InitFromPakEntry(PakEntry *entry);
+    void InitFromPixels(const uint8_t *pixels, int w, int h);
     bool Expand(uint8_t *dst, size_t *byteRead);
     bool ExpandWithBox(uint8_t *dst, size_t *byteRead, int bx1, int bx2, int by1, int by2);
     inline void SetPosition(Point2D *position) { this->position = *position; }

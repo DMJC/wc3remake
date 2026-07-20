@@ -41,6 +41,20 @@ void RSMixer::init() {
     if (this->has_been_initialized) return;
     this->has_been_initialized = true;
     this->initted = Mix_Init(MIX_INIT_MID);
+    // Force FluidSynth for plain MUS_MID playback (WC3's GMMUSIC.IFF-derived
+    // General MIDI tracks — see WC3GameFlow::playGameflowMusic/RSMixer::
+    // playMidiFromMemory). SDL2_mixer_ext's default MIDI_ANY selection also
+    // probes its bundled native Timidity codec, which has no instrument/GUS
+    // patch configuration anywhere in this project; its first load attempt
+    // fails ("Timidity: Can't initialize library") but leaves the codec's own
+    // static state corrupted, so any later MUS_MID load that the MIDI_ANY
+    // fallback routes back through Timidity segfaults inside its readmidi.c
+    // (_timi_read_midi_file/groom_list) instead of falling through to
+    // FluidSynth again. Selecting FluidSynth up front skips that codec
+    // entirely for MUS_MID. Doesn't affect the separate MUS_ADLMIDI paths
+    // this class also uses (playMusic(uint32_t)/playMusic(MemMusic*)) — the
+    // player selection here only applies when the requested type is MUS_MID.
+    Mix_SetMidiPlayer(MIDI_Fluidsynth);
     if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 1024) < 0) {
         printf("Erreur d'initialisation audio: %s\n", Mix_GetError());
         return;
@@ -121,6 +135,34 @@ void RSMixer::playMusic(uint32_t index, int loop) {
         printf("Error playing music: %s\n", Mix_GetError());
     } else {
         this->current_music = index;
+    }
+}
+
+void RSMixer::playMidiFromMemory(const uint8_t *data, size_t size, int loop) {
+    if (shuttingDown || data == nullptr || size == 0) return;
+    if (this->isplaying) {
+        this->stopMusic();
+    }
+    // WC3's own soundtrack is authored as General MIDI, not the SC1-era
+    // AdLib/OPL3 bank (STRIKE.wopl) the ADLMIDI-based playMusic() overloads
+    // in this class use — so this stays on SDL_mixer's native MUS_MID
+    // backend, matching WC3GameFlow::playGameflowMusic (the onboard-carrier
+    // room music, confirmed working), not the two ADLMIDI overloads above.
+    SDL_RWops *rw = SDL_RWFromConstMem(data, (int)size);
+    Mix_Music *music = Mix_LoadMUSType_RW(rw, MUS_MID, 1);
+    if (!music) {
+        printf("Error loading MIDI music: %s\n", Mix_GetError());
+        return;
+    }
+    if (currentMusicPtr) {
+        Mix_HaltMusic();
+        Mix_FreeMusic(currentMusicPtr);
+    }
+    currentMusicPtr = music;
+    this->isplaying = true;
+    this->current_music = UINT32_MAX;
+    if (Mix_PlayMusic(music, loop) == -1) {
+        printf("Error playing MIDI music: %s\n", Mix_GetError());
     }
 }
 

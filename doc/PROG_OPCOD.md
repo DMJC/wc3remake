@@ -4,6 +4,14 @@
 
 This document details the opcodes used in the PROG chunk of Strike Commander mission files. These opcodes control AI actor behavior and define mission logic.
 
+## Instruction Format
+
+Each instruction is **8 bytes**: `opcode(1) + pad(1, always 0) + marker(2, always the constant bytes 0xED,0xFE) + value(4, signed little-endian)`.
+
+Confirmed by checking every one of the ~11,600 `PROG` instructions across every WC3 mission file in the game — the 2-byte marker is invariant (100% `0xED 0xFE`) at the same offset in every single instruction, with no exceptions. A sub-program ends on an all-zero 8-byte instruction (`opcode=0`, `value=0`).
+
+This is wider than it first appears from a naive 2-byte `[opcode][1-byte arg]` read (which is what an earlier version of the parser assumed) — that misreading silently truncated every argument to its low byte and misinterpreted the rest of each 8-byte instruction as extra, bogus "instructions." If you're referencing raw hex dumps against this table, make sure you're grouping by 8, not 2.
+
 ## Opcode Categories
 
 ### Flow Control
@@ -52,6 +60,7 @@ This document details the opcodes used in the PROG chunk of Strike Commander mis
 
 | Dec | Hex | Opcode | Description |
 |-----|-----|--------|-------------|
+| 160 | 0xA0 | OP_SET_WAIT_FOR_SECONDS | Waits the specified number of seconds before the command is considered complete (present in code's opcode enum/switch; was missing from this doc) |
 | 161 | 0xA1 | OP_SET_OBJ_TAKE_OFF | Sets objective to take off from the specified waypoint |
 | 162 | 0xA2 | OP_SET_OBJ_LAND | Sets objective to land at the specified waypoint |
 | 165 | 0xA5 | OP_SET_OBJ_FLY_TO_WP | Sets objective to fly to a specified waypoint |
@@ -79,7 +88,24 @@ This document details the opcodes used in the PROG chunk of Strike Commander mis
 | 9 | 0x09 | OP_SPOT_DATA | Selects spot data |
 | 208 | 0xD0 | OP_SELECT_FLAG_208 | Unknown for the moment |
 
-## Implementation Notes
+## Inferred / Unconfirmed Opcodes
+
+Not in the game's opcode enum (`SCenums.h`) or handled by `SCProg.cpp` — these fall through to a no-op `default:` today. Derived from statistical analysis (frequency, value range, and which known opcode most often immediately precedes/follows each one) across every `PROG` chunk in the game, using the corrected 8-byte instruction format above. **None of these are confirmed against the original executable** — treat as a starting hypothesis for further work (e.g. dosbox-debug tracing), not fact.
+
+| Dec | Hex | Count | Context pattern | Best guess |
+|-----|-----|-------|------------------|------------|
+| 172 | 0xAC | 479 | Follows a `SET_OBJ_*` call 88% of the time (`SET_OBJ_DESTROY_TARGET`, `SET_OBJ_LAND`, `SET_OBJ_TAKE_OFF`, ...); values look like waypoint/objective indices | Links the objective just set to a nav-map waypoint number — natural companion to `OP_SET_MESSAGE` (171, "sets a message for a waypoint in the navigation map") |
+| 153 | 0x99 | 101 | Followed by `OP_SPOT_DATA` 100% of the time | A spot-selector immediately consumed by `SPOT_DATA` |
+| 173 | 0xAD | 52 | Followed by `OP_SPOT_DATA` 100% of the time | Same role as 153 — possibly a second spot-selection mode (e.g. absolute vs. relative) |
+| 150 | 0x96 | 46 | Followed by `OP_BRANCH_IF_EQUAL`/`OP_BRANCH_IF_NOT_EQUAL` 100% of the time | A comparison/test opcode feeding the branch, parallel to `OP_TEST_FLAG` but testing something else |
+| 196 | 0xC4 | 239 | Follows `OP_MOVE_FLAG_TO_WORK_REGISTER`/`OP_MOVE_VALUE_TO_WORK_REGISTER`; often immediately followed by opcode 193 | Part of a comparison/action pair, distinct from `OP_CMP_*` |
+| 193 | 0xC1 | 124 | Follows opcode 196 in ~36% of its occurrences; otherwise follows `OP_SET_LABEL`/branch opcodes | Second half of the 196/193 pair, or a standalone conditional action |
+| 224 | 0xE0 | 105 | Only ever takes value 0 or 1; sits among `OP_BRANCH_IF_*`/`OP_SET_FLAG_*` | A boolean flag setter/getter |
+| 182 | 0xB6 | 132 | Tightly clusters with opcodes 184 and 225 (each commonly precedes/follows the other two); dominated by value `-1` | Part of a related setup/teardown triplet; `-1` matches the "unset" sentinel convention used elsewhere in the format (e.g. `SPOT.area_id`) |
+| 184 | 0xB8 | 96 | See 182 | See 182 |
+| 225 | 0xE1 | 69 | See 182 | See 182 |
+
+
 
 1. Objectives (OP_SET_OBJ_*) define a task for an actor and return "true" when completed.
 

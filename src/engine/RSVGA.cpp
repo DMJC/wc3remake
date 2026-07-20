@@ -7,10 +7,13 @@
 //
 
 #include "RSVGA.h"
+#include "GLBatch.h"
 #include "Config.hpp"
 #include "../realspace/RSImage.h"
 #include "../realspace/RSPalette.h"
+#include "../commons/GraphicsSettings.h"
 #include "SDL2/SDL_opengl_glext.h"
+#include <vector>
 // Ajouter après la fonction applyEagle2x existante
 
 // Fonction auxiliaire pour comparer deux couleurs (utilisée par SuperEagle)
@@ -165,7 +168,11 @@ void applyEagle2x(uint32_t* src, uint32_t* dst, int width, int height) {
 }
 
 RSVGA::RSVGA() {
+    // Real sizing happens in SetCanvasResolution() (called from init()) —
+    // just enough here that a stray call before init() (shouldn't happen)
+    // doesn't dereference null.
     this->frameBuffer = new FrameBuffer(320,200);
+    this->data = (Texel*)calloc(320*200, sizeof(Texel));
     this->upscaled_framebuffer = (uint32_t *)calloc(640*400, sizeof(uint32_t));
 }
 
@@ -173,8 +180,44 @@ RSVGA::~RSVGA() {
     if (this->frameBuffer != nullptr) {
         delete this->frameBuffer;
     }
+    if (this->data != nullptr) {
+        free(this->data);
+    }
     if (this->upscaled_framebuffer != nullptr) {
         free(this->upscaled_framebuffer);
+    }
+}
+void RSVGA::SetCanvasResolution(int w, int h) {
+    if (w == this->canvasWidth && h == this->canvasHeight && this->frameBuffer != nullptr) {
+        return;
+    }
+    this->canvasWidth = w;
+    this->canvasHeight = h;
+
+    if (this->frameBuffer != nullptr) {
+        delete this->frameBuffer;
+    }
+    this->frameBuffer = new FrameBuffer(w, h);
+
+    if (this->data != nullptr) {
+        free(this->data);
+    }
+    this->data = (Texel*)calloc((size_t)w * h, sizeof(Texel));
+
+    if (this->upscaled_framebuffer != nullptr) {
+        free(this->upscaled_framebuffer);
+    }
+    this->upscaled_framebuffer = (uint32_t *)calloc((size_t)w * 2 * h * 2, sizeof(uint32_t));
+
+    // Re-upload the backing GL texture at the new size — textureID is only
+    // valid once init() has run at least once (glGenTextures below), which
+    // is always true by the time this is called from init() itself or from
+    // a later options-screen change.
+    if (this->textureID != 0) {
+        glBindTexture(GL_TEXTURE_2D, this->textureID);
+        uint8_t *blank = (uint8_t *)calloc(1, (size_t)w * h * 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, blank);
+        free(blank);
     }
 }
 void RSVGA::init(int width, int height) {
@@ -185,7 +228,7 @@ void RSVGA::init(int width, int height) {
     this->upscale = config.getBool("Video", "super_eagle_2x", false);
     RSPalette palette;
     TreEntry *entries = (TreEntry *)assets.GetEntryByName("..\\..\\DATA\\PALETTE\\PALETTE.IFF");
-    
+
     if (entries != nullptr) {
         palette.initFromFileRam(entries->data, entries->size);
     } else {
@@ -194,7 +237,7 @@ void RSVGA::init(int width, int height) {
             palette.initFromFileData(f);
         }
     }
-    
+
     this->palette = *palette.GetColorPalette();
 
     glGenTextures(1, &this->textureID);
@@ -207,14 +250,17 @@ void RSVGA::init(int width, int height) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 
-    glBindTexture(GL_TEXTURE_2D, this->textureID);
-    uint8_t *data = (uint8_t *)calloc(1, 320 * 200 * 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 320, 200, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-    free(data);
+    // Canvas resolution follows g_ifVGA (see commons/GraphicsSettings.h) —
+    // 320x200 for VGA, 640x480 for SVGA (not a clean 2x scale of VGA, a
+    // genuinely distinct 4:3 canvas — see RSCockpit.h's own ARTP_SVGA
+    // comment). SetCanvasResolution() does the actual GL texture upload at
+    // the right size, so the old direct glTexImage2D(...,320,200,...) call
+    // that used to be here is gone — this replaces it.
+    this->SetCanvasResolution(g_ifVGA ? 320 : 640, g_ifVGA ? 200 : 480);
 }
 
 void RSVGA::activate(void) {
-    glColor4f(1, 0, 1, 0);
+    gb.color4f(1, 0, 1, 0);
 }
 
 void RSVGA::setPalette(VGAPalette *newPalette) { this->palette = *newPalette; }
@@ -224,29 +270,35 @@ VGAPalette *RSVGA::getPalette(void) { return &palette; }
 
 void RSVGA::fadeOut(int steps, int delayMs) {
     // Sauvegarde de l'état actuel de l'écran
-    Texel originalData[320 * 200];
-    memcpy(originalData, data, sizeof(data));
-    
+    // Was a fixed-size `Texel originalData[320*200]` + `memcpy(...,
+    // sizeof(data))` — now that `data` is a heap pointer (see its own
+    // declaration comment), `sizeof(data)` would silently copy only
+    // sizeof(Texel*) bytes instead of the real buffer size. Explicit size
+    // + a real (canvas-sized) buffer instead.
+    const size_t pixelCount = (size_t)canvasWidth * canvasHeight;
+    std::vector<Texel> originalData(pixelCount);
+    memcpy(originalData.data(), data, pixelCount * sizeof(Texel));
+
     // Facteur de réduction de luminosité pour chaque étape
     float fadeStep = 1.0f / steps;
-    
+
     for (int step = 1; step <= steps; step++) {
         // Facteur d'assombrissement pour cette étape (de 1.0 à 0.0)
         float fadeFactor = 1.0f - (step * fadeStep);
-        
+
         // Appliquer le facteur d'assombrissement à chaque pixel
-        for (int i = 0; i < 320 * 200; i++) {
+        for (size_t i = 0; i < pixelCount; i++) {
             // Préserver la transparence originale
             uint8_t alpha = originalData[i].a;
-            
+
             // Assombrir progressivement les composantes RGB
             data[i].r = static_cast<uint8_t>(originalData[i].r * fadeFactor);
             data[i].g = static_cast<uint8_t>(originalData[i].g * fadeFactor);
             data[i].b = static_cast<uint8_t>(originalData[i].b * fadeFactor);
             data[i].a = alpha; // Conserver l'alpha d'origine
         }
-        
-        displayBuffer((uint32_t *)data, 320, 200);
+
+        displayBuffer((uint32_t *)data, canvasWidth, canvasHeight);
         Screen->refresh();
         
         SDL_Event ev;
@@ -263,14 +315,14 @@ void RSVGA::fadeOut(int steps, int delayMs) {
     }
     
     // S'assurer que l'écran est complètement noir à la fin
-    for (int i = 0; i < 320 * 200; i++) {
+    for (size_t i = 0; i < pixelCount; i++) {
         data[i].r = 0;
         data[i].g = 0;
         data[i].b = 0;
         // Conserver l'alpha d'origine
         data[i].a = originalData[i].a;
     }
-    displayBuffer((uint32_t *)data, 320, 200);
+    displayBuffer((uint32_t *)data, canvasWidth, canvasHeight);
 }
 
 void RSVGA::displayBuffer(uint32_t *buffer, int width, int height) {
@@ -300,21 +352,21 @@ void RSVGA::displayBuffer(uint32_t *buffer, int width, int height) {
     glEnable(GL_TEXTURE_2D);
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    gb.color4f(1.0f, 1.0f, 1.0f, 1.0f);
 
-    glBegin(GL_QUADS);
-    glTexCoord2f(0, 1);
-    glVertex2d(0, 0);
+    gb.begin(GL_QUADS);
+    gb.texCoord2f(0, 1);
+    gb.vertex2d(0, 0);
 
-    glTexCoord2f(1, 1);
-    glVertex2d(width, 0);
+    gb.texCoord2f(1, 1);
+    gb.vertex2d(width, 0);
 
-    glTexCoord2f(1, 0);
-    glVertex2d(width, height);
+    gb.texCoord2f(1, 0);
+    gb.vertex2d(width, height);
 
-    glTexCoord2f(0, 0);
-    glVertex2d(0, height);
-    glEnd();
+    gb.texCoord2f(0, 0);
+    gb.vertex2d(0, height);
+    gb.end();
 
     glDisable(GL_TEXTURE_2D);
     glEnable(GL_CULL_FACE);
@@ -332,14 +384,15 @@ void RSVGA::vSync(void) {
     memcpy(lut, palette.colors, sizeof(lut));
     lut[255].a = 0;
     uint8_t *src = frameBuffer->framebuffer;
-    for (size_t i = 0; i < 320 * 200; i++) {
+    const size_t pixelCount = (size_t)canvasWidth * canvasHeight;
+    for (size_t i = 0; i < pixelCount; i++) {
         *dst++ = lut[src[i]];
     }
     if (this->upscale) {
-        applySuperEagle2x((uint32_t *)data, upscaled_framebuffer, 320, 200);
-        displayBuffer(upscaled_framebuffer, 640, 400);
+        applySuperEagle2x((uint32_t *)data, upscaled_framebuffer, canvasWidth, canvasHeight);
+        displayBuffer(upscaled_framebuffer, canvasWidth * 2, canvasHeight * 2);
     } else {
-        displayBuffer((uint32_t *)data, 320, 200);
+        displayBuffer((uint32_t *)data, canvasWidth, canvasHeight);
     }
 }
 

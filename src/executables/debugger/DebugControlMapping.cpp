@@ -87,6 +87,8 @@ void DebugControlMapping::buildActionList() {
 
         // --- Combat ---
         { "Fire Primary",           CreateAction(InputAction::SIM_START, S::FIRE_PRIMARY)       },
+        { "Fire Missile",           CreateAction(InputAction::SIM_START, S::FIRE_MISSILE)       },
+        { "Cycle Guns",             CreateAction(InputAction::SIM_START, S::CYCLE_GUNS)         },
         { "Target Nearest",         CreateAction(InputAction::SIM_START, S::TARGET_NEAREST)     },
         { "Chaff",                  CreateAction(InputAction::SIM_START, S::CHAFF)              },
         { "Flare",                  CreateAction(InputAction::SIM_START, S::FLARE)              },
@@ -104,6 +106,7 @@ void DebugControlMapping::buildActionList() {
         { "View Target",            CreateAction(InputAction::SIM_START, S::VIEW_TARGET)        },
         { "View Behind",            CreateAction(InputAction::SIM_START, S::VIEW_BEHIND)        },
         { "View Weapons",           CreateAction(InputAction::SIM_START, S::VIEW_WEAPONS)       },
+        { "View Track",             CreateAction(InputAction::SIM_START, S::VIEW_TRACK)         },
 
         // --- MFD / Radar ---
         { "MDFS Radar",             CreateAction(InputAction::SIM_START, S::MDFS_RADAR)         },

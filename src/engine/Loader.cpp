@@ -1,4 +1,5 @@
 #include "Loader.h"
+#include "GLBatch.h"
 #include "SDL_ttf.h"
 
 
@@ -163,17 +164,17 @@ void Loader::runFrame() {
 
     glBindTexture(GL_TEXTURE_2D, loadingTexture);
 
-    glColor4f(1.0f,0.0f,1.0f,1.0f);
-    glBegin(GL_QUADS);
-        glTexCoord2f(0.0f, 0.0f);
-        glVertex2f(-1.0f, 1.0f);
-        glTexCoord2f(1.0f, 0.0f);
-        glVertex2f(1.0f, 1.0f);
-        glTexCoord2f(1.0f, 1.0f);
-        glVertex2f(1.0f, -1.0f);
-        glTexCoord2f(0.0f, 1.0f);
-        glVertex2f(-1.0f, -1.0f);
-    glEnd();
+    gb.color4f(1.0f,0.0f,1.0f,1.0f);
+    gb.begin(GL_QUADS);
+        gb.texCoord2f(0.0f, 0.0f);
+        gb.vertex2f(-1.0f, 1.0f);
+        gb.texCoord2f(1.0f, 0.0f);
+        gb.vertex2f(1.0f, 1.0f);
+        gb.texCoord2f(1.0f, 1.0f);
+        gb.vertex2f(1.0f, -1.0f);
+        gb.texCoord2f(0.0f, 1.0f);
+        gb.vertex2f(-1.0f, -1.0f);
+    gb.end();
 
     glDisable(GL_TEXTURE_2D);
     glEnable(GL_CULL_FACE);

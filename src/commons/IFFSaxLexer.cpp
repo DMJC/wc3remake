@@ -93,17 +93,14 @@ void IFFSaxLexer::Parse(std::unordered_map<std::string, std::function<void(uint8
             if (events.count(chunk_stype) > 0) {
                 uint8_t * chunk_data = (uint8_t *)calloc(chunk_size + size_offset, sizeof(uint8_t));
                 this->stream->ReadBytes(chunk_data, chunk_size + size_offset);
-                if (this->stream->CurrentByte() == 0 && (chunk_size % 2 != 0)) {
+                // EA-IFF-85: odd-sized chunks are always followed by exactly
+                // one pad byte, unconditionally — its value is not
+                // meaningful (e.g. compressed pixel data pads with whatever
+                // byte the compressor happened to emit last), so it can't be
+                // detected by inspecting it.
+                if (chunk_size % 2 != 0) {
                     this->stream->MoveForward(1);
                     read++;
-                } else if (chunk_size % 2 != 0 && this->stream->CurrentByte() == this->stream->PeekByte()) {
-                    this->stream->MoveForward(1);
-                    read++;
-                } else if (chunk_size % 2 != 0 && this->stream->GetSize() - this->stream->GetCurrentPosition() == 1) {
-                    this->stream->MoveForward(1);
-                    read++;
-                } else if (chunk_size % 2 != 0) {
-                    printf("IFF SAX: Expected padding byte not found after chunk %s\n", chunk_stype.c_str());
                 }
                 events.at(chunk_stype)(chunk_data, chunk_size + size_offset);
                 read += (chunk_size + size_offset);
@@ -111,17 +108,9 @@ void IFFSaxLexer::Parse(std::unordered_map<std::string, std::function<void(uint8
             } else {
                 printf("%s not handled\n", chunk_stype.c_str());
                 std::vector<uint8_t> dump = this->stream->ReadBytes(chunk_size + size_offset);
-                if (this->stream->CurrentByte() == 0 && (chunk_size % 2 != 0)) {
+                if (chunk_size % 2 != 0) {
                     this->stream->MoveForward(1);
                     read++;
-                } else if (chunk_size % 2 != 0 && this->stream->CurrentByte() == this->stream->PeekByte()) {
-                    this->stream->MoveForward(1);
-                    read++;
-                } else if (chunk_size % 2 != 0 && this->stream->GetSize() - this->stream->GetCurrentPosition() == 1) {
-                    this->stream->MoveForward(1);
-                    read++;
-                } else if (chunk_size % 2 != 0) {
-                    printf("IFF SAX: Expected padding byte not found after chunk %s\n", chunk_stype.c_str());
                 }
                 read += (chunk_size+ size_offset );
             }
@@ -136,26 +125,26 @@ void IFFSaxLexer::Parse(std::unordered_map<std::string, std::function<void(uint8
                 read -= 4;
 			}
             read += 4;
-            if (events.count(chunk_stype.c_str()) > 0) {
+            // Look up by the full 4-char chunk_stype, not chunk_stype.c_str()
+            // — a tag with an embedded null (e.g. WC3 profile's "FMV\0" or
+            // "AI\0_") would otherwise implicitly convert through the
+            // strlen-based std::string(const char*) constructor and get
+            // silently truncated (to "FMV"/"AI"), so it could never match a
+            // handler even if one were registered for it. No behavior change
+            // for the ordinary case, since a chunk_stype without an embedded
+            // null round-trips identically through .c_str().
+            if (events.count(chunk_stype) > 0) {
                 if (chunk_size > 0) {
                     uint8_t * chunk_data = (uint8_t *)calloc(chunk_size, sizeof(uint8_t));
                     this->stream->ReadBytes(chunk_data, chunk_size);
-                    if (this->stream->CurrentByte() == 0 && (chunk_size % 2 != 0)) {
+                    if (chunk_size % 2 != 0) {
                         this->stream->MoveForward(1);
                         read++;
-                    } else if (chunk_size % 2 != 0 && this->stream->CurrentByte() == this->stream->PeekByte()) {
-                        this->stream->MoveForward(1);
-                        read++;
-                    } else if (chunk_size % 2 != 0 && this->stream->GetSize() - this->stream->GetCurrentPosition() == 1) {
-                        this->stream->MoveForward(1);
-                        read++;
-                    } else if (chunk_size % 2 != 0) {
-                        printf("IFF SAX: Expected padding byte not found after chunk %s\n", chunk_stype.c_str());
                     }
-                    events.at(chunk_stype.c_str())(chunk_data, chunk_size);
+                    events.at(chunk_stype)(chunk_data, chunk_size);
                     free(chunk_data);
                 } else {
-                    events.at(chunk_stype.c_str())(NULL, 0);
+                    events.at(chunk_stype)(NULL, 0);
                 }
                 read += chunk_size;
             } else {
@@ -163,17 +152,9 @@ void IFFSaxLexer::Parse(std::unordered_map<std::string, std::function<void(uint8
                 if (chunk_size > 0) {
                     //std::vector<uint8_t> dump = this->stream->ReadBytes(chunk_size);
                     this->stream->MoveForward(chunk_size);
-                    if (this->stream->CurrentByte() == 0 && (chunk_size % 2 != 0)) {
+                    if (chunk_size % 2 != 0) {
                         this->stream->MoveForward(1);
                         read++;
-                    } else if (chunk_size % 2 != 0 && this->stream->CurrentByte() == this->stream->PeekByte()) {
-                        this->stream->MoveForward(1);
-                        read++;
-                    } else if (chunk_size % 2 != 0 && this->stream->GetSize() - this->stream->GetCurrentPosition() == 1) {
-                        this->stream->MoveForward(1);
-                        read++;
-                    } else if (chunk_size % 2 != 0) {
-                        printf("IFF SAX: Expected padding byte not found after chunk %s\n", chunk_stype.c_str());
                     }
                     read += chunk_size;
                 }

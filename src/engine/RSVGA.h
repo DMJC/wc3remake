@@ -36,12 +36,31 @@ private:
     FrameBuffer* frameBuffer;
     uint32_t *upscaled_framebuffer{nullptr};
     uint32_t textureID;
-    Texel data[320 * 200];
+    // Was a fixed Texel data[320*200] — the logical 2D-screen canvas
+    // (nav map, cockpit HUD, targeting-box overlay, ...) used to be
+    // permanently VGA (320x200) regardless of the if_VGA setting (see
+    // commons/GraphicsSettings.h), since this buffer's size was baked into
+    // the class itself rather than being configurable. Heap-allocated and
+    // resized via SetCanvasResolution() instead, so it can genuinely be
+    // 640x480 for SVGA mode.
+    Texel *data{nullptr};
+    int canvasWidth{320};
+    int canvasHeight{200};
     inline static std::unique_ptr<RSVGA> s_instance{};
     void displayBuffer(uint32_t* buffer, int width, int height);
     RSScreen *Screen = &RSScreen::instance();
 public:
     bool upscale{false};
+    // (Re)allocates frameBuffer/data/upscaled_framebuffer and the backing
+    // GL texture at the given logical canvas resolution — called once from
+    // init() using the current g_ifVGA setting, and again whenever the
+    // player changes the VGA/SVGA option so it takes effect without a
+    // restart. Safe to call with the same size repeatedly (no-ops the
+    // reallocation) since options-screen clicks call it every frame the
+    // setting is active, not just on change.
+    void SetCanvasResolution(int w, int h);
+    int GetCanvasWidth() const { return canvasWidth; }
+    int GetCanvasHeight() const { return canvasHeight; }
     
     static RSVGA& getInstance() {
         if (!RSVGA::hasInstance()) {
@@ -67,6 +86,10 @@ public:
     void vSync(void);
     void fadeOut(int steps = 10, int delayMs = 50);
     FrameBuffer* getFrameBuffer(void){ return frameBuffer;};
+    // Actual window/output pixel size (the letterboxed-to-4:3 GL viewport
+    // target), independent of the fixed 320x200 logical frameBuffer above.
+    int GetWindowWidth(void) const { return width; }
+    int GetWindowHeight(void) const { return height; }
 
     void ajusterContraste(float facteur);
     void ajusterLuminosite(float facteur);

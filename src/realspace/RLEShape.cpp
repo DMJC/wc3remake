@@ -7,6 +7,8 @@
 //
 
 #include "RLEShape.h"
+#include <algorithm>
+#include <initializer_list>
 
 RLEShape::RLEShape() : colorOffset(0) {
     position.x = 0;
@@ -73,9 +75,15 @@ RLEShape::~RLEShape() {
 
 void RLEShape::ReadFragment(RLEFragment *frag) {
 
+    // WC3 frames often have no trailing FRAG_END — stop cleanly at stream end.
+    if (stream.GetCurrentPosition() + 2 > stream.GetSize()) {
+        frag->type = FRAG_END;
+        return;
+    }
     uint16_t code = stream.ReadUShort();
 
-    if (code == 0) {
+    // Need 4 more bytes for dx + dy; if not available treat as FRAG_END.
+    if (code == 0 || stream.GetCurrentPosition() + 4 > stream.GetSize()) {
         frag->type = FRAG_END;
         return;
     }
@@ -104,6 +112,7 @@ bool RLEShape::ExpandFragment(RLEFragment *frag, uint8_t *dst) {
     switch (frag->type) {
         case FRAG_RAW: {
             for (int i = 0; i < frag->numTexels; i++) {
+                if (stream.IsEndOfStream()) return false;
                 uint8_t color = stream.ReadByte();
                 error = WriteColor(dst, frag->dx + i, frag->dy, color);
                 if (error)
@@ -115,6 +124,7 @@ bool RLEShape::ExpandFragment(RLEFragment *frag, uint8_t *dst) {
             int numOfTexelsWritten = 0;
 
             while (numOfTexelsWritten < frag->numTexels) {
+                if (stream.IsEndOfStream()) return false;
                 uint8_t subCode = stream.ReadByte();
                 uint8_t subCodeType = subCode % 2;
 
@@ -122,6 +132,7 @@ bool RLEShape::ExpandFragment(RLEFragment *frag, uint8_t *dst) {
 
                 if (subCodeType == SUB_FRAG_RAW) {
                     for (int i = 0; i < fragNumTexels; i++) {
+                        if (stream.IsEndOfStream()) return false;
                         uint8_t color = stream.ReadByte();
                         error = WriteColor(dst, frag->dx + numOfTexelsWritten, frag->dy, color);
                         if (error)
@@ -130,6 +141,7 @@ bool RLEShape::ExpandFragment(RLEFragment *frag, uint8_t *dst) {
                     }
 
                 } else {
+                    if (stream.IsEndOfStream()) return false;
                     uint8_t color = stream.ReadByte();
                     for (int i = 0; i < fragNumTexels; i++) {
                         error = WriteColor(dst, frag->dx + numOfTexelsWritten, frag->dy, color);
@@ -156,6 +168,7 @@ bool RLEShape::ExpandFragmentWithBox(RLEFragment *frag, uint8_t *dst, int bx1, i
     switch (frag->type) {
         case FRAG_RAW: {
             for (int i = 0; i < frag->numTexels; i++) {
+                if (stream.IsEndOfStream()) return false;
                 uint8_t color = stream.ReadByte();
                 error = WriteColorWithBox(dst, frag->dx + i, frag->dy, color, bx1, bx2, by1, by2);
                 if (error)
@@ -167,6 +180,7 @@ bool RLEShape::ExpandFragmentWithBox(RLEFragment *frag, uint8_t *dst, int bx1, i
             int numOfTexelsWritten = 0;
 
             while (numOfTexelsWritten < frag->numTexels) {
+                if (stream.IsEndOfStream()) return false;
                 uint8_t subCode = stream.ReadByte();
                 uint8_t subCodeType = subCode % 2;
 
@@ -174,6 +188,7 @@ bool RLEShape::ExpandFragmentWithBox(RLEFragment *frag, uint8_t *dst, int bx1, i
 
                 if (subCodeType == SUB_FRAG_RAW) {
                     for (int i = 0; i < fragNumTexels; i++) {
+                        if (stream.IsEndOfStream()) return false;
                         uint8_t color = stream.ReadByte();
                         error = WriteColorWithBox(dst, frag->dx + numOfTexelsWritten, frag->dy, color, bx1, bx2, by1, by2);
                         if (error)
@@ -182,6 +197,7 @@ bool RLEShape::ExpandFragmentWithBox(RLEFragment *frag, uint8_t *dst, int bx1, i
                     }
 
                 } else {
+                    if (stream.IsEndOfStream()) return false;
                     uint8_t color = stream.ReadByte();
                     for (int i = 0; i < fragNumTexels; i++) {
                         error = WriteColorWithBox(dst, frag->dx + numOfTexelsWritten, frag->dy, color, bx1, bx2, by1, by2);
@@ -230,33 +246,23 @@ void RLEShape::init(uint8_t *idata, size_t isize) {
     if (this->rightDist + this->leftDist == 0 && this->topDist + this->botDist > 0) {
         this->leftDist = 1;
     }
-    if (this->rightDist > 640 || 
-        this->leftDist > 640 || 
-        this->topDist > 400 || 
-        this->botDist > 400 || 
-        this->rightDist < -320 || 
-        this->topDist < -200 || 
-        this->leftDist < -320 || 
-        this->botDist < -200) {
+    if (this->rightDist > 1280 ||
+        this->leftDist > 1280 ||
+        this->topDist > 960 ||
+        this->botDist > 960 ||
+        this->rightDist < -640 ||
+        this->topDist < -480 ||
+        this->leftDist < -640 ||
+        this->botDist < -480) {
         this->uncompressed = false;
-        printf("Warning: RLE shape has invalid dimensions, skipping expansion\n");
-        printf("Dimensions: left=%d, right=%d, top=%d, bot=%d\n", this->leftDist, this->rightDist, this->topDist, this->botDist);
         return;
     }
     if (this->rightDist + this->leftDist > 0 && this->topDist + this->botDist > 0) {
-        this->buffer_size.x = this->leftDist + this->rightDist;  // sprite width
-        this->buffer_size.y = this->topDist + this->botDist;       // sprite height
-        if (this->buffer_size.x > 322 || this->buffer_size.y > 204) {
-            printf("Warning: RLE shape has dimensions larger than screen, clipping will occur\n");
-            printf("Buffer dimensions: width=%d, height=%d\n", this->buffer_size.x, this->buffer_size.y);
-            this->buffer_size.x = 322;
-            this->buffer_size.y = 204;
-        }
+        this->buffer_size.x = this->leftDist + this->rightDist;
+        this->buffer_size.y = this->topDist + this->botDist;
         this->expand_buffer = new uint8_t[this->buffer_size.x * this->buffer_size.y];
         memset(this->expand_buffer, 255, this->buffer_size.x * this->buffer_size.y);
         bool error = this->Expand(this->expand_buffer, &this->uncompressed_size);
-        this->buffer_size.x = 320;  // restaurer les dimensions écran
-        this->buffer_size.y = 200;
         this->uncompressed = true;
     }
 }
@@ -264,6 +270,23 @@ void RLEShape::init(uint8_t *idata, size_t isize) {
 void RLEShape::InitWithPosition(uint8_t *idata, size_t isize, Point2D *position) {
     init(idata, isize);
     SetPosition(position);
+}
+
+void RLEShape::InitFromPixels(const uint8_t *pixels, int w, int h) {
+    delete[] this->expand_buffer;
+    this->expand_buffer = new uint8_t[w * h];
+    memcpy(this->expand_buffer, pixels, w * h);
+    this->leftDist  = 0;
+    this->rightDist = (int16_t)w;
+    this->topDist   = 0;
+    this->botDist   = (int16_t)h;
+    this->buffer_size.x = w;
+    this->buffer_size.y = h;
+    this->uncompressed = true;
+    this->size = 0;
+    this->data = nullptr;
+    this->position.x = 0;
+    this->position.y = 0;
 }
 
 bool RLEShape::Expand(uint8_t *dst, size_t *byteRead) {
@@ -309,16 +332,16 @@ bool RLEShape::Expand(uint8_t *dst, size_t *byteRead) {
         *byteRead = 0;
         return false;
     }
-    this->stream.Set(data, size);
+    // data points 8 bytes past the buffer start (after the header); size includes
+    // those 8 header bytes, so only (size - 8) bytes are valid fragment data.
+    this->stream.Set(data, size > 8 ? size - 8 : 0);
     RLEFragment frag;
 
     ReadFragment(&frag);
 
     while (frag.type != FRAG_END) {
         bool error = ExpandFragment(&frag, dst);
-        if (error) {
-            return true;
-        }
+        if (error) return true;
         ReadFragment(&frag);
     }
 
@@ -362,7 +385,7 @@ bool RLEShape::ExpandWithBox(uint8_t *dst, size_t *byteRead, int bx1, int bx2, i
         *byteRead = this->uncompressed_size;
         return false;
     }
-    this->stream.Set(data, size);
+    this->stream.Set(data, size > 8 ? size - 8 : 0);
     RLEFragment frag;
 
     ReadFragment(&frag);

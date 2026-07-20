@@ -20,24 +20,49 @@ SCMouse::~SCMouse(){
     
 }
 
+static void makeFallbackCursor(RLEShape* shape) {
+    // 12×12 arrow pointing top-left.
+    // 0=black outline, 15=white fill, 255=transparent.
+    static const uint8_t kPixels[12 * 12] = {
+          0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+          0,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+          0,  15,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+          0,  15,  15,   0, 255, 255, 255, 255, 255, 255, 255, 255,
+          0,  15,  15,  15,   0, 255, 255, 255, 255, 255, 255, 255,
+          0,  15,  15,  15,  15,   0, 255, 255, 255, 255, 255, 255,
+          0,  15,  15,   0,   0, 255, 255, 255, 255, 255, 255, 255,
+          0,  15,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+          0,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+          0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    };
+    shape->InitFromPixels(kPixels, 12, 12);
+}
+
 void SCMouse::init(void){
-    
+
     AssetManager &asset = AssetManager::instance();
     TreEntry* cursorShape   = asset.GetEntryByName(CURSOR_SHAPE_PATH);
     if (!cursorShape) {
-        this->visible = false;
+        for (int i = 0; i < 4; i++) {
+            appearances[i] = new RLEShape();
+            makeFallbackCursor(appearances[i]);
+        }
+        this->visible = true;
         return;
     }
     PakArchive cursors ;
     cursors.InitFromRAM("MOUSE.SHP",cursorShape->data,cursorShape->size);
-    
+
     RLEShape* shape;
-    
+
     for (int i = 0 ; i < 4; i++) {
         shape = new RLEShape();
         shape->init(cursors.GetEntry(i)->data, cursors.GetEntry(i)->size);
         appearances[i] = shape;
     }
+    this->visible = true;
 }
 
 void SCMouse::draw(void){

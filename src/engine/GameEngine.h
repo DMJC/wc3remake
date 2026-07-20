@@ -15,6 +15,7 @@
 #include <stack>
 #include <vector>
 #include <string>
+#include <functional>
 #include <SDL.h>
 #include "../commons/Maths.h"
 #include "SCMouse.h"
@@ -97,6 +98,43 @@ enum SimActionOfst {
     SINGLE_TARGET_MODE = 64,
     RUDDER_LEFT = 65,
     RUDDER_RIGHT = 66,
+    THROTTLE_STOP = 67,
+    AFTERBURNER = 68,
+    MODIFIER_SHIFT = 69,
+    // Real WC-series controls use dedicated gun/missile triggers, not a
+    // single fire button cycling through every hardpoint type — FIRE_PRIMARY
+    // (Space/joystick button 1) always fires the ship's gun; this fires
+    // whatever ordnance MDFS_WEAPONS has cycled to (missile/torpedo).
+    FIRE_MISSILE = 70,
+    // Cycles which gun TYPE FIRE_PRIMARY fires — real WC3 behavior: a ship
+    // with N distinct gun types has N+1 states (each type individually,
+    // then a final "all guns" state that fires every gun hardpoint
+    // together), not a hardpoint-by-hardpoint cycle. See
+    // SCStrike.cpp's collectDistinctGunTypes/FIRE_PRIMARY handler.
+    CYCLE_GUNS = 71,
+    // Toggles a sticky hard-lock on the currently auto-targeted ship: keeps
+    // it selected even if the player looks away (auto-targeting normally
+    // re-evaluates every frame based on player orientation). See
+    // SCStrike::updateAutoTarget/SCCockpit::target_hard_locked.
+    LOCK_TARGET = 72,
+    // Rotates the left MFD through the 4 power-allocation gauges (E/W/S/D
+    // highlighted in turn) then the shield/hull page, back to the first
+    // gauge — not a plain open/close toggle. See
+    // SCCockpit::CyclePowerOrShield/RenderMFDSPower.
+    MDFS_POWER = 73,
+    // Cycles SCCockpit::WC3CockpitViewMode: SVGA cockpit -> VGA cockpit ->
+    // HUD only (no cockpit background/frame, gauges/MFDs only, from the
+    // cockpit file's own separate HUD instrument layout). See
+    // SCCockpit::CycleViewMode.
+    CYCLE_COCKPIT_VIEW = 74,
+    // Toggles the left MFD's shield status display (user-confirmed real
+    // page). See SCCockpit::show_shield/RenderMFDSShield.
+    MDFS_SHIELD = 75,
+    // Real WC3 "Track Camera" (F10, WRLD>CAMR>TRAK — user-confirmed 2026-07
+    // session). Was squatted on by the SPEC_KEY_1 mission-force-end debug
+    // cheat before this — see that binding's own relocation comment. See
+    // View::TRACK's own comment for the camera behavior.
+    VIEW_TRACK = 76,
 };
 
 class GameEngine{
@@ -117,6 +155,14 @@ protected:
     RSFontManager &FontManager = RSFontManager::getInstance();
     RSScreen *Screen = &RSScreen::getInstance();
     Point2D lastControllerPosition{0,0};
+    // Checked once per frame in run(), right after pumpEvents() and before
+    // dispatching to whatever activity is on top of the stack — so it fires
+    // regardless of which activity is currently focused (e.g. a global
+    // Alt+O options hotkey that works identically during a GAMEFLOW menu or
+    // active flight). Deliberately generic (no WC3-specific type here) so
+    // the engine layer stays game-agnostic; the callback itself pushes/pops
+    // whatever activity it wants via addActivity()/stopTopActivity().
+    std::function<void()> m_globalHotkeyCheck;
 
 public:
     static GameEngine& getInstance() {
@@ -151,6 +197,7 @@ public:
     Keyboard* getKeyboard() const { return m_keyboard; }
     void initKeyboard();
     virtual void pumpEvents(void);
+    void setGlobalHotkeyHandler(std::function<void()> handler) { m_globalHotkeyCheck = std::move(handler); }
 
 };
 

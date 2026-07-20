@@ -32,6 +32,13 @@ class Quaternion{
     void Normalize(void);
     void GetAngles(float& pitch, float& yaw, float& roll);
     void fromEulerAngles(float pitch, float roll);
+    // Builds a quaternion representing a rotation of angleRad (radians)
+    // around the given axis (expected normalized, e.g. (0,1,0) for yaw).
+    // Used to integrate a per-frame incremental rotation into a persistent
+    // orientation quaternion via Multiply(), instead of composing/
+    // re-extracting Euler angles every frame — the latter is what causes
+    // gimbal lock as pitch approaches +-90 (see SCJdynPlane::updatePosition).
+    void FromAxisAngle(float axisX, float axisY, float axisZ, float angleRad);
             
     private:
     

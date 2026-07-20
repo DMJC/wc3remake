@@ -7,6 +7,7 @@
 //
 
 #include "RSScreen.h"
+#include "GLBatch.h"
 #include "Config.hpp"
 #include "GLExtensions.h"
 #include "imgui.h"
@@ -102,6 +103,15 @@ void RSScreen::openScreen(void){
         drawableW = this->width;
         drawableH = this->height;
     }
+    // Keep width/height (and the SDL logical/point size) in sync with the
+    // real drawable — openScreen() also runs on every window resize
+    // (EventManager's SDL_WINDOWEVENT_RESIZED handler), and before this
+    // fix width/height were only ever set once in init(), so every
+    // full-screen viewport/mouse-mapping call site elsewhere kept using a
+    // stale pre-resize size.
+    this->width = drawableW;
+    this->height = drawableH;
+    SDL_GetWindowSize(m_window, &this->logical_width, &this->logical_height);
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -117,6 +127,10 @@ void RSScreen::openScreen(void){
         vpH = targetH;
         vpY = (drawableH - vpH) / 2;
     }
+    this->viewport_x = vpX;
+    this->viewport_y = vpY;
+    this->viewport_w = vpW;
+    this->viewport_h = vpH;
 
     glViewport(vpX, vpY, vpW, vpH);
 
@@ -124,6 +138,22 @@ void RSScreen::openScreen(void){
     glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
+}
+
+void RSScreen::windowToLogical(int mx, int my, int logicalW, int logicalH, int& outX, int& outY) const {
+    if (viewport_w <= 0 || viewport_h <= 0) { outX = mx; outY = my; return; }
+    int lx = mx - viewport_x;
+    int ly = my - viewport_y;
+    if (lx < 0) lx = 0; else if (lx >= viewport_w) lx = viewport_w - 1;
+    if (ly < 0) ly = 0; else if (ly >= viewport_h) ly = viewport_h - 1;
+    outX = lx * logicalW / viewport_w;
+    outY = ly * logicalH / viewport_h;
+}
+
+void RSScreen::logicalToWindow(int lx, int ly, int logicalW, int logicalH, int& outX, int& outY) const {
+    if (logicalW <= 0 || logicalH <= 0) { outX = lx; outY = ly; return; }
+    outX = viewport_x + lx * viewport_w / logicalW;
+    outY = viewport_y + ly * viewport_h / logicalH;
 }
 
 void RSScreen::initPostProcess() {
@@ -382,12 +412,12 @@ void RSScreen::refresh(void) {
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, m_postProcessTexture);
 
-        glBegin(GL_QUADS);
-            glTexCoord2f(u0, v0); glVertex2f(-1.0f, -1.0f);
-            glTexCoord2f(u1, v0); glVertex2f( 1.0f, -1.0f);
-            glTexCoord2f(u1, v1); glVertex2f( 1.0f,  1.0f);
-            glTexCoord2f(u0, v1); glVertex2f(-1.0f,  1.0f);
-        glEnd();
+        gb.begin(GL_QUADS);
+            gb.texCoord2f(u0, v0); gb.vertex2f(-1.0f, -1.0f);
+            gb.texCoord2f(u1, v0); gb.vertex2f( 1.0f, -1.0f);
+            gb.texCoord2f(u1, v1); gb.vertex2f( 1.0f,  1.0f);
+            gb.texCoord2f(u0, v1); gb.vertex2f(-1.0f,  1.0f);
+        gb.end();
 
         glDisable(GL_TEXTURE_2D);
         glUseProgram(0);
@@ -461,36 +491,36 @@ void RSScreen::fxTurnOnTv() {
         float horizontalWidth = animProgress / 0.1f * 2.0f; // 0 to 2.0
         float lineHeight = 0.01f;
         
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        glBegin(GL_QUADS);
-            glVertex2f(-horizontalWidth/2, -lineHeight/2);
-            glVertex2f(horizontalWidth/2, -lineHeight/2);
-            glVertex2f(horizontalWidth/2, lineHeight/2);
-            glVertex2f(-horizontalWidth/2, lineHeight/2);
-        glEnd();
+        gb.color4f(1.0f, 1.0f, 1.0f, 1.0f);
+        gb.begin(GL_QUADS);
+            gb.vertex2f(-horizontalWidth/2, -lineHeight/2);
+            gb.vertex2f(horizontalWidth/2, -lineHeight/2);
+            gb.vertex2f(horizontalWidth/2, lineHeight/2);
+            gb.vertex2f(-horizontalWidth/2, lineHeight/2);
+        gb.end();
     } else if (animProgress < 0.2f) {
         // Second phase: Vertical expansion after horizontal is complete
         float normalizedProgress = (animProgress - 0.1f) / 0.1f; // 0 to 1.0
         float verticalHeight = normalizedProgress * 2.0f;  // 0 to 2.0
         
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        glBegin(GL_QUADS);
-            glVertex2f(-1.0f, -verticalHeight/2);
-            glVertex2f(1.0f, -verticalHeight/2);
-            glVertex2f(1.0f, verticalHeight/2);
-            glVertex2f(-1.0f, verticalHeight/2);
-        glEnd();
+        gb.color4f(1.0f, 1.0f, 1.0f, 1.0f);
+        gb.begin(GL_QUADS);
+            gb.vertex2f(-1.0f, -verticalHeight/2);
+            gb.vertex2f(1.0f, -verticalHeight/2);
+            gb.vertex2f(1.0f, verticalHeight/2);
+            gb.vertex2f(-1.0f, verticalHeight/2);
+        gb.end();
     } else if (animProgress < 0.3f && animProgress >= 0.5f) {
         // Third phase: Full white screen fading out as noise fades in
         float fadeOutWhite = 1.0f - ((animProgress - 0.5f) / 0.2f);
         
-        glColor4f(1.0f, 1.0f, 1.0f, fadeOutWhite);
-        glBegin(GL_QUADS);
-            glVertex2f(-1.0f, -1.0f);
-            glVertex2f(1.0f, -1.0f);
-            glVertex2f(1.0f, 1.0f);
-            glVertex2f(-1.0f, 1.0f);
-        glEnd();
+        gb.color4f(1.0f, 1.0f, 1.0f, fadeOutWhite);
+        gb.begin(GL_QUADS);
+            gb.vertex2f(-1.0f, -1.0f);
+            gb.vertex2f(1.0f, -1.0f);
+            gb.vertex2f(1.0f, 1.0f);
+            gb.vertex2f(-1.0f, 1.0f);
+        gb.end();
     }
     
 
@@ -498,19 +528,19 @@ void RSScreen::fxTurnOnTv() {
     if (animProgress >= 0.3f && animProgress < 0.7f) {
         float noiseIntensity = 1.0f - (animProgress / 0.8f);
         
-        glColor4f(1.0f, 1.0f, 1.0f, noiseIntensity);
-        glBegin(GL_QUADS);
+        gb.color4f(1.0f, 1.0f, 1.0f, noiseIntensity);
+        gb.begin(GL_QUADS);
         for (int i = 0; i < 10000; i++) {
             float x = static_cast<float>(rand()) / (float) RAND_MAX * 2.0f - 1.0f;
             float y = static_cast<float>(rand()) / (float) RAND_MAX * 2.0f - 1.0f;
             float size = 0.003f + 0.002f * static_cast<float>(rand()) / (float) RAND_MAX;
             
-            glVertex2f(x - size, y - size);
-            glVertex2f(x + size, y - size);
-            glVertex2f(x + size, y + size);
-            glVertex2f(x - size, y + size);
+            gb.vertex2f(x - size, y - size);
+            gb.vertex2f(x + size, y - size);
+            gb.vertex2f(x + size, y + size);
+            gb.vertex2f(x - size, y + size);
         }
-        glEnd();
+        gb.end();
     }
 
     // Horizontal line sweeping from center
@@ -519,13 +549,13 @@ void RSScreen::fxTurnOnTv() {
         float lineHeight = 0.05f;
         float lineY = (lineProgress * 2.0f - 1.0f);
         
-        glColor4f(1.0f, 1.0f, 1.0f, 0.8f);
-        glBegin(GL_QUADS);
-        glVertex2f(-1.0f, lineY - lineHeight);
-        glVertex2f(1.0f, lineY - lineHeight);
-        glVertex2f(1.0f, lineY + lineHeight);
-        glVertex2f(-1.0f, lineY + lineHeight);
-        glEnd();
+        gb.color4f(1.0f, 1.0f, 1.0f, 0.8f);
+        gb.begin(GL_QUADS);
+        gb.vertex2f(-1.0f, lineY - lineHeight);
+        gb.vertex2f(1.0f, lineY - lineHeight);
+        gb.vertex2f(1.0f, lineY + lineHeight);
+        gb.vertex2f(-1.0f, lineY + lineHeight);
+        gb.end();
     }
 
     // Add scanlines and CRT effect
@@ -534,14 +564,14 @@ void RSScreen::fxTurnOnTv() {
         
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, scanlineTexture);
-        glColor4f(1.0f, 1.0f, 1.0f, scanlineAlpha);
+        gb.color4f(1.0f, 1.0f, 1.0f, scanlineAlpha);
         
-        glBegin(GL_QUADS);
-        glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, 1.0f);
-        glTexCoord2f(800.0f, 0.0f); glVertex2f(1.0f, 1.0f);
-        glTexCoord2f(800.0f, 600.0f); glVertex2f(1.0f, -1.0f);
-        glTexCoord2f(0.0f, 600.0f); glVertex2f(-1.0f, -1.0f);
-        glEnd();
+        gb.begin(GL_QUADS);
+        gb.texCoord2f(0.0f, 0.0f); gb.vertex2f(-1.0f, 1.0f);
+        gb.texCoord2f(800.0f, 0.0f); gb.vertex2f(1.0f, 1.0f);
+        gb.texCoord2f(800.0f, 600.0f); gb.vertex2f(1.0f, -1.0f);
+        gb.texCoord2f(0.0f, 600.0f); gb.vertex2f(-1.0f, -1.0f);
+        gb.end();
         
         glDisable(GL_TEXTURE_2D);
     }

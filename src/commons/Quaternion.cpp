@@ -129,6 +129,22 @@ void Quaternion::Conjugate(void) {
 float Quaternion::DotProduct(Quaternion *other) {
     return (this->w * other->w + this->x * other->x + this->y * other->y + this->z * other->z);
 }
+void Quaternion::FromAxisAngle(float axisX, float axisY, float axisZ, float angleRad) {
+    // Negated: ToMatrix()'s output for a standard (non-negated) axis-angle
+    // quaternion is the transpose of what Matrix::rotateM(angleRad, axis)
+    // produces for the same angle (verified directly on all 3 axes) —
+    // this codebase's Matrix uses the opposite rotation-direction
+    // convention. Negating here makes FromAxisAngle(...).ToMatrix() match
+    // rotateM(angleRad, axis) exactly, so callers composing rotations via
+    // quaternions (e.g. SCJdynPlane::updatePosition) stay in sync with
+    // every other rotateM-based consumer of the resulting matrix.
+    float halfAngle = -angleRad * 0.5f;
+    float s = std::sin(halfAngle);
+    this->w = std::cos(halfAngle);
+    this->x = axisX * s;
+    this->y = axisY * s;
+    this->z = axisZ * s;
+}
 void Quaternion::fromEulerAngles(float pitch, float roll) {
     float cy = std::cos(roll * 0.5f);
     float sy = std::sin(roll * 0.5f);

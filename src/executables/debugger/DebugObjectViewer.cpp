@@ -1,4 +1,5 @@
 #include "DebugObjectViewer.h"
+#include "../../engine/GLBatch.h"
 #include <imgui.h>
 #include <imgui_impl_opengl2.h>
 #include <imgui_impl_sdl2.h>
@@ -58,7 +59,7 @@ void DebugObjectViewer::runFrame()  {
         Renderer.drawModel(objs.showCases[currentObject].entity, lodLevel);
         glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
         glLineWidth(2.0f);
-        glColor3f(0.0f, 1.0f, 0.0f); // Vert pour les lignes
+        gb.color3f(0.0f, 1.0f, 0.0f); // Vert pour les lignes
         
         
         const Lod* lod = &objs.showCases[currentObject].entity->lods[lodLevel];
@@ -74,12 +75,12 @@ void DebugObjectViewer::runFrame()  {
                 triangle_id = entity->attrs[lod->triangleIDs[ti]]->id;
             }
             const Triangle& triangle = entity->triangles[triangle_id];
-            glBegin(GL_TRIANGLES);
+            gb.begin(GL_TRIANGLES);
             for (int i = 0; i < 3; i++) {
                 Vector3D vert = entity->vertices[triangle.ids[i]];
-                glVertex3f(vert.x, vert.y, vert.z);
+                gb.vertex3f(vert.x, vert.y, vert.z);
             }
-            glEnd();
+            gb.end();
         }
         for (int ti = 0; ti < lod->numTriangles; ti++) {
             int quad_id = 0;
@@ -97,19 +98,19 @@ void DebugObjectViewer::runFrame()  {
             }
             
             const Quads *triangle = entity->quads[quad_id];
-            glColor3f(1.0f, 0.0f, 1.0f);
+            gb.color3f(1.0f, 0.0f, 1.0f);
             bool twoSided = false;
             twoSided = prop2 == 1;
             if (twoSided) {
-                glColor3f(1.0f, 1.0f, 0.0f);
+                gb.color3f(1.0f, 1.0f, 0.0f);
                 glDisable(GL_CULL_FACE);
             }
-            glBegin(GL_QUADS);
+            gb.begin(GL_QUADS);
             for (int i = 0; i < 4; i++) {
                 Vector3D vert = entity->vertices[triangle->ids[i]];
-                glVertex3f(vert.x, vert.y, vert.z);
+                gb.vertex3f(vert.x, vert.y, vert.z);
             }
-            glEnd();
+            gb.end();
             if (twoSided) {
                 glEnable(GL_CULL_FACE);
             }
@@ -118,8 +119,8 @@ void DebugObjectViewer::runFrame()  {
         
         // Dessiner les vertices
         glPointSize(5.0f);
-        glColor3f(1.0f, 0.0f, 0.0f); // Rouge pour les vertices
-        glBegin(GL_POINTS);
+        gb.color3f(1.0f, 0.0f, 0.0f); // Rouge pour les vertices
+        gb.begin(GL_POINTS);
         for (int ti = 0; ti < lod->numTriangles; ti++) {
             int triangle_id = lod->triangleIDs[ti];
             if (entity->attrs.find(lod->triangleIDs[ti]) != entity->attrs.end() &&
@@ -131,10 +132,10 @@ void DebugObjectViewer::runFrame()  {
             const Triangle& triangle = entity->triangles[triangle_id];
             for (int i = 0; i < 3; i++) {
                 Vector3D vert = entity->vertices[triangle.ids[i]];
-                glVertex3f(vert.x, vert.y, vert.z);
+                gb.vertex3f(vert.x, vert.y, vert.z);
             }
         }
-        glEnd();
+        gb.end();
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         glLineWidth(1.0f);
         

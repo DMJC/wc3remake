@@ -22,7 +22,9 @@ extern "C" {
 #include <Windows.h>
 #endif
 #ifndef __APPLE__
+    #define GL_GLEXT_PROTOTYPES
     #include <GL/gl.h>
+    #include <GL/glext.h>
 #else
     #define GL_SILENCE_DEPRECATION
     #include <OpenGL/gl.h>
@@ -104,6 +106,32 @@ public:
     int32_t scale;
     bool is_spfx_finished{false};
     bool force_keyboard_capture{false};
+
+    // The current 4:3-letterboxed viewport rect within the real drawable
+    // area [0,width]x[0,height] — recomputed by openScreen() (called on
+    // init and on every window resize). The original game's assets are all
+    // authored for a 4:3 canvas (640x480 rooms, 320x200 movies); stretching
+    // them to fill an arbitrary (e.g. 16:9) window distorts every sprite,
+    // so every full-screen blit/viewport in the WC3 code paths should use
+    // this rect instead of (0,0,width,height) directly, and every mouse
+    // coordinate should go through windowToLogical() below rather than a
+    // naive "mx * logicalW / width" (which implicitly assumes the whole
+    // window is the logical canvas — wrong once there are letterbox bars).
+    int32_t viewport_x{0};
+    int32_t viewport_y{0};
+    int32_t viewport_w{0};
+    int32_t viewport_h{0};
+
+    // Maps a mouse position (in the same window-coordinate space as
+    // EventManager's mouse x/y) into a logicalW x logicalH virtual-screen
+    // coordinate, accounting for the letterbox — positions in the black
+    // bars clamp to the nearest in-bounds logical pixel rather than going
+    // negative or off the far edge.
+    void windowToLogical(int mx, int my, int logicalW, int logicalH, int& outX, int& outY) const;
+    // Inverse of windowToLogical() — used to warp the real mouse cursor to
+    // a specific logical-space point (e.g. cycleZoneFocus()'s Tab/right-
+    // click zone-centering).
+    void logicalToWindow(int lx, int ly, int logicalW, int logicalH, int& outX, int& outY) const;
 
 protected:
     SDL_Window* m_window{nullptr};

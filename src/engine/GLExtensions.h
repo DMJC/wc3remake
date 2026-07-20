@@ -47,7 +47,13 @@ extern PFNGLUNIFORM1FPROC          glUniform1f;
 
 bool initGLExtensions();
 
+#elif !defined(__APPLE__)
+// Linux: use GL extension headers for shader functions
+#define GL_GLEXT_PROTOTYPES
+#include <GL/gl.h>
+#include <GL/glext.h>
+inline bool initGLExtensions() { return true; }
 #else
-// macOS / Linux : les fonctions sont disponibles directement
+// macOS: functions available directly
 inline bool initGLExtensions() { return true; }
 #endif

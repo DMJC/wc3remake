@@ -26,9 +26,9 @@ uint8_t convertFrom6To8(uint8_t value) {
     uint8_t algo4 = (value * (255.0f / 63.0f));
     uint8_t algo5 = (value * (255/63.0f));
     uint8_t algo6 = (value * 254 / 63);
-
-    
-    return algo2;
+    uint8_t algo7 = (value * (254/63.0f));
+    return algo1; //Fixes the Ship
+//    return algo7; //Fixes the Flight Area but breaks others
 }
 void VGAPalette::Diff(VGAPalette* other){
     for (int i=0  ;i <256 ; i++){
@@ -173,8 +173,21 @@ void Texture::updateContent(RSImage* image){
         }
     }
     
-    // Appliquer l’anti-halo une seule fois si la texture a de l’alpha
-    if (hasAlpha && needAphaFix) {
+    // Anti-halo needed anywhere GL_LINEAR filtering can blend a fully-
+    // transparent colorkey pixel's own RGB (magenta, per this engine's
+    // convention — see VGAPalette::CopyFromOtherPalette's filter) against
+    // an opaque neighbor: that produces a visible magenta fringe at the
+    // edge even though alpha correctly fades to 0 there, since GL_LINEAR
+    // still interpolates the RGB channels too. Used to be gated on
+    // needAphaFix (image->flags==1), but that flag is only ever set as an
+    // incidental side effect of the LZ/PKWare-compressed texture-loading
+    // paths in RSEntity.cpp — small or otherwise-uncompressed textures
+    // (e.g. the galaxy skybox billboards, some cockpit elements) never set
+    // it and so always skipped this fix, leaving their edges fringed.
+    // hasAlpha alone (this texture has any transparent pixels at all) is
+    // the real precondition — apply it unconditionally whenever that's
+    // true instead of relying on a compression-format side channel.
+    if (hasAlpha) {
         AlphaBleedRGBA8(this->data, (int)this->width, (int)this->height, 8);
     }
 }

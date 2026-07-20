@@ -181,33 +181,54 @@ Vector3D SCPlane::PredictShot(int weapon_hard_point_id, SCMissionActors *target)
     return adjusted_direction;
 }
 
-void SCPlane::ShootWithPrediction(int weapon_hard_point_id, SCMissionActors *target, SCMission *mission) {
+bool SCPlane::ShootWithPrediction(int weapon_hard_point_id, SCMissionActors *target, SCMission *mission, float lockProgressSeconds) {
     // Prédire d'abord le tir
     Vector3D adjusted_direction = this->PredictShot(weapon_hard_point_id, target);
-    
+
     // Vérifier que l'arme est disponible
     if (this->weaps_load[weapon_hard_point_id]->nb_weap <= 0) {
         weapon_hard_point_id = (int) this->object->entity->hpts.size() - weapon_hard_point_id;
-        if (weapon_hard_point_id <= 0 || 
+        if (weapon_hard_point_id <= 0 ||
             weapon_hard_point_id >= this->weaps_load.size() ||
-            this->weaps_load[weapon_hard_point_id] == nullptr || 
+            this->weaps_load[weapon_hard_point_id] == nullptr ||
             this->weaps_load[weapon_hard_point_id]->nb_weap == 0) {
-            return;
+            return false;
         }
     }
-    
+
     // Si en cooldown, ne pas tirer
     if (this->wp_cooldown > 0) {
         this->wp_cooldown--;
-        return;
+        return false;
     }
     
+    // WC3 torpedo/T-bomb (weapon_category==3): same "refuse to fire below
+    // the weapon's own real lock_time_required_seconds" rule as the main
+    // Shoot() switch — AI callers pass the 999.0f sentinel default so
+    // this never actually blocks them (see Shoot()'s own comment on why
+    // AI doesn't need a real lock timer), but a player-fired predictive
+    // shot (not currently reachable — prediction is AI-only, gated in
+    // Shoot()) would still be gated correctly if that ever changes.
+    {
+        auto *checkWdat = this->weaps_load[weapon_hard_point_id]->objct->wdat;
+        if (checkWdat != nullptr && checkWdat->weapon_category == 3) {
+            if (lockProgressSeconds < checkWdat->lock_time_required_seconds) {
+                return false;
+            }
+        }
+    }
+
     // Créer l'objet réel en utilisant les paramètres ajustés
     SCSimulatedObject *weap = nullptr;
     MemSound *sound = nullptr;
-    
+
     switch (this->weaps_load[weapon_hard_point_id]->objct->wdat->weapon_id) {
         case weapon_ids::ID_20MM:
+        case weapon_ids::ID_NEUTGUN:
+        case weapon_ids::ID_IONGUN:
+        case weapon_ids::ID_RLASER_WC3:
+        case weapon_ids::ID_REAPGUN:
+        case weapon_ids::ID_TACHGUN:
             weap = new GunSimulatedObject();
             this->wp_cooldown = 30;
             break;
@@ -241,6 +262,11 @@ void SCPlane::ShootWithPrediction(int weapon_hard_point_id, SCMissionActors *tar
     float thrustMagnitude = planeSpeed;
     switch (this->weaps_load[weapon_hard_point_id]->objct->wdat->weapon_id) {
         case weapon_ids::ID_20MM: // Gun
+        case weapon_ids::ID_NEUTGUN:
+        case weapon_ids::ID_IONGUN:
+        case weapon_ids::ID_RLASER_WC3:
+        case weapon_ids::ID_REAPGUN:
+        case weapon_ids::ID_TACHGUN:
             thrustMagnitude = planeSpeed * 250.0f * (this->tps / 60.0f);
             break;
         case weapon_ids::ID_MK20:
@@ -278,9 +304,10 @@ void SCPlane::ShootWithPrediction(int weapon_hard_point_id, SCMissionActors *tar
     
     // Décrémenter le nombre d'armes disponibles
     this->weaps_load[weapon_hard_point_id]->nb_weap--;
-    
+
     // Ajouter à la liste des objets simulés
     this->weaps_object.push_back(weap);
+    return true;
 }
 
 void SCPlane::RenderWeaponTrajectories() {
@@ -978,8 +1005,8 @@ void SCPlane::computeGravity() {
     this->gravity_force = this->gravity * this->W;
 }
 void SCPlane::computeThrust() {
-    this->thrust_force = .01f / this->tps / this->tps * this->thrust * this->Mthrust;
-    
+    this->thrust_force = .01f / this->tps / this->tps * this->thrust * this->Mthrust * this->engine_power_fraction;
+
 }
 void SCPlane::updateAcceleration() {
     
@@ -1030,7 +1057,16 @@ int SCPlane::IN_BOX(int llx, int urx, int llz, int urz) {
  * @return 1 if the plane is on a runway, 0 otherwise.
  */
 int SCPlane::isOnRunWay() {
-
+    // area is legitimately null for space missions (no runway/ground —
+    // see SCJdynPlane::Simulate's groundlevel comment). Normally the "on
+    // ground" branch that calls this never triggers there (groundlevel
+    // defaults to a huge negative sentinel), but afterburner's much larger
+    // vz feeds into lift/drag formulas that were never recalibrated for
+    // that range, which can send y to an extreme value and trip it anyway
+    // — confirmed by a live crash (SIGSEGV dereferencing null area here).
+    if (area == nullptr) {
+        return 0;
+    }
     for (int i = 0; i < area->objectOverlay.size(); i++) {
 
         if (IN_BOX(area->objectOverlay[i].lx, area->objectOverlay[i].hx, -area->objectOverlay[i].ly,
@@ -1167,7 +1203,7 @@ void SCPlane::Render() {
                 position.y -= 0.5f;
             }
         }
-        Renderer.drawModelWithChilds(this->object->entity, Renderer.lodLevel, pos, orientation, wheel_index, thrust, weapons);
+        Renderer.drawModelWithChilds(this->object->entity, Renderer.lodLevel, pos, orientation, wheel_index, thrust, weapons, this->afterburner_engaged);
     }
 }
 void SCPlane::RenderSmoke() {
@@ -1221,33 +1257,108 @@ void SCPlane::RenderSimulatedObject() {
 Vector3D SCPlane::getWeaponIntialVector(float speedFactor) {
     Vector3D initial_trust = {0,0,0};
     Vector3D planeVelocity       = {
-        (this->x - this->last_px) * this->tps, 
+        (this->x - this->last_px) * this->tps,
         (this->y - this->last_py) * this->tps,
         (this->z - this->last_pz) * this->tps
     };
     return planeVelocity + this->forward * speedFactor;
 
 }
-void SCPlane::Shoot(int weapon_hard_point_id, SCMissionActors *target, SCMission *mission) {
+// Lazily initializes (first call) and regenerates this->gun_energy_current
+// against wall-clock time, returning the up-to-date value -- shared by
+// Shoot()'s own energy-gun case and SCStrike's FIRE_PRIMARY handler (which
+// needs a current reading *before* calling Shoot() to decide whether to fire
+// every matching hardpoint together or alternate one at a time when energy's
+// too low for a full salvo). Kept as the single source of truth for this
+// calc rather than duplicating it at both call sites.
+float SCPlane::GetCurrentGunEnergy() {
+    RSEntity *shipEntity = this->object->entity;
+    uint32_t nowTicks = SDL_GetTicks();
+    if (this->gun_energy_current < 0.0f) {
+        this->gun_energy_current = (float)shipEntity->gun_energy_capacity;
+        this->gun_energy_last_update_ticks = nowTicks;
+    }
+    float elapsedSec = (float)(nowTicks - this->gun_energy_last_update_ticks) / 1000.0f;
+    // /5.0f: RSEntity::gun_energy_recharge_rate's own comment -- confirmed
+    // against live gameplay (HELLCAT/HELLCATP's raw values only match the
+    // observed ~10-11s empty-to-full recharge time once divided by 5).
+    float regenerated = this->gun_energy_current
+        + (float)shipEntity->gun_energy_recharge_rate / 5.0f * this->gun_power_fraction * elapsedSec;
+    float capacity = (float)shipEntity->gun_energy_capacity;
+    this->gun_energy_current = (regenerated < capacity) ? regenerated : capacity;
+    this->gun_energy_last_update_ticks = nowTicks;
+    return this->gun_energy_current;
+}
+bool SCPlane::IsWC3EnergyGunWeaponId(int weaponId) {
+    return weaponId == ID_NEUTGUN || weaponId == ID_IONGUN || weaponId == ID_RLASER_WC3 ||
+        weaponId == ID_REAPGUN || weaponId == ID_TACHGUN;
+}
+// Same as the single-argument overload above, but fires along a direction
+// pitched pitchOffsetDegrees up from this->forward (toward the ship's own
+// up vector) instead of straight down the boresight -- used to converge gun
+// hardpoint fire closer to the HUD crosshair. Computes "up" the same way
+// setCameraFollow/setCameraBelow do, but from yaw/pitch/roll (not twist) to
+// stay in the same basis this->forward itself was derived from
+// (SCPlane::updatePosition's ptw, built from yaw/pitch/roll).
+Vector3D SCPlane::getWeaponIntialVector(float speedFactor, float pitchOffsetDegrees) {
+    Vector3D planeVelocity = {
+        (this->x - this->last_px) * this->tps,
+        (this->y - this->last_py) * this->tps,
+        (this->z - this->last_pz) * this->tps
+    };
+    float r_azim = tenthOfDegreeToRad(this->yaw);
+    float r_elev = tenthOfDegreeToRad(this->pitch);
+    float r_roll = tenthOfDegreeToRad(this->roll);
+    float cosR = cosf(r_roll), sinR = sinf(r_roll);
+    float cosE = cosf(r_elev), sinE = sinf(r_elev);
+    float cosA = cosf(r_azim), sinA = sinf(r_azim);
+    Vector3D up = {
+        -cosA * sinR + sinA * sinE * cosR,
+        cosE * cosR,
+        sinA * sinR + cosA * sinE * cosR
+    };
+    float theta = pitchOffsetDegrees * ((float)M_PI / 180.0f);
+    Vector3D adjustedForward = this->forward * cosf(theta) + up * sinf(theta);
+    return planeVelocity + adjustedForward * speedFactor;
+}
+bool SCPlane::Shoot(int weapon_hard_point_id, SCMissionActors *target, SCMission *mission, float lockProgressSeconds, float spawnAdvanceDistance) {
+    if (weapon_hard_point_id < 0 || (size_t)weapon_hard_point_id >= this->weaps_load.size()) {
+        return false;
+    }
     SCWeaponLoadoutHardPoint *weap_loadout{nullptr};
     weap_loadout = this->weaps_load[weapon_hard_point_id];
     if (weap_loadout == nullptr) {
-        return;
+        return false;
+    }
+    // WC3 torpedo/T-bomb (weapon_category==3): refuse to fire at all below
+    // the weapon's own required lock time — per user direction. Read
+    // directly off wdat->lock_time_required_seconds, real data parsed off
+    // the weapon's own OBJT>MISL>DATA chunk (parseREAL_OBJT_MISL_DATA) —
+    // confirmed exact against two real missile data points (see that
+    // function's own comment); torpedo/T-bomb specifically use the same
+    // parser/field (both are OBJT>MISL format too) but haven't had their
+    // own decoded values externally cross-checked yet. AI callers pass
+    // the 999.0f lockProgressSeconds default (they gate firing via their
+    // own fire-arc/range checks instead — see SCMissionActors.cpp), so
+    // this only ever actually blocks the player.
+    if (weap_loadout->objct->wdat != nullptr && weap_loadout->objct->wdat->weapon_category == 3) {
+        if (lockProgressSeconds < weap_loadout->objct->wdat->lock_time_required_seconds) {
+            return false;
+        }
     }
     if (this->pilot != nullptr && this->pilot->actor_name != "PLAYER") {
         int precision = std::rand() % 16;
         if (precision <= this->pilot->profile->ai.atrb.AA || weap_loadout->objct->wdat->weapon_id == ID_MK20 || weap_loadout->objct->wdat->weapon_id == ID_MK82) {
-            this->ShootWithPrediction(weapon_hard_point_id, target, mission);
-            return;
+            return this->ShootWithPrediction(weapon_hard_point_id, target, mission, lockProgressSeconds);
         }
     }
     SCSimulatedObject *weap{nullptr};
     Vector3D initial_trust = {0,0,0};
-    
+
     MemSound *sound;
     if (this->wp_cooldown > 0) {
         this->wp_cooldown--;
-        return;
+        return false;
     }
     RSEntity *wobj = nullptr;
     wobj = this->weaps_load[weapon_hard_point_id]->objct;
@@ -1256,6 +1367,102 @@ void SCPlane::Shoot(int weapon_hard_point_id, SCMissionActors *target, SCMission
             weap = new GunSimulatedObject();
             initial_trust = this->getWeaponIntialVector(1000.0f); // coefficient ajustable
             this->wp_cooldown = 3; // Cooldown between two shots
+        break;
+        case ID_NEUTGUN:
+        case ID_IONGUN:
+        case ID_RLASER_WC3:
+        case ID_REAPGUN:
+        case ID_TACHGUN: {
+            // Energy-capacitor gated (RSEntity::gun_energy_capacity/
+            // _recharge_rate on the SHIP's own entity, not the weapon's
+            // synthetic one) instead of ammo-count limited — see
+            // gun_energy_current's own comment (SCPlane.h) for the lazy
+            // on-demand regen model.
+            this->GetCurrentGunEnergy();
+            // Real per-shot energy cost, parsed off the weapon's own
+            // OBJT>GUNS>DATA chunk (RSEntity::parseREAL_OBJT_GUNS_DATA) —
+            // confirmed exact against real Tachyon Gun stats. Falls back
+            // to a small nonzero placeholder only if wdat is somehow
+            // still a default-constructed WDAT (e.g. asset failed to
+            // resolve — see getWC3RealWeaponEntity's own printf for that
+            // case).
+            float energyCost = (wobj->wdat->energy_cost > 0) ? (float)wobj->wdat->energy_cost : 5.0f;
+            if (this->gun_energy_current < energyCost) {
+                return false;
+            }
+            this->gun_energy_current -= energyCost;
+            weap = new GunSimulatedObject();
+            // +5 degrees pitched up from the ship's own boresight, to
+            // converge gun fire closer to the HUD crosshair -- per user
+            // direction, not a value derived from any game data.
+            initial_trust = this->getWeaponIntialVector(1000.0f, 5.0f);
+            // Real refire delay (seconds) converted to ticks at the plane's
+            // own current tick rate, parsed off OBJT>GUNS>DATA — confirmed
+            // exact against real Tachyon Gun stats (89/256s ~= 0.35s).
+            // Falls back to the old flat 3-tick placeholder if unset.
+            this->wp_cooldown = (wobj->wdat->refire_delay_seconds > 0.0f)
+                ? (int)(wobj->wdat->refire_delay_seconds * (float)this->tps)
+                : 3;
+        break;
+        }
+        case ID_HSMISS:
+        case ID_IRMISS:
+        case ID_FFMISS:
+            // Missiles fired without a lock go straight ahead (dumbfire) —
+            // per user direction. Mirrors ID_LAU3's own unguided branch
+            // exactly (guidance=false, no target, orientation from the
+            // plane's own current heading below) rather than reimplementing
+            // it. Locked missiles get the existing guided pursuit-steer
+            // behavior, identical to SC1's own missiles (the `default`
+            // case below).
+            //
+            // Required lock time is per-weapon, read directly off wdat->
+            // lock_time_required_seconds (real, parsed off the weapon's own
+            // OBJT>MISL>DATA — see parseREAL_OBJT_MISL_DATA's own comment),
+            // not a single shared constant — confirmed real data shows this
+            // genuinely varies per missile: Friend-or-Foe requires 0s (locks
+            // instantly, effectively always guided whenever a target is
+            // passed in at all), Image-Recognition requires a real 1s hold.
+            weap = new SCSimulatedObject();
+            initial_trust = this->getWeaponIntialVector(1.0f);
+            initial_trust.Scale(1.0f/(float)tps);
+            // target != nullptr guard: FFMISS's 0s lock_time_required_seconds
+            // means lockProgressSeconds(0) >= required(0) is true even with
+            // nothing targeted (SCStrike's FIRE_MISSILE handler now allows
+            // firing these three IDs with target==nullptr for dumbfire) —
+            // without this, guidance would end up true with a null target,
+            // which SCSimulatedObject::Simulate()'s pursuit-steer code
+            // dereferences.
+            if (target != nullptr && lockProgressSeconds >= wobj->wdat->lock_time_required_seconds) {
+                weap->guidance = true;
+                weap->target = target;
+            } else {
+                weap->guidance = false;
+            }
+            this->wp_cooldown = 10;
+        break;
+        case ID_MINEMISS:
+            // Drop and stay put — no initial_trust (stays {0,0,0}), and
+            // SCSimulatedObject::ComputeTrajectory holds it stationary
+            // every tick from here on (see WDAT::is_guided_flight). No
+            // target: the existing dumbfire proximity-scan-every-actor
+            // path in Simulate() is what actually detonates it once an
+            // enemy strays close.
+            weap = new SCSimulatedObject();
+            weap->guidance = false;
+            this->wp_cooldown = 10;
+        break;
+        case ID_TORKMISS:
+        case ID_TEMBMISS:
+            // Reaching here means the lock_time_required gate at the top
+            // of this function already passed — always guided, same as a
+            // locked missile.
+            weap = new SCSimulatedObject();
+            initial_trust = this->getWeaponIntialVector(1.0f);
+            initial_trust.Scale(1.0f/(float)tps);
+            weap->guidance = true;
+            weap->target = target;
+            this->wp_cooldown = 10;
         break;
         case ID_MK20:
         case ID_MK82:
@@ -1312,19 +1519,26 @@ void SCPlane::Shoot(int weapon_hard_point_id, SCMissionActors *target, SCMission
     if (this->weaps_load[weapon_hard_point_id]->nb_weap <= 0) {
         weapon_hard_point_id = (int) this->object->entity->hpts.size()-weapon_hard_point_id;
         if (weapon_hard_point_id<=0) {
-            return;
+            return false;
         }
         if (weapon_hard_point_id > this->weaps_load.size()-1) {
-            return;
+            return false;
         }
         if (this->weaps_load[weapon_hard_point_id] == nullptr) {
-            return;
+            return false;
         }
         if (this->weaps_load[weapon_hard_point_id]->nb_weap == 0) {
-            return;
+            return false;
         }
     }
-    if (!this->infinite_ammo) {
+    // WC3 energy guns (NEUTGUN/ION_GUN/RLASER/REAPGUN/TACHGUN) set nb_weap=1
+    // as a plain "hardpoint occupied" sentinel, not a real ammo count -- see
+    // RSEntity::parseREAL_OBJT_SSHP_WEAP_FGTR_GUNS's own comment. They're
+    // gated purely by gun_energy_current/energy_cost above, so decrementing
+    // nb_weap here would hit 0 after the very first shot and make every
+    // subsequent Shoot() call on that hardpoint fail the nb_weap<=0 check
+    // near the top of this function as if ammo had run out.
+    if (!this->infinite_ammo && !IsWC3EnergyGunWeaponId(wobj->wdat->weapon_id)) {
         if (this->weaps_load[weapon_hard_point_id]->objct->weaps.size() > 0) {
             this->weaps_load[weapon_hard_point_id]->objct->weaps[0]->nb_weap--;
             if (this->weaps_load[weapon_hard_point_id]->objct->weaps[0]->nb_weap <= 0) {
@@ -1336,18 +1550,47 @@ void SCPlane::Shoot(int weapon_hard_point_id, SCMissionActors *target, SCMission
     }
     weap->obj = wobj;
 
-    weap->x = this->x;
-    weap->y = this->y;
-    weap->z = this->z;
+    // Spawn from the fired hardpoint's actual mount position (ship-local
+    // offset, parsed off SSHP>WEAP>FGTR>GUNS -- see RSEntity::parseREAL_
+    // OBJT_SSHP_WEAP_FGTR_GUNS / SCPlane::InitLoadout()) instead of the
+    // ship's center, by rotating it into world space with a fresh
+    // yaw/pitch/roll rotation. Deliberately not this->ptw: that member still
+    // carries this frame's extra velocity-translate/turn-rate sub-step by
+    // the time Shoot() runs (see SCPlane::updatePosition()), so reusing it
+    // here would apply that per-frame delta twice.
+    Matrix hardpointRotation;
+    hardpointRotation.Clear();
+    hardpointRotation.Identity();
+    hardpointRotation.rotateM(tenthOfDegreeToRad(this->yaw), 0, 1, 0);
+    hardpointRotation.rotateM(tenthOfDegreeToRad(this->pitch), 1, 0, 0);
+    hardpointRotation.rotateM(tenthOfDegreeToRad(this->roll), 0, 0, 1);
+    Vector3DHomogeneous hardpointLocal;
+    hardpointLocal.x = weap_loadout->position.x;
+    hardpointLocal.y = weap_loadout->position.y;
+    hardpointLocal.z = weap_loadout->position.z;
+    hardpointLocal.w = 0.0f;
+    Vector3DHomogeneous hardpointWorld = hardpointRotation.multiplyMatrixVector(hardpointLocal);
+
+    weap->x = this->x + hardpointWorld.x;
+    weap->y = this->y + hardpointWorld.y;
+    weap->z = this->z + hardpointWorld.z;
     weap->azimuthf = this->yaw;
     weap->elevationf = this->pitch;
     weap->vx = initial_trust.x;
     weap->vy = initial_trust.y;
     weap->vz = initial_trust.z;
+    if (spawnAdvanceDistance != 0.0f) {
+        Vector3D velocityDir = {weap->vx, weap->vy, weap->vz};
+        velocityDir.Normalize();
+        weap->x += velocityDir.x * spawnAdvanceDistance;
+        weap->y += velocityDir.y * spawnAdvanceDistance;
+        weap->z += velocityDir.z * spawnAdvanceDistance;
+    }
 
     weap->weight = wobj->weight_in_kg*2.205f;
-    
+
     this->weaps_object.push_back(weap);
+    return true;
 }
 void SCPlane::InitLoadout() {
     // this->object->entity->weaps
@@ -1356,6 +1599,47 @@ void SCPlane::InitLoadout() {
     for (int i=0; i < this->weaps_load.size(); i++) {
         this->weaps_load[i] = nullptr;
     }
+    // WC3 (SSHP) ships: each hardpoint has exactly one fixed weapon baked
+    // into the file, already parsed 1:1 by index into this->weaps
+    // (RSEntity::parseREAL_OBJT_SSHP_WEAP_FGTR_GUNS/MISL — this->weaps[i]
+    // is always the weapon mounted at this->hpts[i]). This is a
+    // fundamentally different shape than SC1's JETP loadout (a weapon
+    // *type*+count list matched against hardpoint *slots* separately by
+    // the weap_map/max_load_out tables below, since JETP loadouts are
+    // swappable and WC3's aren't) — the matching/symmetric-splitting
+    // algorithm below doesn't apply and would mis-assign weapons if run
+    // against WC3 data. Detected via weaps.size()==hpts.size(): JETP's
+    // own weaps list is sized to the ship's weapon *type* count, which is
+    // essentially never equal to its hardpoint *slot* count.
+    auto &entityWeaps = this->object->entity->weaps;
+    auto &entityHpts = this->object->entity->hpts;
+    if (!entityWeaps.empty() && entityWeaps.size() == entityHpts.size()) {
+        this->is_wc3_ship = true;
+        int armedCount = 0;
+        for (size_t i = 0; i < entityHpts.size(); i++) {
+            if (entityWeaps[i]->objct == nullptr) {
+                continue;
+            }
+            SCWeaponLoadoutHardPoint *weap = new SCWeaponLoadoutHardPoint();
+            weap->objct = entityWeaps[i]->objct;
+            weap->nb_weap = entityWeaps[i]->nb_weap;
+            weap->hpts_type = entityHpts[i]->id;
+            weap->name = entityWeaps[i]->name;
+            weap->position = {
+                (float) entityHpts[i]->x,
+                (float) entityHpts[i]->y,
+                (float) entityHpts[i]->z
+            };
+            weap->hud_pos = {0, 0};
+            this->weaps_load[i] = weap;
+            armedCount++;
+        }
+        printf("SCPlane::InitLoadout: WC3 branch, %d/%zu hardpoints armed (unarmed ones failed weapon-id resolution -- see RSEntity's own printf)\n",
+               armedCount, entityHpts.size());
+        return;
+    }
+    printf("SCPlane::InitLoadout: SC1 (JETP) branch -- entity->weaps.size()=%zu, entity->hpts.size()=%zu\n",
+           entityWeaps.size(), entityHpts.size());
     std::unordered_map<int, std::vector<int>> weap_map = {
         {ID_20MM, {0}},
         {ID_AIM9J, {4, 1, 2}},

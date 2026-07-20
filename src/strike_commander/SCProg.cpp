@@ -155,7 +155,9 @@ void SCProg::execute() {
                         if (actor->actor_id == prog.arg) {
                             actor->object->alive = false;
                             actor->is_destroyed = false;
-                            if (actor->object->entity->explos != nullptr && actor->object->entity->explos->objct != nullptr) {
+                            if (!actor->has_exploded && actor->object->entity->explos != nullptr &&
+                                actor->object->entity->explos->objct != nullptr) {
+                                actor->has_exploded = true;
                                 actor->mission->explosions.push_back(new SCExplosion(actor->object->entity->explos->objct, actor->object->position));
                             }
                             break;
@@ -232,9 +234,17 @@ void SCProg::execute() {
                 break;
                 case OP_EXEC_SUB_PROG:
                 {
-                    if (prog.arg < this->mission->mission->mission_data.prog.size()) {
+                    // No cycle detection on sub-program indices — a self- or
+                    // mutually-referential OP_EXEC_SUB_PROG chain recurses
+                    // forever and stack-overflows. Cap nesting depth as a
+                    // last-resort guard against malformed/cyclic program data.
+                    constexpr int kMaxSubProgDepth = 64;
+                    if (this->depth >= kMaxSubProgDepth) {
+                        printf("SCProg: sub-program nesting exceeded %d (prog_id=%u -> arg=%u), likely a cyclic reference — aborting this call\n",
+                               kMaxSubProgDepth, (unsigned)this->prog_id, (unsigned)prog.arg);
+                    } else if (prog.arg < this->mission->mission->mission_data.prog.size()) {
                         std::vector<PROG> *sub_prog = this->mission->mission->mission_data.prog[prog.arg];
-                        SCProg *sub_prog_obj = new SCProg(this->actor, *sub_prog, this->mission, prog.arg);
+                        SCProg *sub_prog_obj = new SCProg(this->actor, *sub_prog, this->mission, prog.arg, this->depth + 1);
                         sub_prog_obj->execute();
                         delete sub_prog_obj;
                     } else {
@@ -302,10 +312,18 @@ void SCProg::execute() {
                         exec = false;
                     }
                 break;
+                case OP_SELECT_NEXT_MISSION:
+                    this->mission->next_mission_message_index = prog.arg;
+                break;
+                case OP_SELECT_NEXT_MISSION_END:
+                    // Always observed right after OP_SELECT_NEXT_MISSION with
+                    // arg 0 — see that opcode's own comment. No confirmed
+                    // effect; no-op for now.
+                break;
                 case OP_SELECT_FLAG_208:
-                    
+
                     // This opcode is a no-op in the original game, possibly reserved for future use.
-                    
+
                 break;
                 case OP_DIST_TO_TARGET:
                     work_register = this->actor->getDistanceToTarget(prog.arg);

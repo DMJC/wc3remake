@@ -1,4 +1,5 @@
 #include "VRScreen.h"
+#include "../../engine/GLBatch.h"
 #include "../../engine/gametimer.h"
 #include "vrtimer.h"
 #include <cmath>
@@ -97,14 +98,14 @@ static void drawMirrorTextureToWindow(GLuint tex, int winW, int winH)
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
 
-    glColor4f(1, 1, 1, 1);
-    glBegin(GL_QUADS);
+    gb.color4f(1, 1, 1, 1);
+    gb.begin(GL_QUADS);
         // Si ton mirror est inversé verticalement, swap les v (0<->1)
-        glTexCoord2f(0.0f, 0.0f); glVertex2f(0.0f, 0.0f);
-        glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, 0.0f);
-        glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, 1.0f);
-        glTexCoord2f(0.0f, 1.0f); glVertex2f(0.0f, 1.0f);
-    glEnd();
+        gb.texCoord2f(0.0f, 0.0f); gb.vertex2f(0.0f, 0.0f);
+        gb.texCoord2f(1.0f, 0.0f); gb.vertex2f(1.0f, 0.0f);
+        gb.texCoord2f(1.0f, 1.0f); gb.vertex2f(1.0f, 1.0f);
+        gb.texCoord2f(0.0f, 1.0f); gb.vertex2f(0.0f, 1.0f);
+    gb.end();
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glDisable(GL_TEXTURE_2D);

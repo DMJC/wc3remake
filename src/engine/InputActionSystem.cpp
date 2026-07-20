@@ -82,7 +82,7 @@ void InputActionSystem::bindInput(const InputAction actionId, const InputBinding
     if (m_actions.find(actionId) == m_actions.end()) {
         registerAction(actionId);
     }
-    
+
     // Ajouter la liaison
     m_actions[actionId].bindings.push_back(binding);
 }

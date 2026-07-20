@@ -214,6 +214,11 @@ void FrameBuffer::printText_SM(RSFont *font, Point2D *coo, char *text, uint8_t c
 
     if (text == NULL)
         return;
+    // WC3 cockpits don't ship SC's HUD.IFF-adjacent SHUDFONT.SHP/HUDFONT.SHP
+    // fonts, so SCCockpit's font/big_font are null for WC3 missions until a
+    // WC3-specific cockpit font is wired up; skip drawing rather than crash.
+    if (font == NULL)
+        return;
 
     if (size <= 0)
         return;

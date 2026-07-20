@@ -7,15 +7,25 @@
 //
 
 #include "precomp.h"
+#include "../engine/GLBatch.h"
+#include "../engine/gametimer.h"
 #include <cctype>
 #include <tuple>
 #include <optional>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include "SCStrike.h"
 #include "../realspace/block_def.h"
 #define SC_WORLD 1100
 #define RENDER_DISTANCE 40000.0f
+// Half-length of VICTEST3.IFF (the TCS Victory's hangar-bay interior model,
+// RSEntity::flight_deck_entity) along its long axis, per its exported OBJ
+// vertex bounding box (Y spans roughly -1375..1348 in the ship's own local
+// frame — see the flight_deck_entity render-mode comment in the actor loop
+// below). Used as a simple "is the player still near/inside the bay"
+// proximity radius.
+#define HANGAR_INTERIOR_RADIUS 1500.0f
 #define AUTOPILOTE_TIMEOUT 1000
 #define AUTOPILOTE_SPEED 4
 
@@ -73,14 +83,14 @@ static void drawTargetSquareOverlay(int32_t viewportW,
 
     glDisable(GL_DEPTH_TEST);
 
-    glColor3f(0.0f, 1.0f, 0.0f);
+    gb.color3f(0.0f, 1.0f, 0.0f);
     const float s = 8.0f;
-    glBegin(GL_LINE_LOOP);
-    glVertex2f((float)px - s, (float)py - s);
-    glVertex2f((float)px + s, (float)py - s);
-    glVertex2f((float)px + s, (float)py + s);
-    glVertex2f((float)px - s, (float)py + s);
-    glEnd();
+    gb.begin(GL_LINE_LOOP);
+    gb.vertex2f((float)px - s, (float)py - s);
+    gb.vertex2f((float)px + s, (float)py - s);
+    gb.vertex2f((float)px + s, (float)py + s);
+    gb.vertex2f((float)px - s, (float)py + s);
+    gb.end();
 
     glEnable(GL_DEPTH_TEST);
     
@@ -115,7 +125,14 @@ void SCStrike::renderVirtualCockpit() {
     }
 }
 void SCStrike::renderVirtualF16Cockpit() {
-    if (this->cockpit->cockpit == nullptr) {
+    // this->cockpit->cockpit->REAL.OBJS (the SC1-style 3D virtual-cockpit
+    // model) is legitimately null for every WC3 cockpit — WC3's own parse
+    // path (InitFromWC3Ram/parseWC3_COCK) never populates it, since WC3
+    // renders its cockpit via the 2D VDU/instrument sprite system instead.
+    // Was previously dereferenced unconditionally below (crash: RealObjs::
+    // OBJS had no default initializer either, so this read garbage instead
+    // of a clean null — see that field's own comment).
+    if (this->cockpit->cockpit == nullptr || this->cockpit->cockpit->REAL.OBJS == nullptr) {
         return;
     }
     static std::vector<Texture *> s_PrevFrameGLTex;
@@ -388,9 +405,42 @@ void SCStrike::renderVirtualF16Cockpit() {
             speed_texture
         );
 
-        speed_image->data = nullptr;        
+        speed_image->data = nullptr;
         delete speed_image;
         s_CurrentFrameGLTex.push_back(speed_texture);
+        if (this->cockpit->shield_framebuffer != nullptr) {
+            cockpit->shield_framebuffer->fillWithColor(0);
+            cockpit->RenderShieldGauge({0,0}, cockpit->shield_framebuffer);
+            Texture *shield_texture = new Texture();
+            shield_texture->animated = true;
+            RSImage *shield_image = new RSImage();
+            shield_image->palette = &this->cockpit->palette;
+            shield_image->data = this->cockpit->shield_framebuffer->framebuffer;
+            shield_image->width = this->cockpit->shield_framebuffer->width;
+            shield_image->height = this->cockpit->shield_framebuffer->height;
+            shield_texture->set(shield_image);
+            shield_texture->updateContent(shield_image);
+            // Placed just below the altimeter/speed cluster — a first-guess
+            // position, not derived from any parsed layout metadata (WC3's
+            // shape-pak carries no per-id screen coordinates, see
+            // RSCockpit::instrumentShapes), same as how alti/speed/RAWS's
+            // own quad corners above were arrived at. Needs live-visual
+            // tuning once in-game.
+            Renderer.drawTexturedQuad(
+                cockpit_pos,
+                cockpit_rot,
+                {
+                    {6.1f, -3.15f, 1.10f},
+                    {6.1f, -3.15f, 1.60f},
+                    {5.7f, -3.92f, 1.60f},
+                    {5.7f, -3.92f, 1.10f}
+                },
+                shield_texture
+            );
+            shield_image->data = nullptr;
+            delete shield_image;
+            s_CurrentFrameGLTex.push_back(shield_texture);
+        }
         cockpit->comm_framebuffer->fillWithColor(0);
 
         if (cockpit->RenderCommMessages({0,13}, cockpit->comm_framebuffer)) {
@@ -457,7 +507,9 @@ void SCStrike::renderVirtualF16Cockpit() {
     glPopMatrix();
 }
 void SCStrike::renderVirtualF22Cockpit() {
-    if (this->cockpit->cockpit == nullptr) {
+    // See renderVirtualF16Cockpit's own comment — same null REAL.OBJS
+    // crash risk, same fix.
+    if (this->cockpit->cockpit == nullptr || this->cockpit->cockpit->REAL.OBJS == nullptr) {
         return;
     }
     static std::vector<Texture *> s_PrevFrameGLTex;
@@ -764,10 +816,161 @@ SCStrike::SCStrike() {
 SCStrike::~SCStrike() {
     Game->direct_mouse_control = false;
 }
+
+namespace {
+// Afterburner sound source, user-identified: 48_8bit_11025.wav (8-bit PCM
+// mono, 11025Hz, ~3.74s) — not part of any TRE archive, loaded as a loose
+// file the same way RSMixer already loads STRIKE.wopl ("./assets/...",
+// copied from resources/ at build time), since AssetManager has no entry
+// for it.
+struct WavInfo {
+    bool valid{false};
+    uint32_t sampleRate{0};
+    uint16_t channels{0};
+    uint16_t bitsPerSample{0};
+    size_t dataOffset{0};
+    size_t dataSize{0};
+};
+
+uint32_t ReadU32LE(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+uint16_t ReadU16LE(const uint8_t *p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+// Walks a RIFF/WAVE buffer's chunks to find "fmt " and "data" — not
+// assuming the canonical 44-byte fixed layout, since some WAV writers
+// insert extra chunks (LIST/fact/etc.) before "data".
+WavInfo ParseWav(const std::vector<uint8_t> &buf) {
+    WavInfo info;
+    if (buf.size() < 12 || memcmp(buf.data(), "RIFF", 4) != 0 || memcmp(buf.data() + 8, "WAVE", 4) != 0) {
+        return info;
+    }
+    size_t pos = 12;
+    while (pos + 8 <= buf.size()) {
+        char id[5] = {0};
+        memcpy(id, buf.data() + pos, 4);
+        uint32_t chunkSize = ReadU32LE(buf.data() + pos + 4);
+        size_t bodyStart = pos + 8;
+        if (bodyStart + chunkSize > buf.size()) break;
+        if (memcmp(id, "fmt ", 4) == 0 && chunkSize >= 16) {
+            const uint8_t *p = buf.data() + bodyStart;
+            info.channels = ReadU16LE(p + 2);
+            info.sampleRate = ReadU32LE(p + 4);
+            info.bitsPerSample = ReadU16LE(p + 14);
+        } else if (memcmp(id, "data", 4) == 0) {
+            info.dataOffset = bodyStart;
+            info.dataSize = chunkSize;
+        }
+        pos = bodyStart + chunkSize + (chunkSize & 1); // chunks are word-aligned
+    }
+    info.valid = info.sampleRate > 0 && info.channels > 0 && info.bitsPerSample > 0 && info.dataSize > 0;
+    return info;
+}
+
+// Builds a standalone, canonical-header WAV containing only the last
+// `tailSeconds` of `full`'s audio, so it can be looped seamlessly on its
+// own once the afterburner key has been held past the full clip's length.
+std::vector<uint8_t> BuildWavTail(const std::vector<uint8_t> &full, const WavInfo &info, float tailSeconds) {
+    size_t frameBytes = (size_t)info.channels * (info.bitsPerSample / 8);
+    size_t tailBytes = (size_t)(tailSeconds * (float)info.sampleRate) * frameBytes;
+    if (tailBytes == 0 || tailBytes > info.dataSize) tailBytes = info.dataSize;
+    tailBytes -= tailBytes % frameBytes; // keep frame-aligned
+    size_t tailStart = info.dataOffset + info.dataSize - tailBytes;
+
+    std::vector<uint8_t> out(44 + tailBytes);
+    uint8_t *h = out.data();
+    memcpy(h, "RIFF", 4);
+    uint32_t riffSize = (uint32_t)(36 + tailBytes);
+    memcpy(h + 4, &riffSize, 4);
+    memcpy(h + 8, "WAVE", 4);
+    memcpy(h + 12, "fmt ", 4);
+    uint32_t fmtSize = 16;
+    memcpy(h + 16, &fmtSize, 4);
+    uint16_t audioFormat = 1; // PCM
+    memcpy(h + 20, &audioFormat, 2);
+    memcpy(h + 22, &info.channels, 2);
+    memcpy(h + 24, &info.sampleRate, 4);
+    uint32_t byteRate = info.sampleRate * frameBytes;
+    memcpy(h + 28, &byteRate, 4);
+    uint16_t blockAlign = (uint16_t)frameBytes;
+    memcpy(h + 32, &blockAlign, 2);
+    memcpy(h + 34, &info.bitsPerSample, 2);
+    memcpy(h + 36, "data", 4);
+    uint32_t dataSize32 = (uint32_t)tailBytes;
+    memcpy(h + 40, &dataSize32, 4);
+    memcpy(h + 44, full.data() + tailStart, tailBytes);
+    return out;
+}
+
+bool g_afterburnerSoundLoaded = false;
+std::vector<uint8_t> g_afterburnerFullWav;
+std::vector<uint8_t> g_afterburnerTailWav;
+float g_afterburnerFullDuration = 0.0f;
+
+void LoadAfterburnerSoundOnce() {
+    if (g_afterburnerSoundLoaded) return;
+    g_afterburnerSoundLoaded = true;
+    std::ifstream f("./assets/48_8bit_11025.wav", std::ios::binary);
+    if (!f) {
+        printf("Afterburner sound not found at ./assets/48_8bit_11025.wav\n");
+        return;
+    }
+    g_afterburnerFullWav.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    WavInfo info = ParseWav(g_afterburnerFullWav);
+    if (!info.valid) {
+        printf("Afterburner sound: failed to parse WAV header\n");
+        g_afterburnerFullWav.clear();
+        return;
+    }
+    size_t frameBytes = (size_t)info.channels * (info.bitsPerSample / 8);
+    g_afterburnerFullDuration = (float)info.dataSize / (float)(info.sampleRate * frameBytes);
+    g_afterburnerTailWav = BuildWavTail(g_afterburnerFullWav, info, 1.0f);
+}
+} // namespace
+
+// Real behavior (user-confirmed): the afterburner sound plays through
+// once from the moment the key is first pressed; once only the last
+// second of the clip remains, that last second loops for as long as the
+// key stays held (rather than restarting the whole clip or cutting off
+// mid-sound); releasing the key stops it immediately. There's no
+// equivalent sample anywhere in a mission's own sound bank
+// (current_mission->sound.sounds), so this loads/caches the loose WAV
+// once instead of going through AssetManager.
+void SCStrike::updateAfterburnerSound(bool engaged) {
+    LoadAfterburnerSoundOnce();
+    if (g_afterburnerFullWav.empty()) return;
+    static constexpr int kAfterburnerChannel = 6;
+
+    if (engaged && !this->afterburner_sound_engaged_prev) {
+        Mixer.playSoundVoc(g_afterburnerFullWav.data(), g_afterburnerFullWav.size(), kAfterburnerChannel, 0);
+        this->afterburner_sound_elapsed = 0.0f;
+        this->afterburner_sound_tail_started = false;
+    } else if (engaged) {
+        this->afterburner_sound_elapsed += GameTimer::getInstance().getDeltaTime();
+        if (!this->afterburner_sound_tail_started &&
+            this->afterburner_sound_elapsed >= g_afterburnerFullDuration - 1.0f) {
+            Mixer.playSoundVoc(g_afterburnerTailWav.data(), g_afterburnerTailWav.size(), kAfterburnerChannel, -1);
+            this->afterburner_sound_tail_started = true;
+        }
+    } else if (this->afterburner_sound_engaged_prev) {
+        Mixer.stopSound(kAfterburnerChannel);
+        this->afterburner_sound_tail_started = false;
+    }
+    this->afterburner_sound_engaged_prev = engaged;
+}
+
 void SCStrike::registerSimulatorInputs() {
     
 }
 void SCStrike::autopilotCompute() {
+    // No waypoint queued yet (see SCCockpit::Update()'s own guard for why
+    // that's a normal, reachable state) — nothing to autopilot toward.
+    if (this->current_mission->waypoints.empty() ||
+        (size_t)this->nav_point_id >= this->current_mission->waypoints.size()) {
+        return;
+    }
     Vector2D destination = {this->current_mission->waypoints[this->nav_point_id]->spot->position.x,
                             this->current_mission->waypoints[this->nav_point_id]->spot->position.z};
     this->autopilot_target_azimuth = atan2(this->player_plane->x-destination.x, this->player_plane->z-destination.y);
@@ -932,6 +1135,195 @@ void SCStrike::autopilotCompute() {
     this->autopilot_timeout = 400;
 }
 
+void SCStrike::beginAutopilotSequence(AutopilotSequence kind) {
+    SCMissionActors *carrier = nullptr;
+    if (!this->findCarrierActor(carrier) || this->player_plane == nullptr) {
+        return;
+    }
+    this->autopilot_seq_start_pos = {this->player_plane->x, this->player_plane->y, this->player_plane->z};
+    this->autopilot_seq_start_yaw = this->player_plane->yaw;
+
+    // Same heading convention as getDockedCarrierYawTenths/setCameraFollow
+    // elsewhere in this file: tenths-of-a-degree, azimuth measured the
+    // engine's own way (360-azymuth). setCameraFollow's own math confirms
+    // {sin(azim), cos(azim)} is this convention's BACKWARD direction (it's
+    // used with a *negative* distanceBehind to place the camera behind the
+    // ship) — real forward is the negation. Bug found via live testing:
+    // the ship reversed out of the hangar instead of flying forward when
+    // this was originally written as +{sin,cos}.
+    float carrierYawTenths = (360.0f - static_cast<float>(carrier->object->azymuth)) * 10.0f;
+    float carrierYawRad = tenthOfDegreeToRad(carrierYawTenths);
+    Vector3D carrierForward = {-sinf(carrierYawRad), 0.0f, -cosf(carrierYawRad)};
+
+    if (kind == AutopilotSequence::TAKEOFF) {
+        // End point: straight out along the carrier's own heading, well
+        // clear of the hangar-bay proximity radius.
+        this->autopilot_seq_end_pos = {
+            carrier->object->position.x + carrierForward.x * (HANGAR_INTERIOR_RADIUS * 2.0f),
+            carrier->object->position.y,
+            carrier->object->position.z + carrierForward.z * (HANGAR_INTERIOR_RADIUS * 2.0f)
+        };
+    } else {
+        // LANDING: end point is the carrier/bay position itself.
+        this->autopilot_seq_end_pos = carrier->object->position;
+    }
+    this->autopilot_seq_end_yaw = carrierYawTenths;
+
+    this->camera_mode = View::AUTO_PILOT;
+    this->autopilot_timeout = 400;
+    this->autopilot_sequence = kind;
+}
+
+void SCStrike::updateAutopilotSequence() {
+    constexpr float kSeqRange = 400.0f + (float)AUTOPILOTE_TIMEOUT;
+    float t = (400.0f - (float)this->autopilot_timeout) / kSeqRange;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    Vector3D pos = {
+        this->autopilot_seq_start_pos.x + (this->autopilot_seq_end_pos.x - this->autopilot_seq_start_pos.x) * t,
+        this->autopilot_seq_start_pos.y + (this->autopilot_seq_end_pos.y - this->autopilot_seq_start_pos.y) * t,
+        this->autopilot_seq_start_pos.z + (this->autopilot_seq_end_pos.z - this->autopilot_seq_start_pos.z) * t
+    };
+    // Plain lerp — start/end are both real bounded-sequence headings, not
+    // arbitrary angles, so shortest-path wraparound isn't a concern here.
+    float yaw = this->autopilot_seq_start_yaw + (this->autopilot_seq_end_yaw - this->autopilot_seq_start_yaw) * t;
+
+    this->player_plane->x = pos.x;
+    this->player_plane->y = pos.y;
+    this->player_plane->z = pos.z;
+    this->player_plane->yaw = yaw;
+    this->player_plane->ptw.Identity();
+    this->player_plane->ptw.translateM(pos.x, pos.y, pos.z);
+    this->player_plane->ptw.rotateM(tenthOfDegreeToRad(yaw), 0, 1, 0);
+    this->player_plane->Simulate();
+
+    // Camera: real user-observed shot descriptions (2026-07 session).
+    // Neither reads AUTO's own (unconfirmed) trailing bytes — see
+    // WorldCameraAutoSequence's comment in RSWorld.h.
+    if (this->autopilot_sequence == AutopilotSequence::TAKEOFF && t < 0.6f) {
+        // Phase A (t in [0, 0.6)): camera ahead-and-above the ship, looking
+        // back/down at it, swinging down to underneath as the ship advances
+        // out of the bay.
+        float phaseT = t / 0.6f;
+        float yawRad = tenthOfDegreeToRad(yaw);
+        Vector3D shipForward = {sinf(yawRad), 0.0f, cosf(yawRad)};
+        float aheadDist = 40.0f * (1.0f - phaseT);
+        float heightOffset = 25.0f * (1.0f - phaseT) - 15.0f * phaseT; // +above -> -below
+        Vector3D camPos = {
+            pos.x - shipForward.x * aheadDist,
+            pos.y + heightOffset,
+            pos.z - shipForward.z * aheadDist
+        };
+        camera->SetPosition(&camPos);
+        camera->lookAt(&pos);
+    } else if (this->autopilot_sequence == AutopilotSequence::TAKEOFF) {
+        // Phase B (t in [0.6, 1.0]): hard cut to the standard chase cam.
+        this->setCameraFollow(this->player_plane);
+    } else {
+        // LANDING: camera starts behind the ship and moves toward the
+        // carrier, decelerating (ease-out) to a stop at a point short of
+        // the ship's own full path — the ship continues past the now-
+        // nearly-stationary camera and flies on into the bay.
+        float startYawRad = tenthOfDegreeToRad(this->autopilot_seq_start_yaw);
+        // Real forward — see beginAutopilotSequence's comment on why
+        // {sin,cos} alone is this convention's backward direction.
+        Vector3D shipStartForward = {-sinf(startYawRad), 0.0f, -cosf(startYawRad)};
+        Vector3D camStart = {
+            this->autopilot_seq_start_pos.x - shipStartForward.x * 65.0f,
+            this->autopilot_seq_start_pos.y + 10.0f,
+            this->autopilot_seq_start_pos.z - shipStartForward.z * 65.0f
+        };
+        constexpr float kCamStopFraction = 0.6f; // camera stops short of the bay itself
+        Vector3D camEnd = {
+            this->autopilot_seq_start_pos.x + (this->autopilot_seq_end_pos.x - this->autopilot_seq_start_pos.x) * kCamStopFraction,
+            this->autopilot_seq_start_pos.y + (this->autopilot_seq_end_pos.y - this->autopilot_seq_start_pos.y) * kCamStopFraction + 10.0f,
+            this->autopilot_seq_start_pos.z + (this->autopilot_seq_end_pos.z - this->autopilot_seq_start_pos.z) * kCamStopFraction
+        };
+        float camT = 1.0f - (1.0f - t) * (1.0f - t); // quadratic ease-out
+        Vector3D camPos = {
+            camStart.x + (camEnd.x - camStart.x) * camT,
+            camStart.y + (camEnd.y - camStart.y) * camT,
+            camStart.z + (camEnd.z - camStart.z) * camT
+        };
+        camera->SetPosition(&camPos);
+        camera->lookAt(&pos); // tracks the ship as it flies past into the bay
+    }
+
+    if (this->autopilot_timeout > -AUTOPILOTE_TIMEOUT) {
+        this->autopilot_timeout -= AUTOPILOTE_SPEED;
+        return;
+    }
+
+    // Completion: snap to the exact end transform (avoid float-lerp drift),
+    // then hand off per sequence kind.
+    this->player_plane->x = this->autopilot_seq_end_pos.x;
+    this->player_plane->y = this->autopilot_seq_end_pos.y;
+    this->player_plane->z = this->autopilot_seq_end_pos.z;
+    this->player_plane->yaw = this->autopilot_seq_end_yaw;
+    this->player_plane->ptw.Identity();
+    this->player_plane->ptw.translateM(this->autopilot_seq_end_pos.x, this->autopilot_seq_end_pos.y, this->autopilot_seq_end_pos.z);
+    this->player_plane->ptw.rotateM(tenthOfDegreeToRad(this->autopilot_seq_end_yaw), 0, 1, 0);
+    this->player_plane->Simulate();
+
+    if (this->autopilot_sequence == AutopilotSequence::LANDING) {
+        // Reuses the existing manual-landing mission-end path (SCMission::
+        // update()'s own landing_clearance_granted/airspeed<100 check) —
+        // no duplicated end-mission logic here.
+        this->player_plane->landed = true;
+    }
+    // TAKEOFF needs nothing else: the plane is now physically outside the
+    // bay, so SCMission::update()'s existing area-crossing check picks up
+    // has_left_carrier_bay=true on its own next tick.
+    this->autopilot_sequence = AutopilotSequence::NONE;
+    this->camera_mode = View::FRONT;
+}
+
+// Distinct gun (weapon_category==0) weapon_ids mounted on plane, in
+// first-encountered order scanning weaps_load by hardpoint index — the
+// ordering CYCLE_GUNS/G cycles through and FIRE_PRIMARY/Space fires
+// against (see SCPlane::selected_gun_group's own comment). A ship with
+// twin hardpoints of the same gun type only contributes one entry here;
+// firing that type still fires every hardpoint sharing it.
+static std::vector<int> collectDistinctGunTypes(SCPlane *plane) {
+    std::vector<int> types;
+    for (auto *hpt : plane->weaps_load) {
+        if (hpt == nullptr || hpt->objct == nullptr || hpt->objct->wdat == nullptr) {
+            continue;
+        }
+        if (hpt->objct->wdat->weapon_category != 0) {
+            continue;
+        }
+        int weaponId = hpt->objct->wdat->weapon_id;
+        if (std::find(types.begin(), types.end(), weaponId) == types.end()) {
+            types.push_back(weaponId);
+        }
+    }
+    return types;
+}
+// Mirrors collectDistinctGunTypes above (same first-encountered-order scan
+// of weaps_load, same dedup-by-weapon_id), but for missiles/ordnance
+// (weapon_category != 0) instead of guns -- backs selected_missile_group,
+// WC3's own independent missile-type cycle (see that field's own comment
+// for why this can't just reuse selected_weapon/MDFS_WEAPONS's existing
+// SC1-oriented logic).
+static std::vector<int> collectDistinctMissileTypes(SCPlane *plane) {
+    std::vector<int> types;
+    for (auto *hpt : plane->weaps_load) {
+        if (hpt == nullptr || hpt->objct == nullptr || hpt->objct->wdat == nullptr) {
+            continue;
+        }
+        if (hpt->objct->wdat->weapon_category == 0) {
+            continue;
+        }
+        int weaponId = hpt->objct->wdat->weapon_id;
+        if (std::find(types.begin(), types.end(), weaponId) == types.end()) {
+            types.push_back(weaponId);
+        }
+    }
+    return types;
+}
+
 /**
  * @brief Handle keyboard events
  *
@@ -971,15 +1363,25 @@ void SCStrike::checkKeyboard(void) {
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::RUDDER_LEFT))) {
         this->player_plane->rudder -= 0.1f;
         is_rudder_pressed = true;
+        // Unlike control_stick_x/y (roll/pitch), rudder never disabled
+        // mouse control — meaning stray mouse movement could still drive
+        // control_stick_x (roll) at the same time as a yaw key press,
+        // looking like the axes were swapped even though they weren't.
+        this->mouse_control = false;
     }
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::RUDDER_RIGHT))) {
         this->player_plane->rudder += 0.1f;
         is_rudder_pressed = true;
+        this->mouse_control = false;
     }
+    bool is_shift_held = m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MODIFIER_SHIFT));
     if (!is_rudder_pressed) {
         this->player_plane->rudder = 0;
     } else {
-        this->player_plane->rudder = std::clamp(this->player_plane->rudder, -10.0f, 10.0f);
+        // Shift held = full-rate yaw, otherwise half-rate — matches the
+        // half/full speed keyboard scheme for every rotation axis.
+        float rudderCap = is_shift_held ? 10.0f : 5.0f;
+        this->player_plane->rudder = std::clamp(this->player_plane->rudder, -rudderCap, rudderCap);
     }
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::THROTTLE_UP))) {
         if (this->player_plane->GetThrottle() == 0) {
@@ -1017,23 +1419,202 @@ void SCStrike::checkKeyboard(void) {
                 } else if (this->current_mission->sound.sounds.size() > 0) {
                     MemSound *engine = this->current_mission->sound.sounds[SoundEffectIds::ENGINE_MIL_SHUT_DOWN];
                     Mixer.playSoundVoc(engine->data, engine->size, 5, 0);
-                }    
+                }
             }
-            
+
         }
     }
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::THROTTLE_STOP))) {
+        this->player_plane->SetThrottle(0);
+        if (this->current_mission->sound.sounds.size() > 0 && !Mixer.isSoundPlaying(5)) {
+            MemSound *engine = this->current_mission->sound.sounds[SoundEffectIds::ENGINE_MIL_SHUT_DOWN];
+            Mixer.playSoundVoc(engine->data, engine->size, 5, 0);
+        }
+    }
+    this->player_plane->afterburner_engaged =
+        m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::AFTERBURNER));
+    this->updateAfterburnerSound(this->player_plane->afterburner_engaged);
     this->cockpit->is_shooting = false;
+    // Real WC-series controls: dedicated gun/missile triggers, not one fire
+    // button cycling through every hardpoint type (see FIRE_MISSILE's own
+    // comment in GameEngine.h). CYCLE_GUNS/G selects which gun TYPE
+    // FIRE_PRIMARY/Space fires — N distinct types means N+1 states (each
+    // type individually, then a final "fire every gun together" state).
+    // Guarded against Ctrl held: WC3's Ctrl+G (gun-sync toggle, see
+    // WC3Strike::checkGunSyncToggleInput) shares the bare G scancode with
+    // this binding, and isActionJustPressed doesn't know about modifiers —
+    // without this guard, Ctrl+G would both cycle guns and toggle sync.
+    if (!(SDL_GetModState() & KMOD_CTRL) &&
+        m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::CYCLE_GUNS))) {
+        std::vector<int> gunTypes = collectDistinctGunTypes(this->player_plane);
+        if (!gunTypes.empty()) {
+            this->player_plane->selected_gun_group =
+                (this->player_plane->selected_gun_group + 1) % ((int)gunTypes.size() + 1);
+            printf("CYCLE_GUNS: %zu distinct gun type(s) found, now selecting group %d%s\n",
+                   gunTypes.size(), this->player_plane->selected_gun_group,
+                   (this->player_plane->selected_gun_group == (int)gunTypes.size()) ? " (all guns)" : "");
+        } else {
+            printf("CYCLE_GUNS: pressed, but weaps_load has zero gun-category (weapon_category==0) hardpoints with a resolved weapon -- nothing to cycle\n");
+        }
+    }
+    // Guns always fire down the boresight, no target required. Fires every
+    // hardpoint matching the CYCLE_GUNS-selected type (or every gun
+    // hardpoint at all, in the final "all guns" state) as one simultaneous
+    // salvo. wp_cooldown is a single value shared across the whole plane,
+    // not per-hardpoint — Shoot() itself owns the "still on cooldown"
+    // decrement-and-return logic, so the *first* candidate hardpoint is
+    // always called normally (this is what lets wp_cooldown actually tick
+    // down frame to frame; gating the loop itself on wp_cooldown<=0
+    // without ever calling Shoot() was a real bug — it froze wp_cooldown
+    // permanently at whatever value the first successful shot set, since
+    // nothing ever called Shoot() again to decrement it). Only once that
+    // first call confirms a real fire this frame (via its bool return) do
+    // later hardpoints in the same salvo get their cooldown forced to 0 so
+    // they aren't blocked by the first one's freshly-set value.
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_PRIMARY))) {
-        if (target != nullptr) {
-            this->player_plane->Shoot(this->player_plane->selected_weapon, target, this->current_mission);
-            this->cockpit->is_shooting = true;
+        std::vector<int> gunTypes = collectDistinctGunTypes(this->player_plane);
+        if (!gunTypes.empty()) {
+            bool fireAll = (this->player_plane->selected_gun_group >= (int)gunTypes.size());
+            int targetWeaponId = fireAll ? -1 : gunTypes[this->player_plane->selected_gun_group];
+            std::vector<size_t> matchingHpts;
+            for (size_t i = 0; i < this->player_plane->weaps_load.size(); i++) {
+                auto *hpt = this->player_plane->weaps_load[i];
+                if (hpt == nullptr || hpt->objct == nullptr || hpt->objct->wdat == nullptr) {
+                    continue;
+                }
+                if (hpt->objct->wdat->weapon_category != 0) {
+                    continue;
+                }
+                if (!fireAll && hpt->objct->wdat->weapon_id != targetWeaponId) {
+                    continue;
+                }
+                matchingHpts.push_back(i);
+            }
+            if (!matchingHpts.empty()) {
+                // When energy can't cover firing every matching hardpoint
+                // together this press, alternate through them one at a time
+                // instead of always attempting the same hardpoint first
+                // (SCPlane::Shoot()'s own energy check would otherwise let
+                // hardpoint 0 drain what little energy there is every time,
+                // starving the others). Only applies to WC3's energy-gated
+                // guns — SC1's ID_20MM and anything without a resolved wdat
+                // always fire every matching hardpoint together.
+                std::vector<size_t> hptsToFire = matchingHpts;
+                RSEntity *firstObjct = this->player_plane->weaps_load[matchingHpts[0]]->objct;
+                if (matchingHpts.size() > 1 && firstObjct->wdat != nullptr &&
+                    SCPlane::IsWC3EnergyGunWeaponId(firstObjct->wdat->weapon_id)) {
+                    float energyCostEach = (firstObjct->wdat->energy_cost > 0) ? (float)firstObjct->wdat->energy_cost : 5.0f;
+                    float currentEnergy = this->player_plane->GetCurrentGunEnergy();
+                    if (currentEnergy < energyCostEach * (float)matchingHpts.size()) {
+                        size_t pick = matchingHpts[this->player_plane->gun_alternate_index % matchingHpts.size()];
+                        this->player_plane->gun_alternate_index++;
+                        hptsToFire = {pick};
+                    }
+                }
+                // WC3's real default is desynchronized gun-pair fire: one
+                // cannon fires slightly before the other, picked at random
+                // each shot, the leader ending up about half a bolt's length
+                // ahead — toggled off (both fire in perfect sync) with
+                // Ctrl+G (SCPlane::guns_synchronized). Implemented as a
+                // spawn-position head start rather than an actual timing
+                // delay (see Shoot()'s spawnAdvanceDistance param comment)
+                // since a real delay would be a few milliseconds, well under
+                // this simulation's own tick granularity.
+                // kBoltLength must track SCRenderer::drawBolt's own geometry
+                // (8.9+8.5 unscaled) and its glScalef call — both currently
+                // 1.5x.
+                constexpr float kBoltLength = (8.9f + 8.5f) * 1.5f;
+                int leaderPick = -1;
+                if (hptsToFire.size() > 1 && !this->player_plane->guns_synchronized) {
+                    leaderPick = (int)(std::rand() % hptsToFire.size());
+                }
+                // Only the first hardpoint to fire is called unconditionally
+                // (so a not-yet-ready cooldown only ticks down once per
+                // frame, same as before this salvo logic existed) — the rest
+                // only fire if that first call actually fired.
+                float advance0 = (leaderPick == 0) ? kBoltLength * 0.5f : 0.0f;
+                bool fired = this->player_plane->Shoot((int)hptsToFire[0], target, this->current_mission, 999.0f, advance0);
+                if (fired) {
+                    this->cockpit->is_shooting = true;
+                    for (size_t idx = 1; idx < hptsToFire.size(); idx++) {
+                        this->player_plane->wp_cooldown = 0;
+                        float advance = (leaderPick == (int)idx) ? kBoltLength * 0.5f : 0.0f;
+                        this->player_plane->Shoot((int)hptsToFire[idx], target, this->current_mission, 999.0f, advance);
+                    }
+                }
+            }
+        }
+    }
+    // Missiles/torpedo (Enter/FIRE_MISSILE) fire whatever MDFS_WEAPONS has
+    // cycled selected_weapon to — still requires a target (guidance/lock
+    // need something to aim at), unlike the gun above. Guarded against
+    // selected_weapon landing on a gun slot (Enter shouldn't double as a
+    // second gun trigger).
+    if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_MISSILE))) {
+        // WC3: resolve the hardpoint from selected_missile_group's own
+        // independent missile-type cycle instead of the SC1 selected_weapon
+        // index (which MDFS_WEAPONS no longer drives for WC3 ships at all —
+        // see that handler's own comment) — first hardpoint whose
+        // weapon_id matches the currently selected missile type.
+        int selIdx = -1;
+        if (this->player_plane->is_wc3_ship) {
+            std::vector<int> missileTypes = collectDistinctMissileTypes(this->player_plane);
+            if (!missileTypes.empty()) {
+                int targetWeaponId = missileTypes[this->player_plane->selected_missile_group % missileTypes.size()];
+                for (size_t i = 0; i < this->player_plane->weaps_load.size(); i++) {
+                    auto *hpt = this->player_plane->weaps_load[i];
+                    if (hpt != nullptr && hpt->objct != nullptr && hpt->objct->wdat != nullptr &&
+                        hpt->objct->wdat->weapon_id == targetWeaponId) {
+                        selIdx = (int)i;
+                        break;
+                    }
+                }
+            }
+        } else {
+            selIdx = this->player_plane->selected_weapon;
+        }
+        if (selIdx >= 0 && (size_t)selIdx < this->player_plane->weaps_load.size()) {
+            auto *selected = this->player_plane->weaps_load[selIdx];
+            if (selected != nullptr && selected->objct != nullptr && selected->objct->wdat != nullptr &&
+                selected->objct->wdat->weapon_category != 0) {
+                // WC3's heatseeker/image-recognition/friend-or-foe missiles
+                // can dumbfire (fly straight ahead, unguided) with no target
+                // selected at all — see SCPlane::Shoot()'s own comment on
+                // this. Requiring `target != nullptr` here unconditionally
+                // (as before) silently blocked FIRE_MISSILE from doing
+                // anything at all whenever nothing was targeted, even
+                // though Shoot()'s own dumbfire branch already handles a
+                // null target safely. Torpedo/T-bomb (weapon_category==3)
+                // and SC1's own missiles still require a real target, same
+                // as before — only these three IDs get the relaxation.
+                int weaponId = selected->objct->wdat->weapon_id;
+                bool canDumbfireUnlocked = weaponId == weapon_ids::ID_HSMISS ||
+                    weaponId == weapon_ids::ID_IRMISS || weaponId == weapon_ids::ID_FFMISS;
+                if (target != nullptr || canDumbfireUnlocked) {
+                    // Real lock-on timer (SCCockpit::updateLockOn) — lets
+                    // Shoot() decide missile guided-vs-dumbfire and gate
+                    // torpedo/T-bomb firing entirely.
+                    this->player_plane->Shoot((int)selIdx, target, this->current_mission,
+                                               this->cockpit->lock_progress);
+                    this->cockpit->is_shooting = true;
+                }
+            }
         }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_MOUSE))) {
         this->mouse_control = !this->mouse_control;
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::AUTOPILOT))) {
-        this->autopilotCompute();
+        // checkKeyboard() already returns early (see the top of this
+        // function) whenever camera_mode==View::AUTO_PILOT, so this can't
+        // re-trigger/reset a sequence that's already playing.
+        if (!this->current_mission->has_left_carrier_bay) {
+            this->beginAutopilotSequence(AutopilotSequence::TAKEOFF);
+        } else if (this->current_mission->landing_clearance_granted) {
+            this->beginAutopilotSequence(AutopilotSequence::LANDING);
+        } else if (this->CanEngageAutopilot()) {
+            this->autopilotCompute();
+        }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::LANDING_GEAR))) {
         this->player_plane->SetWheel();
@@ -1056,18 +1637,65 @@ void SCStrike::checkKeyboard(void) {
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::TARGET_NEAREST))) {
         this->findTarget();
     }
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::LOCK_TARGET))) {
+        if (this->target != nullptr) {
+            this->cockpit->target_hard_locked = !this->cockpit->target_hard_locked;
+        }
+    }
+    // Toggles this->cockpit->show_radars — only consulted for Strike
+    // Commander's own (non-WC3) radar page now (SCCockpit.cpp's runFrame
+    // page-rotation call site). WC3's radar always draws unconditionally
+    // (user-confirmed 2026-07 session: no toggle key for it), so this key
+    // press is a no-op for WC3 cockpits rather than removed outright —
+    // SCStrike.cpp is shared between both games, and SC still needs it.
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_RADAR))) {
         this->cockpit->show_radars = !this->cockpit->show_radars;
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_DAMAGE))) {
         this->cockpit->show_damage = !this->cockpit->show_damage;
     }
-    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS))) {
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_POWER))) {
+        // User-confirmed real behavior: 'p' rotates E->W->S->D->shield->E
+        // rather than a plain open/close toggle. See CyclePowerOrShield.
+        this->cockpit->CyclePowerOrShield();
+    }
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_SHIELD))) {
+        this->cockpit->show_shield = !this->cockpit->show_shield;
+    }
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::CYCLE_COCKPIT_VIEW))) {
+        this->cockpit->CycleViewMode();
+    }
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS)) &&
+        this->player_plane->is_wc3_ship) {
+        // WC3: independent missile/ordnance-type cycle (selected_missile_
+        // group), completely separate from gun selection (selected_gun_
+        // group/CYCLE_GUNS) -- per user direction. The SC1 logic below
+        // (selected_weapon, hpts.size()/2+1 sizing, SC1 HUD weapon-mode
+        // switch) doesn't apply to WC3's simpler fixed 1:1 hardpoint layout
+        // and was walking into/getting stuck on gun hardpoints instead of
+        // cycling ordnance cleanly.
+        if (this->cockpit->show_weapons) {
+            std::vector<int> missileTypes = collectDistinctMissileTypes(this->player_plane);
+            if (!missileTypes.empty()) {
+                this->player_plane->selected_missile_group =
+                    (this->player_plane->selected_missile_group + 1) % (int)missileTypes.size();
+            }
+            this->player_plane->wp_cooldown = 0;
+            this->mfd_timeout = 400;
+        } else {
+            this->cockpit->show_weapons = !this->cockpit->show_weapons;
+            this->mfd_timeout = 400;
+            this->player_plane->wp_cooldown = 0;
+        }
+    } else if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS))) {
         if (this->cockpit->show_weapons) {
             int nb_hardpoint = this->player_plane->object->entity->hpts.size() / 2 +1;
             int next_weapon = (this->player_plane->selected_weapon + 1) % nb_hardpoint;
             if (this->air_weapons_mode) {
-                while (this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_20MM &&
+                while (this->player_plane->weaps_load[next_weapon] != nullptr &&
+                       this->player_plane->weaps_load[next_weapon]->objct != nullptr &&
+                       this->player_plane->weaps_load[next_weapon]->objct->wdat != nullptr &&
+                       this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_20MM &&
                        this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_AIM120 &&
                        this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_AIM9J &&
                        this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_AIM9M) {
@@ -1124,7 +1752,7 @@ void SCStrike::checkKeyboard(void) {
         }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::SHOW_NAVMAP))) {
-        SCNavMap *nav_screen = new SCNavMap();
+        SCNavMap *nav_screen = this->createNavMap();
         nav_screen->init();
         nav_screen->SetName((char *)this->current_mission->world->tera.c_str());
         nav_screen->mission = this->current_mission;
@@ -1138,16 +1766,29 @@ void SCStrike::checkKeyboard(void) {
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::FLARE))) {
         //this->player_plane->LaunchFlares(this->current_mission);
     }
+    // '[' / ']' are context-sensitive, same precedent as the M/W dual-use
+    // MDFS_WEAPONS key: while the power MFD is open they nudge the
+    // selected gauge (user-confirmed real binding — '[' decreases, ']'
+    // increases), otherwise they keep their existing radar-zoom function.
+    static constexpr float kPowerStep = 5.0f;
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::RADAR_ZOOM_IN))) {
-        this->cockpit->radar_zoom -= 1;
-        if (this->cockpit->radar_zoom < 1) {
-            this->cockpit->radar_zoom = 1;
+        if (this->cockpit->show_power) {
+            this->cockpit->AdjustSelectedPower(-kPowerStep);
+        } else {
+            this->cockpit->radar_zoom -= 1;
+            if (this->cockpit->radar_zoom < 1) {
+                this->cockpit->radar_zoom = 1;
+            }
         }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::RADAR_ZOOM_OUT))) {
-        this->cockpit->radar_zoom += 1;
-        if (this->cockpit->radar_zoom > 4) {
-            this->cockpit->radar_zoom = 4;
+        if (this->cockpit->show_power) {
+            this->cockpit->AdjustSelectedPower(kPowerStep);
+        } else {
+            this->cockpit->radar_zoom += 1;
+            if (this->cockpit->radar_zoom > 4) {
+                this->cockpit->radar_zoom = 4;
+            }
         }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO))) {
@@ -1184,6 +1825,26 @@ void SCStrike::checkKeyboard(void) {
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_WEAPONS))) {
         if (this->camera_mode != View::MISSILE_CAM) {
             this->camera_mode = View::MISSILE_CAM;
+        } else {
+            this->camera_mode = View::REAL;
+        }
+    }
+    // Real WC3 "Track Camera" (F10, WRLD>CAMR>TRAK). Anchors a world-fixed
+    // camera at the player's position at the moment of engaging (not
+    // re-anchored on every press while already in this mode, so it stays a
+    // real flyby shot rather than snapping to the player each frame) —
+    // see runFrame's View::TRACK case for the continuous lookAt.
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_TRACK))) {
+        if (this->camera_mode != View::TRACK) {
+            const float lateral = 80.0f;
+            const float above = 20.0f;
+            float r_azim = tenthOfDegreeToRad(this->player_plane->azimuthf + 900.0f);
+            this->track_camera_anchor = {
+                this->player_plane->x + lateral * sinf(r_azim),
+                this->player_plane->y + above,
+                this->player_plane->z + lateral * cosf(r_azim)
+            };
+            this->camera_mode = View::TRACK;
         } else {
             this->camera_mode = View::REAL;
         }
@@ -1326,7 +1987,7 @@ void SCStrike::checkKeyboard(void) {
                 this->cockpit->SetCommActorTarget(6);
             } else {
                 if (this->cockpit->comm_actor != nullptr) {
-                    this->cockpit->comm_actor->respondToRadioMessage(5, this->current_mission, this->current_mission->player);
+                    this->cockpit->comm_actor->respondToRadioMessage(6, this->current_mission, this->current_mission->player);
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
@@ -1338,7 +1999,7 @@ void SCStrike::checkKeyboard(void) {
                 this->cockpit->SetCommActorTarget(7);
             } else {
                 if (this->cockpit->comm_actor != nullptr) {
-                    this->cockpit->comm_actor->respondToRadioMessage(5, this->current_mission, this->current_mission->player);
+                    this->cockpit->comm_actor->respondToRadioMessage(7, this->current_mission, this->current_mission->player);
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
@@ -1350,7 +2011,7 @@ void SCStrike::checkKeyboard(void) {
                 this->cockpit->SetCommActorTarget(8);
             } else {
                 if (this->cockpit->comm_actor != nullptr) {
-                    this->cockpit->comm_actor->respondToRadioMessage(5, this->current_mission, this->current_mission->player);
+                    this->cockpit->comm_actor->respondToRadioMessage(8, this->current_mission, this->current_mission->player);
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
@@ -1396,20 +2057,26 @@ void SCStrike::checkKeyboard(void) {
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::PAUSE))) {
         this->pause_simu = !this->pause_simu;
     }
+    // Shift held = full-rate, otherwise half-rate, matching every other
+    // rotation axis (is_shift_held computed above for rudder/yaw). 200 is
+    // SCJdynPlane::processInput's own kStickFullDeflection — using it here
+    // too (rather than the old, inconsistent 150 for pitch) means "full"
+    // actually reaches the ship's calibrated max dps, not 75% of it.
+    float pitchRollDeflection = is_shift_held ? 200 : 100;
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::PITCH_UP))) {
-        this->player_plane->control_stick_y = -150;
+        this->player_plane->control_stick_y = -pitchRollDeflection;
         this->mouse_control = false;
     }
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::PITCH_DOWN))) {
-        this->player_plane->control_stick_y = 150;
+        this->player_plane->control_stick_y = pitchRollDeflection;
         this->mouse_control = false;
     }
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::ROLL_LEFT))) {
-        this->player_plane->control_stick_x = -200;
+        this->player_plane->control_stick_x = -pitchRollDeflection;
         this->mouse_control = false;
     }
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::ROLL_RIGHT))) {
-        this->player_plane->control_stick_x = 200;
+        this->player_plane->control_stick_x = pitchRollDeflection;
         this->mouse_control = false;
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::EYES_ON_TARGET))) {
@@ -1463,24 +2130,46 @@ void SCStrike::checkKeyboard(void) {
         this->pilote_lookat.y = 0;
     }
     this->cockpit->mouse_control = this->mouse_control;
+    this->checkGameSpecificKeyboard();
+}
+SCNavMap* SCStrike::createNavMap() {
+    return new SCNavMap();
 }
 void SCStrike::findTarget() {
-    const float target_range = 30000.0f;
+    const float target_range = 80000.0f;  // real confirmed max radar range
     const float target_range_sq = target_range * target_range;
 
-    // 1. Collecter tous les ennemis valides dans la portée
+    // 1. Collecter toutes les cibles valides dans la portée — user-
+    // confirmed real behavior: T cycles through every trackable contact
+    // (friend or foe), not just enemies, so this now scans the master
+    // actors list rather than current_mission->enemies. Previously also
+    // filtered on actor->team_id == player->team_id, a separate, unrelated
+    // (and apparently unreliable — WC3Mission.cpp reads it from a raw,
+    // never-confirmed "unknown_bytes[2]" field) classification from the
+    // real friend/foe split already used to build current_mission-
+    // >enemies/friendlies (see that split's own comment) — every enemy was
+    // being filtered out here whenever the two team_id guesses happened to
+    // coincide, which is why targeting was stuck on "none".
     std::vector<int> candidates;
-    for (int i = 0; i < (int)this->current_mission->enemies.size(); i++) {
-        auto enemy = this->current_mission->enemies[i];
-        if (enemy->team_id == this->current_mission->player->team_id) {
+    for (int i = 0; i < (int)this->current_mission->actors.size(); i++) {
+        auto actor = this->current_mission->actors[i];
+        if (actor == nullptr || actor == this->current_mission->player) {
             continue;
         }
-        if (!enemy->is_active || enemy->is_destroyed) {
+        if (!actor->is_active || actor->is_destroyed) {
             continue;
         }
-        float dx = enemy->object->position.x - this->player_plane->x;
-        float dy = enemy->object->position.y - this->player_plane->y;
-        float dz = enemy->object->position.z - this->player_plane->z;
+        // User-confirmed (2026-07 session): cloaked contacts (e.g. the
+        // Skipper Missile, SKIPMISS — cloaks every 3 seconds specifically
+        // "to prevent missile lock") can't be targeted at all while
+        // cloaked; only decloaked. SCMissionActors::UpdateCloak drives
+        // actor->plane->cloaked once per SCMission::update() tick.
+        if (actor->plane != nullptr && actor->plane->cloaked) {
+            continue;
+        }
+        float dx = actor->object->position.x - this->player_plane->x;
+        float dy = actor->object->position.y - this->player_plane->y;
+        float dz = actor->object->position.z - this->player_plane->z;
         float distSq = dx * dx + dy * dy + dz * dz;
         if (distSq <= target_range_sq) {
             candidates.push_back(i);
@@ -1493,13 +2182,14 @@ void SCStrike::findTarget() {
         this->target = nullptr;
         this->current_mission->player->target = nullptr;
         this->cockpit->target = nullptr;
+        printf("Target: none\n");
         return;
     }
 
     // 2. Trier les candidats par distance croissante
     std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
-        auto ea = this->current_mission->enemies[a];
-        auto eb = this->current_mission->enemies[b];
+        auto ea = this->current_mission->actors[a];
+        auto eb = this->current_mission->actors[b];
         float dxa = ea->object->position.x - this->player_plane->x;
         float dya = ea->object->position.y - this->player_plane->y;
         float dza = ea->object->position.z - this->player_plane->z;
@@ -1520,11 +2210,158 @@ void SCStrike::findTarget() {
     }
 
     // 4. Appliquer la nouvelle cible
-    int selectedEnemyIndex = candidates[nextIndex];
-    this->current_target = selectedEnemyIndex;
-    this->target = this->current_mission->enemies[selectedEnemyIndex];
+    int selectedIndex = candidates[nextIndex];
+    this->current_target = selectedIndex;
+    this->target = this->current_mission->actors[selectedIndex];
     this->current_mission->player->target = this->target;
     this->cockpit->target = this->target->object;
+    printf("Target: %s\n", this->target->object->member_name.c_str());
+}
+// Real WC3-style auto-targeting: continuously targets whatever in-range
+// enemy the player is oriented towards (nearest if several qualify), rather
+// than findTarget()'s manual T-cycle. Skips entirely while
+// cockpit->target_hard_locked is true (see SCCockpit.h) so a sticky L-lock
+// keeps its target regardless of where the player looks; if that locked
+// target dies or leaves a generous extended range, the lock is released
+// here and auto-targeting resumes the same frame.
+void SCStrike::updateAutoTarget() {
+    if (this->cockpit->target_hard_locked) {
+        bool stillValid = (this->target != nullptr && this->target->is_active && !this->target->is_destroyed &&
+                            (this->target->plane == nullptr || !this->target->plane->cloaked));
+        if (stillValid) {
+            const float maxLockRange = 80000.0f * 1.5f;  // real confirmed max radar range
+            float dx = this->target->object->position.x - this->player_plane->x;
+            float dy = this->target->object->position.y - this->player_plane->y;
+            float dz = this->target->object->position.z - this->player_plane->z;
+            stillValid = (dx * dx + dy * dy + dz * dz) <= (maxLockRange * maxLockRange);
+        }
+        if (stillValid) {
+            return;
+        }
+        this->cockpit->target_hard_locked = false;
+        // Fall through so a target is re-acquired this same frame instead
+        // of leaving current_target stale for one frame.
+    }
+
+    const float target_range = 80000.0f;  // real confirmed max radar range
+    const float target_range_sq = target_range * target_range;
+    SCMissionActors *best = nullptr;
+    // Only meaningful as an *enemy*-list index (matches findTarget()'s own
+    // contract, since it cycles by comparing candidate indices straight
+    // against this field) — stays -1 whenever the winning candidate is a
+    // friendly, even though `target`/`cockpit->target` below do get set to
+    // it. findTarget()'s manual T-cycle only ever considers enemies anyway.
+    int bestEnemyIndex = -1;
+    float bestDistSq = 0.0f;
+
+    // Auto-targeting isn't just for weapons lock — the target box itself is
+    // meant to highlight whatever ship (enemy or friendly) the player is
+    // oriented towards, so both lists are real candidates here.
+    auto considerCandidate = [&](SCMissionActors *actor, int enemyIndex) {
+        if (actor == this->current_mission->player) {
+            return;
+        }
+        if (!actor->is_active || actor->is_destroyed) {
+            return;
+        }
+        // See findTarget()'s own matching comment — cloaked contacts can't
+        // be targeted at all while cloaked.
+        if (actor->plane != nullptr && actor->plane->cloaked) {
+            return;
+        }
+        float dx = actor->object->position.x - this->player_plane->x;
+        float dy = actor->object->position.y - this->player_plane->y;
+        float dz = actor->object->position.z - this->player_plane->z;
+        float distSq = dx * dx + dy * dy + dz * dz;
+        if (distSq > target_range_sq) {
+            return;
+        }
+        if (SCMissionActors::ClassifyHitQuadrant(this->current_mission->player, actor->object->position) != HitQuadrant::Front) {
+            return;
+        }
+        if (best == nullptr || distSq < bestDistSq) {
+            best = actor;
+            bestEnemyIndex = enemyIndex;
+            bestDistSq = distSq;
+        }
+    };
+    for (int i = 0; i < (int)this->current_mission->enemies.size(); i++) {
+        considerCandidate(this->current_mission->enemies[i], i);
+    }
+    for (auto friendly : this->current_mission->friendlies) {
+        considerCandidate(friendly, -1);
+    }
+
+    this->current_target = bestEnemyIndex;
+    this->target = best;
+    this->current_mission->player->target = best;
+    this->cockpit->target = (best != nullptr) ? best->object : nullptr;
+}
+// See declaration comment (SCStrike.h).
+//
+// current_mission->waypoints is NOT a pre-populated route to fly through in
+// order — it's a growing history log: mission scripting pushes a *new*
+// entry every time the current objective changes (SCMissionActorsPlayer::
+// takeOff/land/flyToWaypoint/flyToArea, in SCMissionActors.cpp), and old
+// entries are left in place as history, not removed. So "the next nav
+// point" is simply whichever entry was pushed most recently
+// (waypoints.back()), not something reached by flying through prior ones.
+//
+// An earlier version of this function got that backwards — it treated
+// nav_point_id as a cursor to proximity-advance forward through the list,
+// which broke autopilot entirely: the player spawns right at the "take
+// off" spot (the very first waypoint pushed), so on the first frame it
+// would immediately count that as "reached" and advance nav_point_id past
+// it — but since that's the *only* entry that exists yet, nav_point_id
+// landed on an out-of-bounds index and stayed there, which makes
+// autopilotCompute()'s own bounds check silently refuse to engage,
+// independent of CanEngageAutopilot's enemy-proximity gate.
+void SCStrike::updateNavPoint() {
+    if (this->current_mission == nullptr) {
+        return;
+    }
+    size_t count = this->current_mission->waypoints.size();
+    if (count == 0) {
+        return;
+    }
+    if (count != this->last_nav_point_count) {
+        // A new current-objective waypoint was pushed since we last
+        // checked (or this is the first one this mission) — auto-follow
+        // it. Doesn't touch nav_point_id otherwise, so a manual pick made
+        // via the nav-map screen (which writes nav_point_id directly)
+        // sticks until the next real objective change.
+        this->nav_point_id = (uint8_t)((count - 1 > 255) ? 255 : count - 1);
+        this->last_nav_point_count = count;
+    }
+}
+// See declaration comment (SCStrike.h). "Immediate area" — no real data
+// source for this either, picked smaller than updateAutoTarget's 80000-unit
+// max radar range (autopilot should refuse well before a hostile is merely
+// on radar, but there's no reverse-engineered real value to match against).
+// Tunable.
+bool SCStrike::CanEngageAutopilot() {
+    if (this->current_mission == nullptr || this->player_plane == nullptr) {
+        return true;
+    }
+    const float kAutopilotBlockRange = 20000.0f;
+    const float kAutopilotBlockRangeSq = kAutopilotBlockRange * kAutopilotBlockRange;
+    for (auto enemy : this->current_mission->enemies) {
+        if (enemy == nullptr || !enemy->is_active || enemy->is_destroyed || enemy->object == nullptr) {
+            continue;
+        }
+        std::string name = enemy->object->member_name;
+        std::transform(name.begin(), name.end(), name.begin(), ::toupper);
+        if (SCMissionActors::IsCapitalShipName(name)) {
+            continue;
+        }
+        float dx = enemy->object->position.x - this->player_plane->x;
+        float dy = enemy->object->position.y - this->player_plane->y;
+        float dz = enemy->object->position.z - this->player_plane->z;
+        if (dx * dx + dy * dy + dz * dz <= kAutopilotBlockRangeSq) {
+            return false;
+        }
+    }
+    return true;
 }
 /**
  * SCStrike::Init
@@ -1596,6 +2433,7 @@ void SCStrike::setMission(char const *missionName) {
     this->current_target = 0;
     this->target = this->current_mission->enemies[this->current_target];
     this->nav_point_id = 0;
+    this->last_nav_point_count = 0;
     this->player_plane = this->current_mission->player->plane;
     this->player_plane->yaw = (360 - playerCoord->azymuth) * 10.0f;
     this->player_plane->object = playerCoord;
@@ -1649,6 +2487,52 @@ void SCStrike::setMission(char const *missionName) {
     Mixer.switchBank(2);
     Mixer.playMusic(this->current_mission->mission->mission_data.tune+1);
 }
+void SCStrike::updateMissionMusic() {
+    if (this->current_mission->mission_over && this->current_mission->mission_won) {
+        this->Mixer.playMusic(13); // play victory music
+    } else if (this->current_mission->mission_over && !this->current_mission->mission_won) {
+        this->Mixer.playMusic(12); // play victory music
+    } else if (this->current_mission->in_combat) {
+        this->Mixer.playMusic(5);
+    } else {
+        this->Mixer.playMusic(this->current_mission->mission->mission_data.tune+1);
+    }
+}
+bool SCStrike::findCarrierActor(SCMissionActors *&outActor) {
+    if (this->current_mission == nullptr) {
+        return false;
+    }
+    for (auto actor : this->current_mission->actors) {
+        if (actor->object == nullptr || actor->object->entity == nullptr) {
+            continue;
+        }
+        if (actor->object->entity->flight_deck_entity == nullptr) {
+            continue;
+        }
+        outActor = actor;
+        return true;
+    }
+    return false;
+}
+bool SCStrike::getDockedCarrierYawTenths(float &yawTenths) {
+    if (this->current_mission == nullptr || this->player_plane == nullptr) {
+        return false;
+    }
+    SCMissionActors *carrier = nullptr;
+    if (!this->findCarrierActor(carrier)) {
+        return false;
+    }
+    Vector3D d = {
+        carrier->object->position.x - this->player_plane->x,
+        carrier->object->position.y - this->player_plane->y,
+        carrier->object->position.z - this->player_plane->z
+    };
+    if (d.Length() < HANGAR_INTERIOR_RADIUS) {
+        yawTenths = (360.0f - static_cast<float>(carrier->object->azymuth)) * 10.0f;
+        return true;
+    }
+    return false;
+}
 void SCStrike::setCameraFront() {
     Vector3D pos = {this->new_position.x, this->new_position.y, this->new_position.z};
     camera->SetPosition(&pos);
@@ -1658,9 +2542,27 @@ void SCStrike::setCameraFront() {
         -tenthOfDegreeToRad(this->player_plane->azimuthf),
         -tenthOfDegreeToRad(this->player_plane->twist)
     );
+    static int align_debug_count = 0;
+    if (align_debug_count < 10) {
+        align_debug_count++;
+        printf("DEBUG ALIGN(FRONT): player yaw=%.1f azimuthf=%.1f pitch=%.1f elevationf=%.1f roll=%.1f twist=%.1f player_azymuth_raw=%u player_pos=(%.1f,%.1f,%.1f)\n",
+               this->player_plane->yaw, this->player_plane->azimuthf,
+               this->player_plane->pitch, this->player_plane->elevationf,
+               this->player_plane->roll, this->player_plane->twist,
+               (unsigned)this->player_plane->object->azymuth,
+               this->player_plane->x, this->player_plane->y, this->player_plane->z);
+        for (auto a : this->current_mission->actors) {
+            if (a->object->entity != nullptr && a->object->entity->flight_deck_entity != nullptr) {
+                printf("DEBUG ALIGN(FRONT): carrier '%s' azymuth_raw=%u pitch=%d roll=%d pos=(%.1f,%.1f,%.1f)\n",
+                       a->actor_name.c_str(), (unsigned)a->object->azymuth,
+                       (int)a->object->pitch, (int)a->object->roll,
+                       a->object->position.x, a->object->position.y, a->object->position.z);
+            }
+        }
+    }
 }
 void SCStrike::setCameraFollow(SCPlane *plane) {
-    const float distanceBehind = -60.0f;
+    const float distanceBehind = -65.0f;
     float r_azim = tenthOfDegreeToRad(plane->azimuthf);
     float r_elev = tenthOfDegreeToRad(plane->elevationf-100.0f);
     float r_twist = tenthOfDegreeToRad(plane->twist);
@@ -1686,6 +2588,28 @@ void SCStrike::setCameraFollow(SCPlane *plane) {
     } else {
         camera->lookAt(&camLookAt);
     }
+}
+void SCStrike::setCameraBelow(SCPlane *plane) {
+    float r_azim = tenthOfDegreeToRad(plane->azimuthf);
+    float r_elev = tenthOfDegreeToRad(plane->elevationf);
+    float r_twist = tenthOfDegreeToRad(plane->twist);
+    float cosT = cos(r_twist), sinT = sin(r_twist);
+    float cosE = cos(r_elev), sinE = sin(r_elev);
+    float cosA = cos(r_azim), sinA = sin(r_azim);
+    Vector3D up;
+    up.x = -cosA * sinT + sinA * sinE * cosT;
+    up.y = cosE * cosT;
+    up.z = sinA * sinT + cosA * sinE * cosT;
+
+    const float distanceBelow = 60.0f;
+    Vector3D camPos = {
+        plane->x - up.x * distanceBelow,
+        plane->y - up.y * distanceBelow,
+        plane->z - up.z * distanceBelow
+    };
+    camera->SetPosition(&camPos);
+    Vector3D camLookAt = {plane->x, plane->y, plane->z};
+    camera->lookAt(&camLookAt, &up);
 }
 void SCStrike::setCameraRLR() {
     camera->SetPosition(&this->new_position);
@@ -1792,17 +2716,68 @@ void SCStrike::runFrame(void) {
     Renderer.setLight(&this->light);
     if (!this->pause_simu && this->camera_mode!=View::AUTO_PILOT) {
         this->mfd_timeout--;
-        this->player_plane->Simulate();
-        this->current_mission->update();
-        if (this->current_mission->mission_over && this->current_mission->mission_won) {
-            this->Mixer.playMusic(13); // play victory music
-        } else if (this->current_mission->mission_over && !this->current_mission->mission_won) {
-            this->Mixer.playMusic(12); // play victory music
-        } else if (this->current_mission->in_combat) {
-            this->Mixer.playMusic(5);
-        } else {
-            this->Mixer.playMusic(this->current_mission->mission->mission_data.tune+1);
+        // While docked, force the plane's actual simulated heading (not
+        // just the camera's rendered one — see getDockedCarrierYawTenths)
+        // to match the carrier's, otherwise the visual forward direction
+        // (camera, now aligned to the carrier) and the physics forward
+        // direction (ptw/thrust, still built from the player's own
+        // unreliable spawn yaw) disagree and the ship appears to drift
+        // sideways relative to what's on screen.
+        float dockedYawTenths;
+        bool isDocked = this->getDockedCarrierYawTenths(dockedYawTenths);
+        if (isDocked) {
+            this->player_plane->yaw = dockedYawTenths;
         }
+        // Grey motion-dust particles (see SCRenderer::renderSpaceDust) —
+        // shouldn't appear while still inside the TCS Victory's hangar bay,
+        // only once the player has actually flown out into open space.
+        // show_starfield is already only true for WC3 space missions (set
+        // in WC3Strike::setMission), so gating on it here keeps this base,
+        // game-agnostic SCStrike::runFrame() from needing to know anything
+        // WC3-specific.
+        // Disabled for now (user request, 2026-07 session): the respawn
+        // logic in SCRenderer::renderSpaceDust() makes particles look like
+        // they're randomly jumping around rather than a static field the
+        // player flies through, and the first attempt at fixing that
+        // (biasing respawn direction using a per-frame camera-position
+        // delta) broke ship movement for a reason that wasn't diagnosed —
+        // see the "SCRenderer camera/movement coupling" memory. Revisit
+        // with a different approach; the plain
+        // `Renderer.show_starfield && !isDocked` gate below is what this
+        // should go back to once that's sorted.
+        Renderer.show_dust = false;
+        this->player_plane->Simulate();
+        // current_mission->update()'s own per-actor loop keeps every AI
+        // actor's MISN_PART orientation (object->azymuth/pitch/roll) synced
+        // from its live SCPlane each tick, but explicitly skips the player
+        // (physics for the player runs separately, above). Nothing else
+        // ever wrote these back for the player's own object, so
+        // player->object->azymuth stayed frozen at its mission-start spawn
+        // heading no matter how the player actually turned — silently
+        // breaking anything that reads the player's MISN_PART facing (e.g.
+        // updateAutoTarget's ClassifyHitQuadrant call, right below, which
+        // was therefore checking the player's aspect against a heading that
+        // never changed). Mirrors the exact conversion SCMission.cpp's AI
+        // loop uses for its own actors.
+        if (this->player_plane->object != nullptr) {
+            this->player_plane->object->azymuth = 360 - (uint16_t)(this->player_plane->azimuthf / 10.0f);
+            this->player_plane->object->pitch = (uint16_t)(this->player_plane->elevationf / 10.0f);
+            this->player_plane->object->roll = (uint16_t)(this->player_plane->twist / 10.0f);
+        }
+        this->current_mission->update();
+        this->updateAutoTarget();
+        this->updateNavPoint();
+        // 3-state AUTO light (user-confirmed real WC3 behavior, 2026-07
+        // session): on before the player has left the hangar bay (ready to
+        // take off), on again once landing clearance is granted (ready to
+        // land), and reflecting the normal enemy-proximity gate the rest of
+        // the mission.
+        if (!this->current_mission->has_left_carrier_bay || this->current_mission->landing_clearance_granted) {
+            this->cockpit->autopilot_available = true;
+        } else {
+            this->cockpit->autopilot_available = this->CanEngageAutopilot();
+        }
+        this->updateMissionMusic();
         if (this->current_mission->mission_ended) {
             GameState.missions_flags.clear();
             GameState.missions_flags.shrink_to_fit();
@@ -1833,6 +2808,7 @@ void SCStrike::runFrame(void) {
             Screen->refresh();
             Renderer.clear();
             cleanupVirtualCockpitTextures();
+            this->onMissionEnded();
             Game->stopTopActivity();
             return;
         }
@@ -1889,12 +2865,51 @@ void SCStrike::runFrame(void) {
     Renderer.initRenderCameraView();
     switch (this->camera_mode) {
     case View::AUTO_PILOT: {
+        if (this->autopilot_sequence != AutopilotSequence::NONE) {
+            this->updateAutopilotSequence();
+            break;
+        }
         if (this->autopilot_timeout > -AUTOPILOTE_TIMEOUT) {
             this->autopilot_timeout -= AUTOPILOTE_SPEED;
-            Vector3D pos = {this->new_position.x +5, this->new_position.y + 5, 
-                this->new_position.z - (autopilot_timeout)};
+            // Real user-observed shot (2026-07 session): an angled view of
+            // the (already-teleported, stationary) ship as the camera
+            // itself sweeps past it, continuously rotating via lookAt to
+            // track it — the +5/+5 lateral offset this used to have was too
+            // small to read as "angled" at this scale (the camera's Z sweep
+            // alone spans autopilot_timeout's full 1400-unit range), so the
+            // lateral offset is widened to a proper angled-flyby distance.
+            //
+            // Usually frames the player and a single wingman (real user-
+            // observed default), not just the player alone — in escort
+            // missions the "wingman" slot here is whatever ship is actually
+            // being escorted (mission-specific: usually a transport, but
+            // sometimes the Behemoth or the TCS Victory). There's no
+            // dedicated "escort target" field anywhere in the mission data
+            // model, so this reuses the same friendlies-list scan
+            // autopilotCompute() already does to teleport wingmen into
+            // formation just above — whichever active non-player friendly
+            // plane comes up first there is framed here too. Falls back to
+            // the single-ship framing if no such plane exists.
+            constexpr float kAngledOffset = 60.0f;
+            SCPlane *wingman = nullptr;
+            for (auto team : this->current_mission->friendlies) {
+                if (team->is_active && team->plane != nullptr && team->plane != this->player_plane) {
+                    wingman = team->plane;
+                    break;
+                }
+            }
+            Vector3D frameCenter = this->new_position;
+            if (wingman != nullptr) {
+                frameCenter = {
+                    (this->new_position.x + wingman->x) * 0.5f,
+                    (this->new_position.y + wingman->y) * 0.5f,
+                    (this->new_position.z + wingman->z) * 0.5f
+                };
+            }
+            Vector3D pos = {frameCenter.x + kAngledOffset, frameCenter.y + kAngledOffset * 0.5f,
+                frameCenter.z - (autopilot_timeout)};
             camera->SetPosition(&pos);
-            camera->lookAt(&this->new_position);
+            camera->lookAt(&frameCenter);
         } else {
             this->player_plane->ptw.Identity();
             this->player_plane->ptw.translateM(this->player_plane->x, this->player_plane->y, this->player_plane->z);
@@ -1999,6 +3014,16 @@ void SCStrike::runFrame(void) {
         camera->SetPosition(&camPos);
         camera->lookAt(&targetPos, &up);
     } break;
+    // Real WC3 "Track Camera" (F10). World-fixed anchor set once on entry
+    // (checkKeyboard's VIEW_TRACK handler) — continuously re-aims at the
+    // player every frame as they fly past, unlike View::FOLLOW (which
+    // moves with the player) or View::TARGET (which stays at the player's
+    // own position looking outward).
+    case View::TRACK: {
+        Vector3D lookAtPos = {this->player_plane->x, this->player_plane->y, this->player_plane->z};
+        camera->SetPosition(&this->track_camera_anchor);
+        camera->lookAt(&lookAtPos);
+    } break;
     case View::REAL:
     case View::CONTROLLER_LOOK:
     default: {
@@ -2014,6 +3039,24 @@ void SCStrike::runFrame(void) {
             -tenthOfDegreeToRad(this->player_plane->azimuthf),
             -tenthOfDegreeToRad(this->player_plane->twist)
         );
+        static int align_debug_count = 0;
+        if (align_debug_count < 10) {
+            align_debug_count++;
+            printf("DEBUG ALIGN: player yaw=%.1f azimuthf=%.1f pitch=%.1f elevationf=%.1f roll=%.1f twist=%.1f player_azymuth_raw=%u player_pos=(%.1f,%.1f,%.1f)\n",
+                   this->player_plane->yaw, this->player_plane->azimuthf,
+                   this->player_plane->pitch, this->player_plane->elevationf,
+                   this->player_plane->roll, this->player_plane->twist,
+                   (unsigned)this->player_plane->object->azymuth,
+                   this->player_plane->x, this->player_plane->y, this->player_plane->z);
+            for (auto a : this->current_mission->actors) {
+                if (a->object->entity != nullptr && a->object->entity->flight_deck_entity != nullptr) {
+                    printf("DEBUG ALIGN: carrier '%s' azymuth_raw=%u pitch=%d roll=%d pos=(%.1f,%.1f,%.1f)\n",
+                           a->actor_name.c_str(), (unsigned)a->object->azymuth,
+                           (int)a->object->pitch, (int)a->object->roll,
+                           a->object->position.x, a->object->position.y, a->object->position.z);
+                }
+            }
+        }
     } break;
     }
 
@@ -2032,7 +3075,15 @@ void SCStrike::runFrame(void) {
                 continue;
             }
             if (actor->plane != nullptr) {
-                if (actor->plane != this->player_plane) {
+                // The player's own ship is normally excluded here (you're
+                // inside its cockpit, rendering the model would just block
+                // the view) — but in an external camera mode like FOLLOW
+                // (chase cam, F2/VIEW_BEHIND) it should still be drawn,
+                // otherwise there's nothing to see (confirmed by live
+                // testing: chase cam showed an empty view).
+                bool isPlayerShip = (actor->plane == this->player_plane);
+                bool showPlayerShipExternally = isPlayerShip && this->camera_mode == View::FOLLOW;
+                if (!isPlayerShip || showPlayerShipExternally) {
                     Vector3D distance = {
                         actor->plane->x - this->player_plane->x,
                         actor->plane->y - this->player_plane->y,
@@ -2067,10 +3118,37 @@ void SCStrike::runFrame(void) {
                         Renderer.renderBBox(position, bb->min, bb->max);
                         Renderer.renderBBox(position+actor->formation_pos_offset, bb->min, bb->max);
                         Renderer.renderBBox(position+actor->attack_pos_offset, bb->min, bb->max);
-                    } else {
+                    } else if (!actor->has_exploded) {
+                        // Once a fighter has exploded (has_exploded, set by
+                        // hasBeenHit/the mission's destruction finalization
+                        // — see [[project_wc3_hit_visuals_and_collision]]),
+                        // its hull mesh stops rendering entirely — only the
+                        // spawned SCDebris pieces (mission->debris, its own
+                        // render loop below) represent it from then on,
+                        // matching a real destroyed ship having nothing
+                        // left to show but wreckage.
                         actor->plane->Render();
                         if (actor->plane->alive) {
                             actor->plane->RenderSimulatedObject();
+                        }
+                        // Shield-hit visual — see the matching comment on
+                        // the non-plane (capital ship) branch below for
+                        // what this is. Same per-actor timer, just the
+                        // plane's own position/orientation convention
+                        // instead of MISN_PART's (matches renderPlaneLined's
+                        // own bbox-orientation formula above).
+                        if (actor->shield_hit_flash_timer > 0.0f) {
+                            actor->shield_hit_flash_timer -= GameTimer::getInstance().getDeltaTime();
+                            if (actor->plane->object->entity != nullptr && actor->plane->object->entity->shield != nullptr &&
+                                actor->plane->object->entity->shield->objct != nullptr) {
+                                Vector3D shieldPos = {actor->plane->x, actor->plane->y, actor->plane->z};
+                                Vector3D shieldOrientation = {
+                                    actor->plane->azimuthf / 10.0f + 90,
+                                    actor->plane->elevationf / 10.0f,
+                                    -actor->plane->twist / 10.0f
+                                };
+                                Renderer.drawModel(actor->plane->object->entity->shield->objct, Renderer.lodLevel, shieldPos, shieldOrientation);
+                            }
                         }
                     }
                     if (actor->plane->object->alive == false) {
@@ -2088,7 +3166,48 @@ void SCStrike::runFrame(void) {
                 if (distance.Length() > RENDER_DISTANCE) {
                     continue; // Skip rendering if the object is too far away
                 }
+                // Capital ships (e.g. VICTORY.IFF) carry a separate flyable-into
+                // hangar-bay interior model (RSEntity::flight_deck_entity, parsed
+                // from APPR>POLY>SUPR). Its geometry is authored directly in the
+                // parent ship's own local coordinate space (confirmed via
+                // wc-iff-loader's OBJ export: the hangar submodel is merged with
+                // translate=(0,0,0)/parent=-1, i.e. the ship's own frame, and its
+                // vertex bounding box lines up with the ship's hull), so it's
+                // rendered with the exact same world position/orientation as the
+                // ship itself rather than any separate transform. The interior
+                // tunnel mesh and the exterior hull occupy the same coordinate
+                // space and overlap heavily (both span roughly the same length).
+                // This used to pick one or the other based on proximity
+                // (interior only, once inside HANGAR_INTERIOR_RADIUS) --
+                // user-reported (2026-07 session) as "the Victory model is
+                // disappearing" when flying into the hangar, since that
+                // branch skipped the hull entirely. Hangar and hull must
+                // always render together, so always draw both: the hangar
+                // bay mouth is a genuine hole carved through the exterior
+                // hull (that's how you fly into it) -- the hull mesh itself
+                // has no geometry closing it off, since the original design
+                // relies on the interior tunnel model being visible through
+                // the opening. Draw the tunnel first so the hull (authored
+                // to be viewed from outside) depth-occludes it everywhere
+                // except the true opening, instead of the hole showing
+                // nothing at hull-only render distance.
+                if (actor->object->entity->flight_deck_entity != nullptr) {
+                    Renderer.drawModel(actor->object->entity->flight_deck_entity, Renderer.lodLevel, actor_position, actor_orientation);
+                }
                 Renderer.drawModel(actor->object->entity, Renderer.lodLevel, actor_position, actor_orientation);
+                // Shield-hit visual (RSEntity::shield->objct — SHLDFX, see
+                // [[project_wc3_shield_effect_mesh]]): drawn at the same
+                // transform as the hull itself for a brief flash whenever
+                // hasBeenHit last absorbed a hit on shield. Whole-mesh, not
+                // yet isolated to the actual hit facing (SHLDFX's own
+                // GRUP facet groups, e.g. "SHIELD"/"TOPHALF", would be
+                // needed for that — not investigated this session).
+                if (actor->shield_hit_flash_timer > 0.0f) {
+                    actor->shield_hit_flash_timer -= GameTimer::getInstance().getDeltaTime();
+                    if (actor->object->entity->shield != nullptr && actor->object->entity->shield->objct != nullptr) {
+                        Renderer.drawModel(actor->object->entity->shield->objct, Renderer.lodLevel, actor_position, actor_orientation);
+                    }
+                }
                 if (this->show_bbox) {
                     if (actor->aiming_vector.x != 0.0f || actor->aiming_vector.y != 0.0f || actor->aiming_vector.z != 0.0f) {
                         Vector3D aim_pos = {actor->aiming_vector.x, actor->aiming_vector.y, actor->aiming_vector.z};
@@ -2121,6 +3240,22 @@ void SCStrike::runFrame(void) {
                 continue;
             }
             expl->render();
+        }
+
+        float debrisDt = GameTimer::getInstance().getDeltaTime();
+        for (auto piece: this->current_mission->debris) {
+            if (piece->is_finished) {
+                this->current_mission->debris.erase(
+                    std::remove_if(
+                        this->current_mission->debris.begin(),
+                        this->current_mission->debris.end(),
+                        [](const auto& piece) { return piece->is_finished; }
+                    ),
+                    this->current_mission->debris.end());
+                continue;
+            }
+            piece->update(debrisDt);
+            piece->render();
         }
 
         this->player_plane->RenderSimulatedObject();

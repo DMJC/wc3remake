@@ -30,6 +30,11 @@ extern "C" {
 
     #include <SDL.h>
 #ifndef __APPLE__
+#  ifndef _WIN32
+#    ifndef GL_GLEXT_PROTOTYPES
+#      define GL_GLEXT_PROTOTYPES
+#    endif
+#  endif
     #include <GL/gl.h>
     #include <GL/glu.h>
 #else

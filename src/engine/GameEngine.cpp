@@ -137,7 +137,13 @@ void GameEngine::initKeyboard() {
         SimActionOfst::CONTROLLER_STICK_RIGHT_Y,
         SimActionOfst::RADAR_MODE_TOGGLE,
         SimActionOfst::RUDDER_LEFT,
-        SimActionOfst::RUDDER_RIGHT
+        SimActionOfst::RUDDER_RIGHT,
+        SimActionOfst::THROTTLE_STOP,
+        SimActionOfst::AFTERBURNER,
+        SimActionOfst::MODIFIER_SHIFT,
+        SimActionOfst::FIRE_MISSILE,
+        SimActionOfst::CYCLE_GUNS,
+        SimActionOfst::VIEW_TRACK
     };
     
     for (auto action : allActions) {
@@ -157,17 +163,40 @@ void GameEngine::initKeyboard() {
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::THROTTLE_90), SDL_SCANCODE_9);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::THROTTLE_100), SDL_SCANCODE_0);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::AUTOPILOT), SDL_SCANCODE_A);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_LEFT), SDL_SCANCODE_F3);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_RIGHT), SDL_SCANCODE_F4);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_BEHIND), SDL_SCANCODE_F5);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_FORWARD), SDL_SCANCODE_F1);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::PITCH_UP), SDL_SCANCODE_UP);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::PITCH_DOWN), SDL_SCANCODE_DOWN);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::ROLL_LEFT), SDL_SCANCODE_LEFT);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::ROLL_RIGHT), SDL_SCANCODE_RIGHT);
+    // F1 moved to CYCLE_COCKPIT_VIEW; LOOK_FORWARD relocated to F12 (the one
+    // free function key) to make room.
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::CYCLE_COCKPIT_VIEW), SDL_SCANCODE_F1);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_FORWARD), SDL_SCANCODE_F12);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_LEFT), SDL_SCANCODE_F2);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_RIGHT), SDL_SCANCODE_F3);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOOK_BEHIND), SDL_SCANCODE_F4);
+    // Down arrow = Pitch Up, Up arrow = Pitch Down — matches WC3's real
+    // (joystick-pull-back-style) control scheme per live confirmation,
+    // not the naive up=up mapping.
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::PITCH_UP), SDL_SCANCODE_DOWN);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::PITCH_DOWN), SDL_SCANCODE_UP);
+    // Left/Right arrows = Yaw (not Roll) — Roll lives on comma/period below.
+    // Swapped from the naive left=LEFT/right=RIGHT mapping per live
+    // testing feedback (yaw direction itself confirmed correct once the
+    // world-relative-yaw fix landed, but left/right were backwards).
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::RUDDER_LEFT), SDL_SCANCODE_RIGHT);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::RUDDER_RIGHT), SDL_SCANCODE_LEFT);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_PRIMARY), SDL_SCANCODE_SPACE);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_MOUSE), SDL_SCANCODE_M);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LANDING_GEAR), SDL_SCANCODE_L);
+    // Guns on Space, missiles/torpedo on Enter — real WC-series controls,
+    // not a single fire button (see FIRE_MISSILE's own comment).
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_MISSILE), SDL_SCANCODE_RETURN);
+    // Moved off M — M is now bound to MDFS_WEAPONS below (real WC3 control:
+    // G cycles gun type, M cycles missile/ordnance hardpoint).
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_MOUSE), SDL_SCANCODE_U);
+    // M cycles which missile/ordnance hardpoint FIRE_MISSILE/Enter fires —
+    // same action W already triggers (MDFS_WEAPONS' cycling handler,
+    // SCStrike.cpp, updates selected_weapon); bound additively, not a
+    // replacement for W.
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS), SDL_SCANCODE_M);
+    // LANDING_GEAR moved off L to O so L is free for LOCK_TARGET (real WC3
+    // uses L for target lock).
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LANDING_GEAR), SDL_SCANCODE_O);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LOCK_TARGET), SDL_SCANCODE_L);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_BRAKES), SDL_SCANCODE_B);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_FLAPS), SDL_SCANCODE_F);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::TARGET_NEAREST), SDL_SCANCODE_T);
@@ -186,28 +215,60 @@ void GameEngine::initKeyboard() {
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M4), SDL_SCANCODE_4);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M5), SDL_SCANCODE_5);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_TARGET), SDL_SCANCODE_F7);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_BEHIND), SDL_SCANCODE_F2);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_BEHIND), SDL_SCANCODE_F5);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_COCKPIT), SDL_SCANCODE_F6);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_WEAPONS), SDL_SCANCODE_F8);
+    // Real WC3 F9 is WRLD>CAMR>VCTC, "Victim Camera" (user-confirmed
+    // 2026-07 session) — this action predates knowing that real name, but
+    // its behavior (an inset MFD panel showing the current target/victim,
+    // SCCockpit::show_cam) already matches: not a full camera_mode switch
+    // like CHAS/WEAP/TRAK, just a picture-in-picture toggle, which is
+    // exactly the shape real WC3's F9 has. Left under its existing name to
+    // avoid an unnecessary rename across every call site.
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_TARGET_CAMERA), SDL_SCANCODE_F9);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::SPEC_KEY_1), SDL_SCANCODE_F10);
+    // Real WC3 F10 is WRLD>CAMR>TRAK, "Track Camera" (user-confirmed
+    // 2026-07 session) — moved SPEC_KEY_1 (a mission-force-end debug cheat,
+    // not a real WC3 control at all) off F10 onto X to make room.
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_TRACK), SDL_SCANCODE_F10);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::SPEC_KEY_1), SDL_SCANCODE_X);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::SPEC_KEY_2), SDL_SCANCODE_F11);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::PAUSE), SDL_SCANCODE_P);
+    // PAUSE moved off P so P is free for MDFS_POWER (left MFD power meters).
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::PAUSE), SDL_SCANCODE_E);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_POWER), SDL_SCANCODE_P);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_SHIELD), SDL_SCANCODE_S);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::EYES_ON_TARGET), SDL_SCANCODE_Y);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::END_MISSION), SDL_SCANCODE_ESCAPE);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::RUDDER_LEFT), SDL_SCANCODE_COMMA);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::RUDDER_RIGHT), SDL_SCANCODE_PERIOD);
+    // Comma/period = Roll (not rudder/yaw) — see PITCH_UP/RUDDER_LEFT
+    // bindings above for the arrow-key remap this pairs with.
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::ROLL_LEFT), SDL_SCANCODE_COMMA);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::ROLL_RIGHT), SDL_SCANCODE_PERIOD);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MODIFIER_SHIFT), SDL_SCANCODE_LSHIFT);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MODIFIER_SHIFT), SDL_SCANCODE_RSHIFT);
     m_keyboard->bindMousePositionToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MOUSE_X), 0, 1.0f);
     m_keyboard->bindMousePositionToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MOUSE_Y), 1, 1.0f);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M6),SDL_SCANCODE_6);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M7),SDL_SCANCODE_7);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M8),SDL_SCANCODE_8);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::RADAR_MODE_TOGGLE), SDL_SCANCODE_V);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::WEAPON_MODE_TOGGLE), SDL_SCANCODE_G);
+    // Moved off G — G is now CYCLE_GUNS (real WC3 gun-type-select control,
+    // see CYCLE_GUNS's own comment).
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::WEAPON_MODE_TOGGLE), SDL_SCANCODE_H);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::CYCLE_GUNS), SDL_SCANCODE_G);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::INFINIT_AMMO_TOGGLE), SDL_SCANCODE_I);
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::SINGLE_TARGET_MODE), SDL_SCANCODE_K);
-    
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::THROTTLE_STOP), SDL_SCANCODE_BACKSPACE);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::THROTTLE_100), SDL_SCANCODE_BACKSLASH);
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::AFTERBURNER), SDL_SCANCODE_TAB);
+
     m_keyboard->bindGamepadButtonToAction(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_PRIMARY), 0, SDL_CONTROLLER_BUTTON_A);
+    // Real HOTAS/flight-stick trigger convention: button 1 = guns, button 2
+    // = missiles — SDL joystick buttons are 0-indexed internally, so
+    // "button 1"/"button 2" map to indices 0/1 here. Separate from the
+    // SDL_CONTROLLER_BUTTON_* gamepad bindings above/below, which target
+    // Xbox/PlayStation-style pads via SDL's GameController abstraction
+    // rather than a raw joystick device.
+    m_keyboard->bindJoystickButtonToAction(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_PRIMARY), 0, 0);
+    m_keyboard->bindJoystickButtonToAction(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_MISSILE), 0, 1);
     m_keyboard->bindGamepadButtonToAction(CreateAction(InputAction::SIM_START, SimActionOfst::TARGET_NEAREST), 0, SDL_CONTROLLER_BUTTON_B);
     m_keyboard->bindGamepadButtonToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_RADAR), 0, SDL_CONTROLLER_BUTTON_X);
     m_keyboard->bindGamepadButtonToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS), 0, SDL_CONTROLLER_BUTTON_Y);
@@ -315,6 +376,8 @@ void GameEngine::run() {
     while (activities.size() > 0) {
         GameTimer::getInstance().update();
         pumpEvents();
+
+        if (m_globalHotkeyCheck) m_globalHotkeyCheck();
 
         currentActivity = activities.top();
         if (currentActivity->isRunning()) {

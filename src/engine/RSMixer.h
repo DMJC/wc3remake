@@ -34,6 +34,12 @@ public:
     void init();
     void playMusic(uint32_t index, int loop=1);
     void playMusic(MemMusic *mus, int loop=1);
+    // Plays a raw Standard MIDI File already sitting in memory (e.g. a track
+    // decoded from WC3's HMI-format music paks — see WC3MusicPak). Shares
+    // currentMusicPtr with playMusic(uint32_t) above, so starting one stops
+    // the other, matching the rest of this class's single-track-at-a-time
+    // behavior.
+    void playMidiFromMemory(const uint8_t *data, size_t size, int loop = -1);
     void switchBank(uint8_t bank);
     void stopMusic();
     uint32_t getMusicID() { return this->current_music; };

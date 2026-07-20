@@ -2,6 +2,9 @@
 #include "SCMissionActors.h"
 #include <cstdlib>
 #include <ctime>
+#include <algorithm>
+#include <cmath>
+#include <unordered_set>
 
 bool SCMissionActors::wait(int seconds) {
     if (this->current_command != prog_op::OP_SET_WAIT_FOR_SECONDS) {
@@ -550,29 +553,38 @@ bool SCMissionActors::setMessage(uint8_t arg) {
     if (!this->talkative) {
         return false;
     }
-    for (auto message: this->profile->radi.msgs) {
-        if (message.first == arg) {
-            std::string *message = new std::string();
-            *message = this->profile->radi.info.callsign + ": " + this->profile->radi.msgs[arg];
-            RadioMessages *msg = new RadioMessages();
-            msg->message = *message;
-            
-            if (this->mission->sound.inGameVoices.size() > 0) {
-                
-                if (this->mission->sound.inGameVoices.find(this->profile->radi.spch) != this->mission->sound.inGameVoices.end()) {
-                    if (this->mission->sound.inGameVoices[this->profile->radi.spch]->messages.find(arg) != this->mission->sound.inGameVoices[this->profile->radi.spch]->messages.end()) {
-                        MemSound *message_sound = this->mission->sound.inGameVoices[this->profile->radi.spch]->messages[arg];
-                        msg->sound = message_sound;
-                    }
-                }
-                
-                
+    bool hasText = this->profile->radi.msgs.count(arg) > 0;
+    bool hasSound = this->profile->radi.sond.count(arg) > 0;
+    if (!hasText && !hasSound) {
+        return false;
+    }
+    RadioMessages *msg = new RadioMessages();
+    msg->message = this->profile->radi.info.callsign + ": " + this->profile->radi.msgs[arg];
+
+    if (this->mission->sound.inGameVoices.size() > 0) {
+        if (this->mission->sound.inGameVoices.find(this->profile->radi.spch) != this->mission->sound.inGameVoices.end()) {
+            if (this->mission->sound.inGameVoices[this->profile->radi.spch]->messages.find(arg) != this->mission->sound.inGameVoices[this->profile->radi.spch]->messages.end()) {
+                MemSound *message_sound = this->mission->sound.inGameVoices[this->profile->radi.spch]->messages[arg];
+                msg->sound = message_sound;
             }
-            this->mission->radio_messages.push_back(msg);
-            return true;
         }
     }
-    return false;    
+    // WC3's own MISSIONS.TRE-embedded profiles carry radio audio directly
+    // (a SOND chunk keyed by the same RADI code) instead of the SC-style
+    // indirect spch+SPEECH.PAK reference above — fall back to it when that
+    // lookup found nothing.
+    if (msg->sound == nullptr && hasSound) {
+        const std::vector<uint8_t> *wav = this->profile->getRadiSoundWav(arg);
+        if (wav != nullptr) {
+            MemSound *sound_msg = new MemSound();
+            sound_msg->data = const_cast<uint8_t*>(wav->data());
+            sound_msg->size = wav->size();
+            sound_msg->id = arg;
+            msg->sound = sound_msg;
+        }
+    }
+    this->mission->radio_messages.push_back(msg);
+    return true;
 }
 /**
  * @brief Sets the current objective to follow an ally and adjusts the pilot's target waypoint, speed, and climb.
@@ -687,7 +699,19 @@ bool SCMissionActors::respondToRadioMessage(int message_id, SCMission *mission, 
                     // request take off
                 break;
                 case 'f':
-                    // request land 
+                {
+                    // "Request landing." Player-initiated, only meaningful
+                    // when talking to the carrier (SCMissionActorsStrikeBase
+                    // — e.g. WC3's "VIC"-prefixed TCS Victory entry). No
+                    // mission-objective/win-condition tracking exists yet
+                    // (nothing scores kills/objectives complete), so
+                    // clearance is granted and the mission reported as a win
+                    // unconditionally as soon as it's asked for; the actual
+                    // landing still requires the player to fly back into the
+                    // carrier's bay and slow down (see SCMission::update()).
+                    this->mission->landing_clearance_granted = true;
+                    this->setMessage(20);
+                }
                 break;
                 case 'g':
                 {
@@ -1008,35 +1032,268 @@ void SCMissionActors::shootWeapon(SCMissionActors *target) {
     this->object->entity->swpn_data->weapons_round--;
     this->weapons_shooted.push_back(weapon);
 }
+// Which of the target's 4 facings an attack came from, derived purely from
+// the target's yaw (SCMissionActors::object->azymuth) and the world-space
+// direction from the target to the attacker — pitch/roll are intentionally
+// ignored (a coarse 4-way front/back/left/right split doesn't need them,
+// and folding them in risks a 3rd independent axis-sign guess on top of two
+// already-uncertain ones below).
+//
+// Reuses the exact same heading-relative rotation already used (and
+// presumably working, since it drives the live RAWS radar contact display)
+// by SCCockpit::IdentifyRAWSContact: heading = 360 - azimuth_degrees,
+// headingRad = heading/180*pi, then Vector2D::rotateAroundPoint(origin,
+// headingRad) on the world-space (x,z) offset — see SCCockpit.cpp:1017,
+// 1881, 1357. Applied here with the TARGET's own azymuth instead of the
+// player's heading. Which axis of the rotated result maps to "ahead"
+// (local Y here, matching that same code's own convention) vs "right"
+// (local X) is NOT independently re-verified for this new use — it's
+// inherited from that existing, in-use radar code rather than derived
+// fresh, to avoid guessing a 4th axis convention from scratch in an area
+// that has repeatedly gotten this kind of thing wrong on the first try
+// this session (turret axes, afterburner mount, vertex winding, etc.).
+// Needs live confirmation (attack a target head-on and check the front
+// shield/armor actually drops, not a side one).
+HitQuadrant SCMissionActors::ClassifyHitQuadrant(SCMissionActors *target, const Vector3D &attackerPos) {
+    float targetHeadingDeg = 360.0f - (float)target->object->azymuth;
+    float targetHeadingRad = targetHeadingDeg / 180.0f * (float)M_PI;
+    Vector2D toAttacker = {
+        attackerPos.x - target->object->position.x,
+        attackerPos.z - target->object->position.z
+    };
+    Vector2D local = toAttacker.rotateAroundPoint({0, 0}, targetHeadingRad);
+    if (fabsf(local.y) >= fabsf(local.x)) {
+        return local.y >= 0.0f ? HitQuadrant::Front : HitQuadrant::Back;
+    }
+    return local.x >= 0.0f ? HitQuadrant::Right : HitQuadrant::Left;
+}
+bool SCMissionActors::IsCapitalShipName(const std::string &upperName) {
+    // Prefix match, not exact: real transport PART records come in several
+    // hull-type suffixed variants (TTRANSC, TTRANSCS, ...) that never
+    // matched this list under exact-string lookup (2026-07 session, found
+    // while cross-referencing every campaign mission's capital-ship PART
+    // records for the friend/foe fallback below) — every other prefix here
+    // is a real, distinct WC3 namespace (K = Kilrathi, T = Terran capital/
+    // station) that doesn't collide with any fighter model name.
+    static const std::vector<std::string> kCapitalPrefixes = {
+        "VICTORY", "SHUTTLE", "BEHEMOTH", "KCORV", "KCRUISER", "KDESTL", "KDEST",
+        "KTRN", "KDREAD", "KCARRIER", "TCRUISER", "TDEST", "TTRANS", "KASBASE",
+        "EKAPSHI", "KTRAND", "KSGENR",
+        // TBASE ("star base"/"Blackmane base" — user-confirmed 2026-07
+        // session): the Confederation station, grouped with the other
+        // friendly capital-tier entities for radar/marker purposes.
+        "TBASE",
+    };
+    for (auto &prefix : kCapitalPrefixes) {
+        if (upperName.rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+}
+bool SCMissionActors::IsKilrathiShipName(const std::string &upperName) {
+    static const std::unordered_set<std::string> kKilrathiNames = {
+        "KCORV", "KCRUISER", "KDESTL", "KDEST", "KTRN", "KDREAD", "KCARRIER",
+        "KASBASE", "EKAPSHI", "KTRAND", "KSGENR",
+        // Kilrathi fighters (TargShapeIndex::kShipNameToIndex) — species,
+        // not just capital ships, so any future non-capital fallback use
+        // classifies these correctly too.
+        "DRALTHI", "VAKTOTH", "BLOODFNG", "STRAKHA", "PAKTAHN",
+    };
+    return kKilrathiNames.count(upperName) > 0;
+}
+bool SCMissionActors::IsFriendlySupplyStructureName(const std::string &upperName) {
+    // Jump buoys (JUMPLG/JUMPMD/JUMPSM — large/medium/small variants) and
+    // asteroid supply depots (DEPOT) — user-confirmed (2026-07 session):
+    // neutral/friendly navigation structures, not ships, so kept separate
+    // from IsCapitalShipName (which also drives the target-radar cross-vs-
+    // dot marker and the autopilot capital-ship gate — these aren't
+    // "capital ships" in either of those senses, just always-friendly
+    // for radar-color purposes).
+    static const std::vector<std::string> kPrefixes = {"JUMPLG", "JUMPMD", "JUMPSM", "DEPOT"};
+    for (auto &prefix : kPrefixes) {
+        if (upperName.rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+}
+const std::vector<ShipComponent> &SCMissionActors::ComponentsForQuadrant(HitQuadrant quadrant) {
+    static const std::vector<ShipComponent> kFront = {
+        ShipComponent::VDU1, ShipComponent::VDU2, ShipComponent::TacticalDisplay};
+    static const std::vector<ShipComponent> kRight = {
+        ShipComponent::Communications, ShipComponent::Shields, ShipComponent::AutoRepair};
+    static const std::vector<ShipComponent> kBack = {
+        ShipComponent::Afterburners, ShipComponent::PowerPlant, ShipComponent::Engine};
+    static const std::vector<ShipComponent> kLeft = {
+        ShipComponent::Targeting, ShipComponent::Guns};
+    switch (quadrant) {
+        case HitQuadrant::Front: return kFront;
+        case HitQuadrant::Right: return kRight;
+        case HitQuadrant::Back:  return kBack;
+        case HitQuadrant::Left:  return kLeft;
+    }
+    return kFront;
+}
+bool SCMissionActors::IsComponentRepairable(ShipComponent component) {
+    return component != ShipComponent::VDU1 && component != ShipComponent::VDU2 &&
+           component != ShipComponent::TacticalDisplay;
+}
+void SCMissionActors::RollComponentDamage(HitQuadrant quadrant, int overflowDamage) {
+    // No-op on the base class — only SCMissionActorsPlayer tracks internal
+    // components at all (see ShipComponent's own comment).
+}
+void SCMissionActors::TickComponentRepair() {
+    // No-op on the base class — see RollComponentDamage's own comment.
+}
+void SCMissionActors::UpdateCloak(float dt) {
+    if (this->object == nullptr || this->object->entity == nullptr ||
+        this->object->entity->clok == nullptr || this->plane == nullptr) {
+        return;
+    }
+    // User-confirmed (2026-07 session): the Skipper Missile (SKIPMISS, a
+    // real CAST/PART mission actor — not a fired SCSimulatedObject weapon,
+    // confirmed via MISNA004.IFF's own CAST list) "drops in and out of
+    // cloak every 5 seconds to prevent missile lock" — matches its raw
+    // CLOK duration field (5) exactly, so no override needed here (an
+    // earlier hardcoded 3.0f override, based on an initial "every 3
+    // seconds" report, was removed once the confirmed value turned out to
+    // match the file after all).
+    float duration = (float)this->object->entity->clok->duration;
+    if (duration <= 0.0f) {
+        return;
+    }
+    this->cloak_timer += dt;
+    float period = duration * 2.0f;
+    float phase = fmodf(this->cloak_timer, period);
+    this->plane->cloaked = (phase < duration);
+}
 void SCMissionActors::hasBeenHit(SCSimulatedObject *weapon, SCMissionActors *attacker) {
-    int damage = 10;
-    this->health = 0;
     if (this->object->alive == false) {
         return;
     }
-    if (this->health <= 0 && this->object->alive) {
-        if (this->profile != nullptr && this->profile->radi.msgs.size() > 0) {
-            std::srand(std::time(0));
-            int r = std::rand() % 16;
-            if (r<=this->profile->ai.atrb.VB) {
-                int message = std::rand() % 4;
-                this->setMessage(23 + message); // Bail out messages
-            }
+    // Was `this->health = 0;` unconditionally — any single hit (even a
+    // stray 20mm round) instantly destroyed the target regardless of its
+    // actual max health, so there was never any gradual shield/hull
+    // depletion to show on a gauge. WDAT::damage (RSEntity.h) is the real
+    // per-hit damage value, already parsed from the weapon's own IFF data
+    // (RSEntity.cpp's WDAT parser) — use it instead.
+    int damage = (weapon != nullptr && weapon->obj != nullptr && weapon->obj->wdat != nullptr)
+        ? weapon->obj->wdat->damage
+        : 10;
+    // Per-quadrant shield/armor (see SCMissionActors.h) gate the flat
+    // `health` scalar below instead of running in parallel with it — per
+    // the WC3 manual's damage model: "damage does not begin to accrue to
+    // armor until that side's shields are completely down, and the ship
+    // itself doesn't start to take damage until all the armor on a side
+    // is gone, and the shield is completely down." Shield absorbs first,
+    // then armor, and only whatever's left over after both are exhausted
+    // on this hit's facing reaches `health`. Entities with no SHLD chunk
+    // have max_shield_*/max_armor_* (and so shield_*/armor_*) stuck at 0,
+    // so this degrades to "every hit goes straight to health" for them —
+    // the same behavior as before this change, just reached explicitly
+    // instead of via the old unconditional `health -= damage`.
+    Vector3D attackerPos = this->object->position;
+    if (attacker != nullptr && attacker->object != nullptr) {
+        attackerPos = attacker->object->position;
+    } else if (weapon != nullptr) {
+        attackerPos = {weapon->x, weapon->y, weapon->z};
+    }
+    HitQuadrant quadrant = ClassifyHitQuadrant(this, attackerPos);
+    float *facingShield = &this->shield_front;
+    float *facingArmor = &this->armor_front;
+    switch (quadrant) {
+        case HitQuadrant::Front: facingShield = &this->shield_front; facingArmor = &this->armor_front; break;
+        case HitQuadrant::Back:  facingShield = &this->shield_back;  facingArmor = &this->armor_back;  break;
+        case HitQuadrant::Left:  facingShield = &this->shield_left;  facingArmor = &this->armor_left;  break;
+        case HitQuadrant::Right: facingShield = &this->shield_right; facingArmor = &this->armor_right; break;
+    }
+    float remainingDamage = (float)damage;
+    if (*facingShield > 0.0f) {
+        float absorbed = (std::min)(*facingShield, remainingDamage);
+        *facingShield -= absorbed;
+        remainingDamage -= absorbed;
+        // See shield_hit_flash_timer's own comment (SCMissionActors.h).
+        this->shield_hit_flash_timer = 0.3f;
+    }
+    if (remainingDamage > 0.0f && *facingArmor > 0.0f) {
+        float absorbed = (std::min)(*facingArmor, remainingDamage);
+        *facingArmor -= absorbed;
+        remainingDamage -= absorbed;
+    }
+    if (remainingDamage > 0.0f) {
+        this->health -= (int)remainingDamage;
+        // Only a genuine hull hit (shield+armor both already exhausted on
+        // this facing) gives internal components a chance to take damage —
+        // matches the manual's "each time a ship takes a hit that gets
+        // through armor and shields and damages the ship itself, there is
+        // a chance that some internal components will be damaged."
+        this->RollComponentDamage(quadrant, (int)remainingDamage);
+    }
+    if (this->health > 0) {
+        return;
+    }
+    this->health = 0;
+    if (this->profile != nullptr && this->profile->radi.msgs.size() > 0) {
+        std::srand(std::time(0));
+        int r = std::rand() % 16;
+        if (r<=this->profile->ai.atrb.VB) {
+            int message = std::rand() % 4;
+            this->setMessage(23 + message); // Bail out messages
         }
     }
     this->object->alive = false;
-    if (this->object->entity->explos != nullptr) {
+    // Death scream, RADI code 0x0A. WC3's own profiles also carry a 0x39
+    // low-morale variant of the same scream (see PROFILE\SOUND's RADI code
+    // table), but nothing in this engine tracks wingman morale yet — see
+    // todo.MD — so this always plays the high-morale one.
+    if (this->profile != nullptr) {
+        this->setMessage(0x0A);
+    }
+    if (!this->has_exploded && this->object->entity->explos != nullptr) {
+        this->has_exploded = true;
         SCExplosion *explosion = new SCExplosion(this->object->entity->explos->objct, this->object->position);
         this->mission->explosions.push_back(explosion);
-        if (this->mission->sound.sounds.size() > 0) {   
+        if (this->mission->sound.sounds.size() > 0) {
+            // weapon/weapon->obj can be null here (see the damage calc
+            // above, which already guards the same pointers) — a target
+            // can die from other causes routed through this same death
+            // branch, not just a gun/missile hit with a live weapon object.
             MemSound *sound;
-            if (weapon->obj->entity_type == EntityType::tracer) {
+            if (weapon != nullptr && weapon->obj != nullptr && weapon->obj->entity_type == EntityType::tracer) {
                 sound = this->mission->sound.sounds[SoundEffectIds::GUN_IMPACT_1];
             } else {
                 sound = this->mission->sound.sounds[SoundEffectIds::EXPLOSION_1];
             }
             RSMixer::getInstance().playSoundVoc(sound->data, sound->size);
         }
+    }
+    // Wreckage pieces (RSEntity::debris, OBJT>...>DEBR) — one SCDebris per
+    // defined piece, spawned at the ship's own position offset by the
+    // piece's own authored offset, scattering with a random velocity
+    // within the piece's own authored range (space combat — no gravity to
+    // pull them down). Held at the ship's death-moment orientation; no
+    // tumble/spin simulated yet.
+    Vector3D deathOrientation = {
+        (360.0f - (float)this->object->azymuth + 90.0f),
+        (float)this->object->pitch,
+        -(float)this->object->roll
+    };
+    for (auto piece : this->object->entity->debris) {
+        if (piece == nullptr || piece->objct == nullptr) {
+            continue;
+        }
+        Vector3D piecePos = {
+            this->object->position.x + (float)piece->offset_x,
+            this->object->position.y + (float)piece->offset_y,
+            this->object->position.z + (float)piece->offset_z
+        };
+        auto randomInRange = [](int16_t range) -> float {
+            if (range == 0) return 0.0f;
+            return ((float)(std::rand() % 2001 - 1000) / 1000.0f) * (float)range;
+        };
+        Vector3D pieceVel = {
+            randomInRange(piece->velocity_range_x),
+            randomInRange(piece->velocity_range_y),
+            randomInRange(piece->velocity_range_z)
+        };
+        this->mission->debris.push_back(new SCDebris(piece->objct, piecePos, pieceVel, deathOrientation));
     }
     attacker->score += 100;
     if (this->plane != nullptr) {
@@ -1169,8 +1426,128 @@ bool SCMissionActorsPlayer::setMessage(uint8_t arg) {
 }
 
 void SCMissionActorsPlayer::hasBeenHit(SCSimulatedObject *weapon, SCMissionActors *attacker) {
-    // for the moment, the player cannot be hit
-    return;
+    // Was a no-op stub ("the player cannot be hit"). The base class already
+    // does the right thing generically (health=0, object->alive=false once,
+    // guarded against re-triggering — see its own `if (object->alive ==
+    // false) return;`  — radio scream, score/kill-count for the attacker,
+    // explosion+sound): reuse it instead of special-casing the player.
+    // WC3Strike::checkDeathTrigger() polls object->alive each frame and
+    // plays RSCockpit::deathFrames (the same overlay-compositing path as
+    // the Ctrl+E eject sequence) once it goes false.
+    SCMissionActors::hasBeenHit(weapon, attacker);
+}
+
+void SCMissionActorsPlayer::UpdatePlanePowerFractions() {
+    if (this->plane == nullptr) {
+        return;
+    }
+    this->plane->engine_power_fraction =
+        1.0f - this->component_damage[(size_t)ShipComponent::Engine] / 100.0f;
+    this->plane->gun_power_fraction =
+        1.0f - this->component_damage[(size_t)ShipComponent::PowerPlant] / 100.0f;
+}
+
+// Manual: "Each time a ship takes a hit that gets through armor and
+// shields and damages the ship itself, there is a chance that some
+// internal components will be damaged ... Damage is somewhat randomly
+// allocated among components on the side, but the probabilities are
+// weighted so that the components listed first in the table above are
+// most likely to go down first, and the ones listed last will probably
+// go down last ... It is also possible for the randomization process to
+// cause the ship to take structural damage without any of the internal
+// components being damaged at all."
+void SCMissionActorsPlayer::RollComponentDamage(HitQuadrant quadrant, int overflowDamage) {
+    if (overflowDamage <= 0) {
+        return;
+    }
+    const std::vector<ShipComponent> &candidates = SCMissionActors::ComponentsForQuadrant(quadrant);
+    // Flat chance of pure structural damage with no component hit at all —
+    // exact rate not given by the manual, chosen to make component damage
+    // common but not guaranteed.
+    constexpr int kNoComponentDamagePercent = 40;
+    if ((std::rand() % 100) < kNoComponentDamagePercent) {
+        return;
+    }
+    // Weighted pick favoring earlier list entries: a 3-component facing
+    // gets weights 3/2/1 (first is 3x as likely as last), a 2-component
+    // facing gets 2/1.
+    int totalWeight = 0;
+    for (size_t i = 0; i < candidates.size(); i++) {
+        totalWeight += (int)(candidates.size() - i);
+    }
+    if (totalWeight <= 0) {
+        return;
+    }
+    int roll = std::rand() % totalWeight;
+    size_t chosenIndex = candidates.size() - 1;
+    int cumulative = 0;
+    for (size_t i = 0; i < candidates.size(); i++) {
+        cumulative += (int)(candidates.size() - i);
+        if (roll < cumulative) {
+            chosenIndex = i;
+            break;
+        }
+    }
+    ShipComponent chosen = candidates[chosenIndex];
+    float &dmg = this->component_damage[(size_t)chosen];
+    if (dmg >= 100.0f) {
+        return; // already fully (and permanently) destroyed
+    }
+    dmg = (std::min)(100.0f, dmg + (float)overflowDamage);
+    this->UpdatePlanePowerFractions();
+    // "If the power plant or engine is totally destroyed, the ship blows
+    // up." Route through the normal health-reaches-0 death path in the
+    // caller (hasBeenHit) rather than duplicating its death handling
+    // (radio scream, object->alive, score) here.
+    if (dmg >= 100.0f &&
+        (chosen == ShipComponent::PowerPlant || chosen == ShipComponent::Engine)) {
+        this->health = 0;
+    }
+}
+
+// Manual: "Ships' repair systems will automatically repair most
+// components, except those mounted in front (VDU 1, VDU 2 and the
+// tactical display), which cannot be repaired. Also, any component
+// that's completely destroyed (has taken a full 100 points of damage)
+// cannot be repaired." A destroyed AutoRepair component can't repair
+// anything, including itself (it's just another component subject to the
+// same "100 = permanently gone" rule).
+void SCMissionActorsPlayer::TickComponentRepair() {
+    if (this->component_damage[(size_t)ShipComponent::AutoRepair] >= 100.0f) {
+        return;
+    }
+    // Power Plant damage "lowers available power to ... damage repair" —
+    // scale the repair rate down the same way GetCurrentGunEnergy() scales
+    // gun recharge (see gun_power_fraction's own comment in SCPlane.h).
+    float powerPlantFraction =
+        1.0f - this->component_damage[(size_t)ShipComponent::PowerPlant] / 100.0f;
+    // Rate not given by the manual — chosen so a fully-damaged repairable
+    // component (100 points) heals in ~30s at a typical ~60 ticks/sec,
+    // not independently confirmed against real WC3 timing.
+    constexpr float kRepairPointsPerTick = 0.05f;
+    float repairAmount = kRepairPointsPerTick * powerPlantFraction;
+    if (repairAmount <= 0.0f) {
+        return;
+    }
+    bool changed = false;
+    for (size_t i = 0; i < (size_t)ShipComponent::Count; i++) {
+        ShipComponent component = (ShipComponent)i;
+        if (!SCMissionActors::IsComponentRepairable(component)) {
+            continue;
+        }
+        float &dmg = this->component_damage[i];
+        if (dmg <= 0.0f || dmg >= 100.0f) {
+            continue;
+        }
+        dmg -= repairAmount;
+        if (dmg < 0.0f) {
+            dmg = 0.0f;
+        }
+        changed = true;
+    }
+    if (changed) {
+        this->UpdatePlanePowerFractions();
+    }
 }
 
 bool SCMissionActorsStrikeBase::setMessage(uint8_t arg) {
@@ -1185,6 +1562,19 @@ bool SCMissionActorsStrikeBase::setMessage(uint8_t arg) {
         }
         MemSound *message_sound = this->mission->sound.inGameVoices[this->profile->radi.spch]->messages[arg];
         msg->sound = message_sound;
+    }
+    // Same WC3 SOND fallback as SCMissionActors::setMessage above (capital
+    // ships like the Victory carry their own MISSIONS.TRE-embedded profile
+    // too).
+    if (msg->sound == nullptr && this->profile->radi.sond.count(arg) > 0) {
+        const std::vector<uint8_t> *wav = this->profile->getRadiSoundWav(arg);
+        if (wav != nullptr) {
+            MemSound *sound_msg = new MemSound();
+            sound_msg->data = const_cast<uint8_t*>(wav->data());
+            sound_msg->size = wav->size();
+            sound_msg->id = arg;
+            msg->sound = sound_msg;
+        }
     }
     this->mission->radio_messages.push_back(msg);
     if (arg == 20) {

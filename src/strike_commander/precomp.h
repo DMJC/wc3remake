@@ -31,6 +31,7 @@
 // Simulation
 #include "SCSmokeSet.h"
 #include "SCExplosion.h"
+#include "SCDebris.h"
 #include "SCSimulatedObject.h"
 #include "SCPlane.h"
 #include "SCJdynPlane.h"

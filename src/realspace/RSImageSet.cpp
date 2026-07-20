@@ -16,18 +16,30 @@ void RSImageSet::InitFromPakEntry(PakEntry *entry) {
 
     ByteStream index(entry->data, entry->size);
 
+    if (entry->size < 8) {
+        return;
+    }
+
     uint32_t palettesOffset = index.ReadUInt32LE();
     uint32_t firstImageOffset = index.ReadUInt32LE();
+
+    // Sanity check: firstImageOffset should be within the entry and > 4
+    if (firstImageOffset < 4 || firstImageOffset > entry->size) {
+        return;
+    }
+
     std::vector<uint32_t> imageOffsets;
     imageOffsets.push_back(firstImageOffset);
-    while (index.GetCurrentPosition() < firstImageOffset) {
+    while (index.GetCurrentPosition() + 4 <= firstImageOffset) {
         uint32_t imageOffset = index.ReadUInt32LE();
+        if (imageOffset > entry->size) break;
         imageOffsets.push_back(imageOffset);
     }
     RLEShape *shape = RLEShape::GetEmptyShape();
     this->shapes.push_back(shape);
     for (size_t i = 0; i < imageOffsets.size(); i++) {
         uint32_t imageOffset = imageOffsets[i];
+        if (imageOffset >= entry->size) continue;
         size_t size = entry->size - imageOffset;
         if (i < imageOffsets.size() - 1) {
             size = imageOffsets[i+1] - imageOffset;
@@ -40,7 +52,7 @@ void RSImageSet::InitFromPakEntry(PakEntry *entry) {
             this->sequence.push_back((uint8_t)i);
         }
     }
-    if (palettesOffset < entry->size) {
+    if (palettesOffset > 0 && palettesOffset + 8 < entry->size) {
         uint8_t *palettesData = entry->data + palettesOffset;
         RSPalette *palette = new RSPalette();
         uint32_t pal_size = 0;
@@ -48,7 +60,7 @@ void RSImageSet::InitFromPakEntry(PakEntry *entry) {
         pal_size |= *(palettesData+5) << 16;
         pal_size |= *(palettesData+6) << 8;
         pal_size |= *(palettesData+7) << 0;
-        if (*(palettesData+8)=='P') {
+        if (pal_size + 8 <= entry->size - palettesOffset && *(palettesData+8)=='P') {
             palette->initFromFileRam(palettesData, pal_size+8);
             this->palettes.push_back(palette);
             RLEShape *shape = RLEShape::GetEmptyShape();

@@ -43,6 +43,71 @@ enum weapon_ids {
     ID_GBU15 = 8,
     ID_AIM120 = 9,
     ID_20MM = 12,
+    // WC3 (SSHP) weapon types. Deliberately offset well clear of the SC1
+    // ids above — the raw WC3 hardpoint type-id bytes baked into SSHP
+    // files (RSEntity::parseREAL_OBJT_SSHP_WEAP_FGTR_GUNS/MISL: NEUTGUN=3,
+    // ION_GUN=4, RLASER=2, REAPGUN=6, TACHGUN=10) collide with existing
+    // SC1 weapon_ids values (ID_AIM9M=2, ID_AGM65D=3, ...) and must never
+    // be used directly as a weapon_id — only as a transient parse-time
+    // lookup key that gets translated into one of these instead.
+    ID_NEUTGUN = 20,
+    ID_IONGUN = 21,
+    ID_RLASER_WC3 = 22,
+    ID_REAPGUN = 23,
+    ID_TACHGUN = 24,
+    ID_HSMISS = 25,
+    ID_IRMISS = 26,
+    ID_FFMISS = 27,
+    ID_TORKMISS = 28,   // torpedo — cannot fire unless locked (SCPlane::Shoot)
+    ID_TEMBMISS = 29,   // T-bomb — same lock-required rule as torpedo, longer lock time
+    // Mine — fired from a missile hardpoint like the above, but
+    // WDAT::is_guided_flight is false (byte-confirmed real, MINEMISS.IFF's
+    // own OBJT>MISL>DATA), so SCPlane::Shoot() drops it in place instead of
+    // launching it, and SCSimulatedObject::ComputeTrajectory keeps it
+    // stationary — it detonates only via the existing dumbfire proximity-
+    // scan when an enemy strays into CheckCollision's range.
+    ID_MINEMISS = 30,
+};
+// Real per-weapon stats (damage/effective_range/target_range/
+// weapon_category) for WC3 weapons — a FALLBACK ONLY now: RSEntity::
+// getWC3RealWeaponEntity resolves the weapon's real DATA\OBJECTS\<name>.IFF
+// asset and parses its real OBJT>GUNS>DATA/OBJT>MISL>DATA chunk directly
+// into wdat (RSEntity.cpp's parseREAL_OBJT_GUNS_DATA/parseREAL_OBJT_MISL_
+// DATA) whenever that succeeds; this table's values are only used if asset
+// resolution fails entirely (prints its own diagnostic when that happens).
+// damage/effective_range are confirmed real for TACHGUN (70/3200 — real
+// per-shot stats aren't parsed for effective_range the same way; this
+// entry keeps the real damage but an estimated range) and for HSMISS/
+// IRMISS/FFMISS's damage (real: 40->real varies, see parseREAL_OBJT_MISL_
+// DATA — kept here only as this table's own fallback estimate); everything
+// else remains an unconfirmed placeholder, roughly proportionate to its
+// closest SC1 analogue (gun < missile < torpedo, in damage/range).
+// weapon_category follows the existing SCMissionActors.cpp convention:
+// 0=guns, 2=missiles (dumbfire-vs-guided is a lock-state distinction, not
+// a category one), 3=torpedo (new). lock_time_required is likewise a
+// fallback only now — SCPlane::Shoot() prefers the real, per-weapon
+// wdat->lock_time_required_seconds (RSEntity::parseREAL_OBJT_MISL_DATA,
+// confirmed real: e.g. Friend-or-Foe needs 0s, Image-Recognition needs 1s)
+// whenever real asset data was resolved.
+struct WC3WeaponStat {
+    uint16_t damage;
+    uint32_t effective_range;
+    uint32_t target_range;
+    uint8_t weapon_category;
+    float lock_time_required{0.0f};
+};
+static std::unordered_map<int, WC3WeaponStat> wc3_weapon_stats = {
+    {ID_NEUTGUN,  {8,  9000,  12000, 0}},
+    {ID_IONGUN,   {10, 8500,  11500, 0}},
+    {ID_RLASER_WC3, {6, 10000, 13000, 0}},
+    {ID_REAPGUN,  {14, 7500,  10500, 0}},
+    {ID_TACHGUN,  {70, 3200,  14000, 0}},  // damage/range confirmed real
+    {ID_HSMISS,   {40, 20000, 30000, 2}},
+    {ID_IRMISS,   {350, 18000, 28000, 2, 1.0f}},  // damage/lock confirmed real
+    {ID_FFMISS,   {250, 22000, 32000, 2, 0.0f}},  // damage/lock confirmed real
+    {ID_TORKMISS, {8000, 16000, 35000, 3, 12.0f}},  // damage/lock confirmed real; range = decoded duration(16s) x speed(1000)
+    {ID_TEMBMISS, {250, 30000, 40000, 3, 4.0f}},
+    {ID_MINEMISS, {400, 0, 0, 2, 0.0f}},  // damage/lock confirmed real; stationary, no meaningful range
 };
 enum CockpitFace {
     CP_FRONT = 0,
@@ -72,7 +137,17 @@ static std::unordered_map<weapon_ids, std::string> weapon_names = {
     {weapon_ids::ID_MK82, "MK-82"},
     {weapon_ids::ID_DURANDAL, "DUR"},
     {weapon_ids::ID_GBU15, "GBU-15"},
-    {weapon_ids::ID_AIM120, "AIM-120"}
+    {weapon_ids::ID_AIM120, "AIM-120"},
+    {weapon_ids::ID_NEUTGUN, "NEUTRON GUN"},
+    {weapon_ids::ID_IONGUN, "ION CANNON"},
+    {weapon_ids::ID_RLASER_WC3, "LASER"},
+    {weapon_ids::ID_REAPGUN, "REAPER GUN"},
+    {weapon_ids::ID_TACHGUN, "TACHYON GUN"},
+    {weapon_ids::ID_HSMISS, "HEATSEEKER"},
+    {weapon_ids::ID_IRMISS, "IR MISSILE"},
+    {weapon_ids::ID_FFMISS, "FRIEND-FOE"},
+    {weapon_ids::ID_TORKMISS, "TORPEDO"},
+    {weapon_ids::ID_TEMBMISS, "T-BOMB"},
 };
 enum prog_compare_return_values {
     PROG_CMP_EQUAL = 1,          // 000001
@@ -129,6 +204,23 @@ enum prog_op {
     OP_SET_OBJ_FOLLOW_ALLY = 170,
     OP_SET_MESSAGE = 171,
     OP_DEACTIVATE_OBJ = 190,
+    // Selects the next mission's filename by index into MISN>MSGS — the
+    // argument is a message-table index whose string is a lowercase mission
+    // basename (e.g. "misnd003"), not display text. Confirmed by scanning
+    // every PROG chunk across all 110 files in missions.tre: appears in 10
+    // files total, always with an MSGS entry that resolves to a mission
+    // filename. Most uses are unconditional (a single candidate, no branch
+    // — the mission just always continues to that file); MISND002.IFF
+    // (Laconda2) is the one file that wraps it in a real TEST_FLAG/BRANCH
+    // condition choosing between two candidates (misnd003 vs. the misnd3bd
+    // Flint-rescue side-mission) — see SCMission::next_mission_message_index's
+    // own comment for how the result is surfaced.
+    OP_SELECT_NEXT_MISSION = 198,
+    // Always observed immediately after OP_SELECT_NEXT_MISSION with arg 0,
+    // in every one of the 10 files checked — plausibly a fixed "end of
+    // selection" marker, but its own effect (if any) isn't confirmed.
+    // No-op for now, same as OP_SELECT_FLAG_208 below.
+    OP_SELECT_NEXT_MISSION_END = 199,
     OP_SELECT_FLAG_208 = 208,
 };
 
@@ -176,6 +268,8 @@ static std::unordered_map<prog_op, std::string> prog_op_names = {
     {OP_SET_OBJ_FOLLOW_ALLY, "OP_SET_OBJ_FOLLOW_ALLY"},
     {OP_SET_MESSAGE, "OP_SET_MESSAGE"},
     {OP_DEACTIVATE_OBJ, "OP_DEACTIVATE_OBJ"},
+    {OP_SELECT_NEXT_MISSION, "OP_SELECT_NEXT_MISSION"},
+    {OP_SELECT_NEXT_MISSION_END, "OP_SELECT_NEXT_MISSION_END"},
     {OP_SELECT_FLAG_208, "OP_SELECT_FLAG_208"}
 };
 
@@ -219,7 +313,13 @@ static std::unordered_map<std::string, uint8_t> pilot_profile = {
     {"HAWK", 7}
 };
 
-enum View { FRONT = 0, FOLLOW, RIGHT, LEFT, REAR, REAL, TARGET, EYE_ON_TARGET, MISSILE_CAM, OBJECT, AUTO_PILOT, CONTROLLER_LOOK };
+// TRACK: real WC3 "Track Camera" (F10) — a world-fixed camera anchored at
+// wherever the player was when the mode was engaged, continuously
+// re-aiming (lookAt) at the player as they fly on past it, like a
+// stationary tracking shot. See SCStrike::checkKeyboard's VIEW_TRACK
+// handler (sets track_camera_anchor once, on entry) and its own switch
+// case in runFrame's camera_mode dispatch.
+enum View { FRONT = 0, FOLLOW, RIGHT, LEFT, REAR, REAL, TARGET, EYE_ON_TARGET, MISSILE_CAM, OBJECT, AUTO_PILOT, CONTROLLER_LOOK, TRACK };
 
 enum CatalogItems {
     CAT_AIM9J = 73,
