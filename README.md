@@ -5,13 +5,13 @@ A cross-platform open-source project aimed at recreating the RealSpace engine or
 ## Features
 
 ### File Format Support
-- Full TRE Support
-- Full IFF Support 
+- Full XTRE Support
+- In Progress IFF Support 
 - Full PAK Support
-- Comprehensive parsing for all game assets
+- Comprehensive parsing of game assets
 
 ### Rendering Capabilities
-- Render Textures 3D Jets for all Level Of Details
+- Render Textures 3D Spaceships for all Level Of Details
 - Render animation layers (individually)
 - Render Map Textures
 - Render ingame screen (conversation, transition animation, scenes)
@@ -19,7 +19,7 @@ A cross-platform open-source project aimed at recreating the RealSpace engine or
 - Cockpit and instrument simulation
 
 ### Gameplay & Systems
-- Flying with realistic flight physics
+- Flying with Wing Commander 3 space physics
 - GameFlow logic and mission scripting
 - Complete mission system with event-based scripting
 - User interface and menu systems
@@ -46,7 +46,7 @@ A cross-platform open-source project aimed at recreating the RealSpace engine or
 
 ## Goal
 
-The long term goal is to be able to play Strike Commander with a Virtual Reality Headset (Oculus Rift)
+The long term goal is to be able to play Wing Commander 3 with a Virtual Reality Headset (PSVR2)
 
 
 ## Dependencies
@@ -55,32 +55,6 @@ The long term goal is to be able to play Strike Commander with a Virtual Reality
 - Dear IMGui: https://github.com/ocornut/imgui
 - SDL-Mixer-ext: https://wohlsoft.github.io/SDL-Mixer-X/
 - Legacy OpenGL
-
-## Eye Candies
-
-### Last update
-
-![Alt text](pics/debbuger.png)
-![Alt text](pics/catalogues.png)
-![Alt text](pics/choose_pilot.png)
-![Alt text](pics/sf_bridge.png)
-![Alt text](pics/vc_shooting.png)
-
-### News :)
-
-![Alt text](pics/gameflow.png)
-![Alt text](pics/flying.png)
-![Alt text](pics/conversation.png)
-![Alt text](pics/external.png)
-![Alt text](pics/transistion.png)
-![Alt text](pics/virtualcp.png)
-![Alt text](pics/object_viewer.png)
-
-### Originals Eye Candies :)
-
-![Alt text](pics/nice_sc_scene.png)
-![Alt text](/pics/F-22.png)
-![Alt text](/pics/face.png)
 
 ## Build
 
