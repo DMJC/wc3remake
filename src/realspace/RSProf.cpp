@@ -57,9 +57,17 @@ void RSProf::parsePROF_RADI_INFO(uint8_t *data, size_t size){
         return;
     }
     stream.Set(data, size);
+    // Fixed id(2)+name(15)+callsign(15) = 32-byte record, confirmed by direct
+    // byte decode (e.g. PROFILE\TCRUISER.IFF: id=58624, name="Bruiser",
+    // callsign="Ajax" at exactly these offsets). ReadStringNoSize(size) here
+    // used to stop at the first null byte instead of consuming the fixed
+    // 15-byte stride, so `name` under-read (e.g. "Bruiser\0" = 8 bytes, not
+    // 15) and `callsign` then started mid-padding and immediately hit a null
+    // byte — always reading empty, regardless of what a profile's real
+    // callsign was.
     this->radi.info.id = stream.ReadShort();
-    this->radi.info.name = stream.ReadStringNoSize(size);
-    this->radi.info.callsign = stream.ReadStringNoSize(size);
+    this->radi.info.name = stream.ReadString(15);
+    this->radi.info.callsign = stream.ReadString(15);
 }
 void RSProf::parsePROF_RADI_OPTS(uint8_t *data, size_t size){
     ByteStream stream;

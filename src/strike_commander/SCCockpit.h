@@ -11,6 +11,7 @@
 
 #include "precomp.h"
 
+class WC3MVEStream;
 
 struct HudLine {
     Point2D start;
@@ -39,7 +40,7 @@ private:
     void RenderTargetingReticle(FrameBuffer *fb, CHUD_SHAPE *reticleShape, Point2D hudTopLeft, Point2D hudBottomRight, Point2D hudCenter);
     void RenderStraffingReticle(FrameBuffer *fb, CHUD_SHAPE *reticleShape, Point2D hudTopLeft, Point2D hudBottomRight, Point2D hudCenter);
     void RenderBombSight(FrameBuffer* fb, Point2D hudTopLeft, Point2D hudBottomRight, Point2D hudCenter);
-    void RenderMFDS(Point2D mfds, FrameBuffer *fb);
+    void RenderMFDS(Point2D mfds, FrameBuffer *fb, bool clearBackground = true);
     void RenderMissileHud(Point2D position, FrameBuffer *fb, CHUD *hud, Point2D hudTopLeft, Point2D hudBottomRight, Point2D hudCenter);
     void RenderIrTargetHud(Point2D position, FrameBuffer *fb, CHUD *hud, Point2D hudTopLeft, Point2D hudBottomRight, Point2D hudCenter);
     void RenderMFDSRadarImplementation(Point2D pmfd_left, float range, const char* mode_name, bool air_mode, FrameBuffer *fb);
@@ -76,6 +77,18 @@ private:
     Camera cockpit_camera;
     MISN_PART *current_target{nullptr};
     SCMissionActors *current_target_actor{nullptr};
+    SCMissionActors *last_turret_cycle_actor{nullptr};
+    // Ship-local (turret->x/y/z raw field order) -> world-space position of
+    // the given turret hardpoint on actor's ship, replicating the render
+    // path's translate+rotate stack (SCRenderer.cpp drawModel/turret block)
+    // on the CPU instead of the GPU. Returns false if actor/object/entity or
+    // the turret index is invalid.
+    bool GetTurretWorldPosition(SCMissionActors *actor, int turretIndex, Vector3D &outPos);
+    // Draws the target-lock bracket/box around current_target_actor (full
+    // square when target_hard_locked, corner brackets otherwise; blue for
+    // friendlies, red for enemies) and, when targeted_turret_index >= 0, a
+    // smaller white corner-bracket around that turret's projected position.
+    void RenderWC3TargetBrackets(FrameBuffer *fb);
     // WC3 cockpit animation state — time accumulator and frame counter
     // advanced in RenderWC3Instruments each frame to cycle cockpit overlays.
     float wc3_anim_time{0.0f};
@@ -177,6 +190,15 @@ public:
     bool show_radars{false};
     bool show_weapons{false};
     bool show_damage{false};
+    // Which of the Damage MFD's two real pages is showing (user-described,
+    // 2026-07 session): 0 = per-subsystem text list, 1 = top-down ship
+    // graphic with per-quadrant yellow/red damage highlighting — see
+    // RenderMFDSDamage. Cycled by repeated MDFS_DAMAGE presses
+    // (SCStrike.cpp), matching this codebase's existing repeat-press-
+    // cycles-modes convention (e.g. CyclePowerOrShield) — no real
+    // confirmation of exactly which key/gesture switches pages, so this is
+    // a reasonable-guess UX, not file-derived.
+    int damage_page{0};
     bool show_comm{false};
     bool show_cam{false};
     bool show_power{false};
@@ -231,11 +253,42 @@ public:
     // auto-targeting, and updateLockOn's own comment for why lock_progress
     // still requires real-time correct aspect regardless of this flag.
     bool target_hard_locked{false};
+    // Set by SCStrike::findTarget() (the manual 'T'-cycle) whenever it picks
+    // a real target, cleared once that target stops being valid. Lets
+    // updateAutoTarget()'s continuous orientation-based retargeting leave a
+    // manual pick alone instead of overwriting it back to "nearest thing in
+    // the front cone" on literally the next frame — unlike
+    // target_hard_locked, this doesn't change the HUD box style (still a
+    // bracket, not a solid square) since the player hasn't actually
+    // weapons-locked anything, just selected it.
+    bool target_manually_selected{false};
+    // Index into current_target_actor->object->entity->turrets, -1 when the
+    // current target isn't a capital ship (or has no turret data). Defaulted
+    // to 0 whenever current_target_actor changes to a capital ship (see
+    // Update()). Public (unlike current_target_actor itself) so SCStrike's
+    // 'r'-key handler can cycle it directly; GetCurrentTargetTurretCount()
+    // is the public read-only way to find out how far it can cycle without
+    // needing current_target_actor access of its own.
+    int targeted_turret_index{-1};
+    // 0 if there's no current target, its entity is missing, or it has no
+    // turret data — safe to use directly as a cycle-length divisor.
+    int GetCurrentTargetTurretCount() const;
     RadarMode radar_mode{RadarMode::AARD};
     int radar_zoom{1};
     int throttle{0};
     int comm_target{0};
     SCMissionActors *comm_actor{nullptr};
+    // TARGSHAP.PAK target-diagram lock-on animation state (see
+    // DrawShipTargetDiagram in SCCockpit.cpp) — user-requested (2026-07
+    // session): frames 0-4 play once, then hold on frame 5, resetting back
+    // to frame 0 whenever the locked target itself changes. Shared by both
+    // callers (RenderMFDSTarget's fixed right-MFD panel and
+    // RenderTargetWithCam's full-screen HUD overlay) since they're both
+    // just different on-screen placements of the same single "how far
+    // along is the lock animation" state, not independent animations.
+    int targetDiagramAnimFrame{0};
+    float targetDiagramAnimTimer{0.0f};
+    SCMissionActors *targetDiagramLastActor{nullptr};
     float way_az{0};
     MISN_PART *target{nullptr};
     MISN_PART *player{nullptr};
@@ -272,6 +325,28 @@ public:
     void RenderMFDSWeapon(Point2D pmfd_right, FrameBuffer *fb);
     void RenderMFDSRadar(Point2D pmfd_left, float range, int mode, FrameBuffer *fb);
     void RenderMFDSComm(Point2D pmfd_left, int mode, FrameBuffer *fb);
+    // Real WC3 comm page: contact list (mode==0) then that contact's
+    // question list (mode>0), driven by the same RSProf radi.opts/asks
+    // data the SC path above already used — see RenderMFDSComm's own
+    // dispatch comment.
+    void RenderMFDSCommWC3(Point2D pmfd_left, int mode, FrameBuffer *fb);
+    // Comm-reply "radio face" video (RadioMessages::fmvFilename, resolved
+    // from RSProf::radi.fmv in SCMissionActors::setMessage) — fills the
+    // whole left VDU while playing, in place of the contact/question list,
+    // per user spec (2026-07 session): "the entire VDU display area...
+    // not next to the text." commVideoOwnedData is only non-null when the
+    // .mve came from a CD-archive fallback load (XtreArchive::
+    // LoadSingleEntry, same on-demand pattern as WC3GameFlow::playMovie)
+    // rather than a preloaded archive entry, and needs freeing once the
+    // stream is done with it. commVideoPaletteLut is a full-256-color RGB
+    // quantization cache (5 bits/channel, same technique as the existing
+    // green-only BuildPaletteLUT for the SC gun-cam MFD, just an
+    // unrestricted search), built once and reused for every frame.
+    WC3MVEStream *commVideoStream{nullptr};
+    uint8_t *commVideoOwnedData{nullptr};
+    std::unordered_map<uint32_t, uint8_t> commVideoPaletteLut;
+    bool commVideoPaletteLutBuilt{false};
+    void UpdateCommVideo();
     void RenderMFDSDamage(Point2D pmfd_left, FrameBuffer *fb);
     // Right MFD, always on regardless of show_radars/show_weapons/etc (see
     // RenderHUD's dispatch): the generic COCK>SHAP scanning animation while

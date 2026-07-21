@@ -19,6 +19,15 @@ struct WC3WeaponDef {
     std::string tacval;       // SUBS "TACVAL:" line, e.g. "Low", "CAP SHIP", "ULTRA"
     std::string objt;         // in-flight object model name (absent for the two CLASSIFIED specials)
     uint32_t mask{0};         // this weapon's own bit (single bit, e.g. 1, 2, 4, ... 256)
+    // TAGS' two i32LE fields, real data — byte-confirmed as (25, 2) for
+    // every one of the 9 real weapon records with no exceptions, unlike
+    // WC3CraftDef::tag0 below. tag1 matches craft's own constant-7 pattern
+    // (a per-record-type marker, "2"=weapon vs "7"=craft, still a guess at
+    // exact meaning) but tag0 doesn't vary at all here, so there's nothing
+    // to correlate it against yet. Captured rather than discarded per user
+    // instruction (2026-07 session: "don't ignore any of them").
+    int32_t tag0{0};
+    int32_t tag1{0};
 };
 
 // One hardpoint on a craft. mask is a bitwise-OR of the WC3WeaponDef::mask
@@ -35,6 +44,13 @@ struct WC3HardpointDef {
     int capacity{1};
     int cordX{0};
     int cordY{0};
+    // STAT's own i32LE field — read 0 in every one of the 31 real
+    // hardpoint records in LOADOUT.IFF (a static save file with nothing
+    // yet equipped), consistent with it being a runtime "currently loaded
+    // weapon index/count" slot the static file just ships zeroed. Captured
+    // rather than skipped per user instruction (2026-07 session: "don't
+    // ignore any of them") even though its value never varies here.
+    int32_t stat{0};
 };
 
 // One craft loadout record. LOADOUT.IFF has 8 of these (WING/NUM_ == 8),
@@ -48,6 +64,19 @@ struct WC3CraftDef {
     std::string objt;                    // in-flight object model name
     int decoyCount{0};                   // DECY
     std::vector<WC3HardpointDef> hardpoints;
+    // TAGS' two i32LE fields, real data captured rather than discarded
+    // (2026-07 session, user instruction: "don't ignore any of them").
+    // tag1 is a constant 7 across all 8 real craft records (plausibly a
+    // record-type marker, paired with WC3WeaponDef::tag1's own constant 2
+    // for weapon records — "7"=craft/"2"=weapon is a guess, not confirmed).
+    // tag0 varies (40/40/45/70/40/40/40/40 for ARROW/HELLCAT V/
+    // THUNDERBOLT VII/LONGBOW/EXCALIBUR x4) and roughly tracks each craft's
+    // real-world size class (Longbow is the bomber, Thunderbolt the heavy
+    // fighter) — but doesn't match any single visible SUBS stat (armor/
+    // shield/speed) exactly for any craft checked, so its precise meaning
+    // (mass? point cost? UI layout hint?) is still unconfirmed.
+    int32_t tag0{0};
+    int32_t tag1{0};
 };
 
 // 185.SHP UI-chrome frames (no corresponding weapon) — the small hardpoint

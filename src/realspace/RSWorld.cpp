@@ -244,20 +244,79 @@ void RSWorld::parseWRLD_CAMR_AUTO(uint8_t *data, size_t size) {
     this->cameraAutoSequences.push_back(seq);
 }
 
-void RSWorld::parseWRLD_CAMR_CAMR(uint8_t *data, size_t size) {}
+// Shared record shape for TARG/ROTA/COCK/NAV/VCTC/WEAP/TRAK — see
+// WorldCameraModeParams's own comment for the confirmed field breakdown.
+// CAMR/CHAS don't use this (see their own parse functions below) since
+// they carry extra undecoded bytes BEFORE the actor name instead of just
+// the plain 2-byte modeFlags gap this handles.
+static WorldCameraModeParams ParseSimpleWorldCameraModeParams(uint8_t *data, size_t size) {
+    WorldCameraModeParams p;
+    constexpr size_t kHeaderSize = 28; // label(8) + modeFlags(2) + actorName(8) + shared tail(10)
+    if (size < kHeaderSize) {
+        return p;
+    }
+    ByteStream stream(data, size);
+    p.modeLabel = stream.ReadString(8);
+    p.modeFlags = stream.ReadShort();
+    p.actorName = stream.ReadString(8);
+    p.sharedField0 = stream.ReadInt32LE();
+    p.fovDegrees = stream.ReadShort();
+    p.sharedField1 = stream.ReadShort();
+    p.sharedField2 = stream.ReadShort();
+    if (size > kHeaderSize) {
+        p.extraRaw = stream.ReadBytes(size - kHeaderSize);
+    }
+    return p;
+}
+void RSWorld::parseWRLD_CAMR_CAMR(uint8_t *data, size_t size) {
+    // No actor-name field — a free/self camera, not locked to a target.
+    // label(8) + preActorRaw(20, undecoded) + shared tail(10) = 38 bytes,
+    // matching every real sample's chunk size exactly.
+    constexpr size_t kPreActorSize = 20;
+    if (size < 8 + kPreActorSize + 10) {
+        return;
+    }
+    ByteStream stream(data, size);
+    WorldCameraModeParams p;
+    p.modeLabel = stream.ReadString(8);
+    p.preActorRaw = stream.ReadBytes(kPreActorSize);
+    p.sharedField0 = stream.ReadInt32LE();
+    p.fovDegrees = stream.ReadShort();
+    p.sharedField1 = stream.ReadShort();
+    p.sharedField2 = stream.ReadShort();
+    this->camCamera = p;
+}
 
-void RSWorld::parseWRLD_CAMR_CHAS(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_CHAS(uint8_t *data, size_t size) {
+    // label(8) + preActorRaw(14, undecoded — plausibly a chase-camera
+    // position/offset vector, not confidently split yet) + actorName(8) +
+    // shared tail(10) = 40 bytes, matching every real sample exactly.
+    constexpr size_t kPreActorSize = 14;
+    if (size < 8 + kPreActorSize + 8 + 10) {
+        return;
+    }
+    ByteStream stream(data, size);
+    WorldCameraModeParams p;
+    p.modeLabel = stream.ReadString(8);
+    p.preActorRaw = stream.ReadBytes(kPreActorSize);
+    p.actorName = stream.ReadString(8);
+    p.sharedField0 = stream.ReadInt32LE();
+    p.fovDegrees = stream.ReadShort();
+    p.sharedField1 = stream.ReadShort();
+    p.sharedField2 = stream.ReadShort();
+    this->camChase = p;
+}
 
-void RSWorld::parseWRLD_CAMR_COCK(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_COCK(uint8_t *data, size_t size) { this->camCockpit = ParseSimpleWorldCameraModeParams(data, size); }
 
-void RSWorld::parseWRLD_CAMR_NAV(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_NAV(uint8_t *data, size_t size) { this->camNavmap = ParseSimpleWorldCameraModeParams(data, size); }
 
-void RSWorld::parseWRLD_CAMR_ROTA(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_ROTA(uint8_t *data, size_t size) { this->camRotate = ParseSimpleWorldCameraModeParams(data, size); }
 
-void RSWorld::parseWRLD_CAMR_TARG(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_TARG(uint8_t *data, size_t size) { this->camTarget = ParseSimpleWorldCameraModeParams(data, size); }
 
-void RSWorld::parseWRLD_CAMR_TRAK(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_TRAK(uint8_t *data, size_t size) { this->camTrack = ParseSimpleWorldCameraModeParams(data, size); }
 
-void RSWorld::parseWRLD_CAMR_VCTC(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_VCTC(uint8_t *data, size_t size) { this->camVictim = ParseSimpleWorldCameraModeParams(data, size); }
 
-void RSWorld::parseWRLD_CAMR_WEAP(uint8_t *data, size_t size) {}
+void RSWorld::parseWRLD_CAMR_WEAP(uint8_t *data, size_t size) { this->camWeapon = ParseSimpleWorldCameraModeParams(data, size); }

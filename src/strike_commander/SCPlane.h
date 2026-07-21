@@ -93,6 +93,18 @@ protected:
     short g_limit{0};
     /* fuel (0 - 12800)		*/
     int fuel{0};
+    // Real per-ship fuel capacity — moved up from SCJdynPlane (2026-07
+    // session) so cockpit gauge code (SCPlane* pointers, not SCJdynPlane*)
+    // can read it via GetFuelCapacity(). WC3 planes are constructed with
+    // this set to RSEntity::jdyn->FUEL (see WC3Mission::buildActorFromPart),
+    // NOT the fixed 12800 the field comment above describes — that fixed
+    // value only ever applied to Strike Commander's own raw SCPlane::init()
+    // default (100<<7), not real WC3 per-ship data. fuel starts equal to
+    // this at construction (SCJdynPlane's own constructor), i.e. a full
+    // tank — a cockpit gauge dividing by a hardcoded 12800 instead of this
+    // could show less than full even at mission start for any ship whose
+    // real capacity differs (user-reported, 2026-07 session).
+    float fuel_max{0.0f};
     /* upper limit on engines	*/
     short max_throttle{0};
     /* lower limit on engines	*/
@@ -310,12 +322,25 @@ public:
     // collectDistinctGunTypes/FIRE_PRIMARY handler.
     int selected_gun_group{0};
     // Same idea as selected_gun_group above, but for FIRE_MISSILE/Enter: an
-    // index into the ship's distinct missile/ordnance-type list (weapon_
-    // category != 0 hardpoints), independent of both selected_weapon (the
-    // old SC1 MDFS_WEAPONS-driven single shared index, which mixes guns and
-    // missiles together and uses SC1-specific HUD weapon-mode logic that
-    // doesn't apply to WC3 at all) and selected_gun_group. See SCStrike.cpp's
-    // collectDistinctMissileTypes/its own WC3-only MDFS_WEAPONS branch.
+    // index into the ship's own missile/ordnance (weapon_category != 0)
+    // hardpoints, independent of both selected_weapon (the old SC1 MDFS_
+    // WEAPONS-driven single shared index, which mixes guns and missiles
+    // together and uses SC1-specific HUD weapon-mode logic that doesn't
+    // apply to WC3 at all) and selected_gun_group. Unlike guns (which
+    // group same-type hardpoints into one salvo — a deliberate, different
+    // mechanic, see selected_gun_group's own comment), each missile
+    // hardpoint is its own independent "bank": only one bank is ever
+    // selected at a time, even if another bank shares the exact same
+    // missile type (user-corrected, 2026-07 session — an earlier version
+    // of this indexed distinct *types* instead, which put two same-type
+    // banks under one cycle step and fired/highlighted both together).
+    // See SCStrike.cpp's collectMissileHardpointIndices/its own WC3-only
+    // MDFS_WEAPONS branch. Negative = "select all hardpoints" (B key,
+    // user-confirmed 2026-07 session — every missile/torpedo hardpoint
+    // fires together instead of resolving to one bank); cycling via
+    // MDFS_WEAPONS from this state (e.g. -1 + 1) naturally lands back on
+    // bank index 0, reverting to normal single-bank cycling, same as any
+    // other index.
     int selected_missile_group{0};
     // Set true by InitLoadout()'s WC3 branch (entityWeaps.size()==entityHpts
     // .size(), the same detection that branch already uses) — lets shared
@@ -354,6 +379,8 @@ public:
     int isOnRunWay();
     void SetThrottle(int throttle);
     int GetThrottle();
+    int GetFuel() { return this->fuel; }
+    float GetFuelCapacity() { return this->fuel_max; }
     // Real speed-boost state (SCStrike::checkKeyboard sets this from the
     // AFTERBURNER key each frame), consumed by SCJdynPlane's thrust_force
     // calculation to scale thrust toward the ship's own calibrated

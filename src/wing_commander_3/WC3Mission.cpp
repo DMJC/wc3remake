@@ -478,6 +478,7 @@ SCMissionActors* WC3Mission::buildActorFromPart(MISN_PART* part, CAST* cast) {
         // props — which just keep the flat `health` scalar above.
         if (part->entity->shield != nullptr) {
             auto *shld = part->entity->shield;
+            actor->shield_regen_rate = (float)shld->regen_rate;
             actor->shield_front = actor->max_shield_front = (float)shld->front;
             actor->shield_back = actor->max_shield_back = (float)shld->back;
             actor->shield_left = actor->max_shield_left = (float)shld->left;

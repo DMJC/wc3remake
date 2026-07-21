@@ -71,9 +71,17 @@ namespace WC3CockpitShapeId {
     // game likely picks a frame by target HP fraction, not by time).
     constexpr uint32_t kTargetHealthBar = 9;
     constexpr uint32_t kTargetHealthBarSVGA = 39;  // 50x36, 24 frames (exact N match)
-    // 89x81, 12 frames: a second gloved-hand pose set, different color
-    // from kPilotHandAnimation below — possibly the other hand/control
-    // (stick vs. throttle), not confirmed which.
+    // 89x81, 12 frames: NOT a hand animation despite the name (kept for
+    // continuity with earlier code/comments that already used it) —
+    // user-identified, 2026-07 session, as the Damage MFD's page-2 ship
+    // graphic (RenderMFDSDamage): frame 0 is the base/undamaged ship
+    // outline; frames 1-11 are 4 position-identical clusters (front 1-3,
+    // right 4-6, back 7-9, left 10-11) overlaid on it per quadrant,
+    // showing yellow (mild) or red (heavy) damage. kPilotHandAnimation2SVGA
+    // below has a different aspect ratio (46x34 vs. this id's 89x81)
+    // despite the matching 12-frame count, so it's NOT confidently the
+    // same asset at SVGA scale — RenderMFDSDamage currently uses this id
+    // unconditionally, not g_ifVGA-branched, pending that being sorted out.
     constexpr uint32_t kPilotHandAnimation2 = 13;
     constexpr uint32_t kPilotHandAnimation2SVGA = 43;  // 46x34, 12 frames (exact N match)
     // 75x77, 38 frames: frame 0 is a helmet/head silhouette outline; the

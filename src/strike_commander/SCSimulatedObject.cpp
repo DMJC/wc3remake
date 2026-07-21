@@ -485,6 +485,14 @@ std::tuple<Vector3D, Vector3D> GunSimulatedObject::ComputeTrajectoryUntilGround(
     Vector3D velocity{0,0,0};
     Vector3D oldpos{0,0,0};
     std::tie(position, velocity) = this->ComputeTrajectory(tps);
+    // WC3 space missions have no terrain (area stays null — see
+    // WC3Mission::is_space_mission) — there's no ground for a bomb/gun
+    // impact-point HUD marker to hit, so just report the first-step
+    // trajectory point instead of looping toward a ground that doesn't
+    // exist.
+    if (this->mission->area == nullptr) {
+        return { position, velocity };
+    }
     int cpt_iteration = 0;
     while (position.y > this->mission->area->getY(position.x, position.z) == true && cpt_iteration<100000) {
         oldpos = position;

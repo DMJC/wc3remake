@@ -663,10 +663,7 @@ void SCNavMap::showArea(AREA *area, float center, float map_width, int w, int h,
 // exactly "take off" or "landing" (byte-confirmed against the source, not
 // guessed). Excluded from both the 3D marker list and N/arrow-key cycling.
 bool SCNavMap::isTakeoffWaypoint(SCMissionWaypoint *wp) const {
-    if (wp == nullptr || wp->objective == nullptr) {
-        return false;
-    }
-    return *wp->objective == "take off" || *wp->objective == "landing";
+    return SCMissionWaypoint::IsTakeoffOrLanding(wp);
 }
 
 // Converts the VGA-canvas-space box (l,t,w,h) — the same box the flat 2D

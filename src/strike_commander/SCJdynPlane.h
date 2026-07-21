@@ -4,8 +4,6 @@ void gl_sincos(float a, float *b, float *c);
 class SCJdynPlane : public SCPlane {
 protected:
 
-    float fuel_max {0.0f};
-
     float airspeed_in_ms {0.0f};
     void updatePosition();
     void updateAcceleration();

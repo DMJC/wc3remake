@@ -6,25 +6,40 @@
 //
 //   FORM <size> "LOAD"
 //     FORM <size> "WING"
-//       NUM_ (u32 LE) — craft count
+//       NUM_ (u32 LE) — craft count; cross-checked against the actual FORM
+//         count at parse time (WC3LoadoutData.h/.cpp both name each real
+//         WING/0000-0007 record a "loadout screen for one ship" — user-
+//         confirmed, 2026-07 session), logged if they ever disagree
 //       FORM <size> "0000"            (one of these per craft, in order)
-//         TAGS (8 bytes, meaning not needed by the Loadout screen)
+//         TAGS (2x i32 LE) — WC3CraftDef::tag0/tag1; tag1 constant 7 across
+//           every real record (plausibly a craft-record-type marker), tag0
+//           varies (40/45/70) and roughly tracks size class but doesn't
+//           match any single SUBS stat exactly — captured, not fully
+//           decoded (see WC3CraftDef's own comment)
 //         MAIN (nul-terminated string) — craft name
 //         SUBS (nul-terminated strings, back-to-back) — spec sheet lines
 //         OBJT (nul-terminated string) — in-flight model name
 //         DECY (i32 LE) — decoy count
 //         FORM <size> "HARD"
-//           NUM_ (u32 LE) — hardpoint count
+//           NUM_ (u32 LE) — hardpoint count; cross-checked the same way
 //           FORM <size> "0000"        (one of these per hardpoint, in order)
-//             STAT (i32 LE, always 0 in the static file — runtime-only)
+//             STAT (i32 LE, always 0 in the static file — plausibly a
+//               runtime "currently loaded weapon" slot the static save
+//               just ships zeroed; captured into WC3HardpointDef::stat
+//               anyway even though the value never varies here)
 //             MASK (u32 LE) — bitwise-OR of compatible WC3WeaponDef::mask
 //             MAX_ (i32 LE) — capacity
 //             CORD (3x i32 LE) — absolute screen-space x,y,(unused z)
 //     FORM <size> "ARMY"
-//       NUM_ (u32 LE) — weapon count
+//       NUM_ (u32 LE) — weapon count; the real ARMY/0000-0008 records are
+//         the 9 weapon/equipment definitions (user-confirmed, 2026-07
+//         session); cross-checked against the actual FORM count
 //       FORM <size> "0000"            (one of these per weapon, in order)
 //         MASK (u32 LE) — this weapon's own single bit
-//         TAGS (8 bytes)
+//         TAGS (2x i32 LE) — WC3WeaponDef::tag0/tag1; both read a flat
+//           constant (25, 2) across every real weapon record with zero
+//           exceptions, so unlike craft's own tag0 there's nothing here to
+//           correlate against yet
 //         MAIN (nul-terminated string) — weapon name
 //         SUBS (nul-terminated strings: "TYPE: ..." then "TACVAL: ...")
 //         OBJT (nul-terminated string, absent for the two CLASSIFIED specials)
@@ -100,6 +115,7 @@ bool parseHardpoint(const ChunkView& form, WC3HardpointDef& out) {
         if (c.tag == "MASK" && c.size >= 4) out.mask = (uint32_t)ru32le(c.payload);
         else if (c.tag == "MAX_" && c.size >= 4) out.capacity = ru32le(c.payload);
         else if (c.tag == "CORD" && c.size >= 8) { out.cordX = ru32le(c.payload); out.cordY = ru32le(c.payload + 4); }
+        else if (c.tag == "STAT" && c.size >= 4) out.stat = ru32le(c.payload);
     }
     return true;
 }
@@ -110,14 +126,21 @@ bool parseCraft(const ChunkView& form, WC3CraftDef& out) {
         else if (c.tag == "SUBS") out.specLines = splitNulStrings(c.payload, c.size);
         else if (c.tag == "OBJT") out.objt = readCString(c.payload, c.size);
         else if (c.tag == "DECY" && c.size >= 4) out.decoyCount = ru32le(c.payload);
+        else if (c.tag == "TAGS" && c.size >= 8) { out.tag0 = ru32le(c.payload); out.tag1 = ru32le(c.payload + 4); }
         else if (c.tag == "FORM" && formType(c) == "HARD") {
+            uint32_t declaredCount = 0;
             for (auto& hc : walkChunks(c.payload + 4, c.size - 4)) {
-                if (hc.tag == "FORM") {
+                if (hc.tag == "NUM_" && hc.size >= 4) {
+                    declaredCount = (uint32_t)ru32le(hc.payload);
+                } else if (hc.tag == "FORM") {
                     WC3HardpointDef hp;
                     parseHardpoint(hc, hp);
                     out.hardpoints.push_back(hp);
                 }
-                // NUM_ (hardpoint count) is implicit in how many FORMs follow — ignored.
+            }
+            if (declaredCount != out.hardpoints.size()) {
+                printf("WC3LoadoutData: HARD>NUM_ says %u hardpoints for '%s' but found %zu FORMs\n",
+                       declaredCount, out.name.c_str(), out.hardpoints.size());
             }
         }
     }
@@ -129,6 +152,7 @@ bool parseWeapon(const ChunkView& form, WC3WeaponDef& out) {
         if (c.tag == "MASK" && c.size >= 4) out.mask = (uint32_t)ru32le(c.payload);
         else if (c.tag == "MAIN") out.name = readCString(c.payload, c.size);
         else if (c.tag == "OBJT") out.objt = readCString(c.payload, c.size);
+        else if (c.tag == "TAGS" && c.size >= 8) { out.tag0 = ru32le(c.payload); out.tag1 = ru32le(c.payload + 4); }
         else if (c.tag == "SUBS") {
             auto lines = splitNulStrings(c.payload, c.size);
             for (auto& line : lines) {
@@ -155,18 +179,34 @@ bool WC3LoadoutDatabase::loadFromBytes(const uint8_t* data, size_t size) {
         if (top.tag != "FORM") continue;
         std::string type = formType(top);
         if (type == "WING") {
+            uint32_t declaredCount = 0;
             for (auto& c : walkChunks(top.payload + 4, top.size - 4)) {
-                if (c.tag != "FORM") continue; // skip NUM_
+                if (c.tag == "NUM_" && c.size >= 4) {
+                    declaredCount = (uint32_t)ru32le(c.payload);
+                    continue;
+                }
+                if (c.tag != "FORM") continue;
                 WC3CraftDef def;
                 parseCraft(c, def);
                 craft.push_back(std::move(def));
             }
+            if (declaredCount != craft.size()) {
+                printf("WC3LoadoutData: WING>NUM_ says %u craft but found %zu FORMs\n", declaredCount, craft.size());
+            }
         } else if (type == "ARMY") {
+            uint32_t declaredCount = 0;
             for (auto& c : walkChunks(top.payload + 4, top.size - 4)) {
-                if (c.tag != "FORM") continue; // skip NUM_
+                if (c.tag == "NUM_" && c.size >= 4) {
+                    declaredCount = (uint32_t)ru32le(c.payload);
+                    continue;
+                }
+                if (c.tag != "FORM") continue;
                 WC3WeaponDef def;
                 parseWeapon(c, def);
                 weapons.push_back(std::move(def));
+            }
+            if (declaredCount != weapons.size()) {
+                printf("WC3LoadoutData: ARMY>NUM_ says %u weapons but found %zu FORMs\n", declaredCount, weapons.size());
             }
         }
     }

@@ -362,9 +362,20 @@ void SCMission::update() {
     }
     uint8_t area_id = this->getAreaID({this->player->plane->x, this->player->plane->y, this->player->plane->z});
     float yawRad = this->player->plane->yaw * (float)M_PI / 1800.0f; // Convert from 0.1 degrees to radians
-    // Position the offset behind the aircraft based on current yaw
-    this->player->attack_pos_offset.x = -std::sin(yawRad) * -300.0f; // 200 units behind
-    this->player->attack_pos_offset.z = -std::cos(yawRad) * -300.0f;
+    // Manual, 2026-07 session: "If the player ship's speed is under 150
+    // enemy ships will attack the player ship head-on." Below that speed,
+    // attackers' approach point flips to 300 units in FRONT of the
+    // player (same magnitude, opposite sign) instead of behind — a slow
+    // player can't out-turn/out-run a rear approach the way real combat
+    // tactics assume, so real WC3 has enemies merge head-on instead. Only
+    // applies to attacks *on the player* specifically (this block) — AI
+    // vs. AI approach behavior below is unaffected, matching the manual's
+    // own wording ("attack the player ship").
+    float attackOffsetSign = (this->player->plane->airspeed < 150) ? 300.0f : -300.0f;
+    // Position the offset behind (or, below 150 speed, in front of) the
+    // aircraft based on current yaw
+    this->player->attack_pos_offset.x = -std::sin(yawRad) * attackOffsetSign;
+    this->player->attack_pos_offset.z = -std::cos(yawRad) * attackOffsetSign;
     this->player->attack_pos_offset.y = 0.0f; // Same altitude
     if (area_id != this->current_area_id) {
         this->current_area_id = area_id;
@@ -532,6 +543,10 @@ void SCMission::update() {
     for (auto ai_actor : this->actors) {
         if (ai_actor != nullptr && !ai_actor->is_destroyed && cloakDt > 0.0f) {
             ai_actor->UpdateCloak(cloakDt);
+            ai_actor->UpdateShieldRegen(cloakDt);
+            if (ai_actor->collision_cooldown > 0.0f) {
+                ai_actor->collision_cooldown -= cloakDt;
+            }
         }
         if (ai_actor->object->alive == false && ai_actor->is_destroyed == false) {
             ai_actor->is_destroyed = true;
@@ -550,7 +565,13 @@ void SCMission::update() {
             if (!ai_actor->has_exploded && ai_actor->object->entity != nullptr &&
                 ai_actor->object->entity->explos != nullptr) {
                 ai_actor->has_exploded = true;
-                this->explosions.push_back(new SCExplosion(ai_actor->object->entity->explos->objct, ai_actor->object->position));
+                // 12x explosion scale for capital ships — see hasBeenHit's
+                // own comment (SCMissionActors.cpp) for why.
+                std::string upperName = ai_actor->object->member_name;
+                std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+                float explosionScale = SCMissionActors::IsCapitalShipName(upperName) ? 600.0f : 50.0f;
+                bool bigDeathSequence = SCMissionActors::IsLargeCapitalShipName(upperName);
+                this->explosions.push_back(new SCExplosion(ai_actor->object->entity->explos->objct, ai_actor->object->position, explosionScale, bigDeathSequence));
                 if (this->sound.sounds.size() > 0) {
                     MemSound *sound = this->sound.sounds[SoundEffectIds::EXPLOSION_1];
                     Mixer.playSoundVoc(sound->data, sound->size);
@@ -645,6 +666,16 @@ void SCMission::update() {
             }
         }
         
+        // Disabled actors (OP_SET_TARGET_DISABLED, SCProg.cpp — the "shoot
+        // the engines until it reports disabled" mechanic) stop flying and
+        // fighting but stay alive/on-screen, dead in space at wherever they
+        // were when disabled — distinct from is_destroyed, which already
+        // short-circuits above. Skips plane->Simulate()/pilot->FlyTo()
+        // below (no further movement) as well as the AI command dispatch
+        // just above.
+        if (ai_actor->is_disabled) {
+            continue;
+        }
         ai_actor->protectSelf();
         switch (ai_actor->current_command) {
             case OP_SET_WAIT_FOR_SECONDS:
@@ -737,6 +768,83 @@ void SCMission::update() {
                 ai_actor->object->entity = ai_actor->object->entity->destroyed_object;
             }
             //ai_actor->plane = nullptr;
+        }
+    }
+    // Ship-to-ship collision damage (manual, 2026-07 session). Pairwise
+    // world-space AABB overlap test, restricted to EntityType::jet (every
+    // SSHP-parsed entity — fighters and capital ships alike; excludes
+    // turret sub-actors, debris, ground props, etc., which would
+    // otherwise spuriously "collide" with their own parent ship every
+    // tick). collision_cooldown on both sides guards against re-applying
+    // damage every tick while two actors stay overlapping — no friendly-
+    // fire exclusion, matching the existing weapon friendly-fire policy
+    // (see [[project_wc3_hit_visuals_and_collision]]).
+    //
+    // Bug fix (2026-07 session, user-reported: wingman colliding on
+    // takeoff and exploding): capital ships used to be full participants
+    // here, same as any fighter. WC3Mission.cpp's own hangar-bay scene-
+    // spawn fallback places a docked wingman only ~40 units from the
+    // player (position += 40+spreadOffset), which — with the player
+    // starting inside/against the TCS Victory's own hull — lands well
+    // inside the Victory's raw, unscaled, hundreds-of-units-across mesh
+    // AABB. GetCollisionDamage() derives damage from the *attacker's own*
+    // shield+armor total, so overlapping the Victory (a capital ship's
+    // shield+armor dwarfs any fighter's) was instantly lethal the moment
+    // the wingman's is_active flag flipped true — normally the very first
+    // SCMission::update() tick, with collision_cooldown still at its
+    // default 0.0f. Capital ships already have their own separate DAMG>
+    // CPTL hull-point system for weapons fire; there's no equivalent real
+    // mechanic for a fighter grazing a carrier's hull to one-shot it (or
+    // for a capital ship to take fighter-collision damage at all), so
+    // capital ships are excluded from this system entirely rather than
+    // adding a docked-state/grace-period exception that would still leave
+    // every other capital-ship-adjacent maneuver (formation flying close
+    // to the Victory, launch/landing approaches) exposed to the same bug.
+    for (size_t i = 0; i < this->actors.size(); i++) {
+        SCMissionActors *a = this->actors[i];
+        if (a == nullptr || a->is_destroyed || !a->is_active || a->collision_cooldown > 0.0f ||
+            a->object == nullptr || a->object->entity == nullptr ||
+            a->object->entity->entity_type != EntityType::jet ||
+            SCMissionActors::IsCapitalShipName(a->object->member_name)) {
+            continue;
+        }
+        BoudingBox *bbA = a->object->entity->GetBoudingBpx();
+        if (bbA == nullptr) {
+            continue;
+        }
+        Point3D aMin = {a->object->position.x + bbA->min.x, a->object->position.y + bbA->min.y, a->object->position.z + bbA->min.z};
+        Point3D aMax = {a->object->position.x + bbA->max.x, a->object->position.y + bbA->max.y, a->object->position.z + bbA->max.z};
+        for (size_t j = i + 1; j < this->actors.size(); j++) {
+            SCMissionActors *b = this->actors[j];
+            if (b == nullptr || b->is_destroyed || !b->is_active || b->collision_cooldown > 0.0f ||
+                b->object == nullptr || b->object->entity == nullptr ||
+                b->object->entity->entity_type != EntityType::jet ||
+                SCMissionActors::IsCapitalShipName(b->object->member_name)) {
+                continue;
+            }
+            BoudingBox *bbB = b->object->entity->GetBoudingBpx();
+            if (bbB == nullptr) {
+                continue;
+            }
+            Point3D bMin = {b->object->position.x + bbB->min.x, b->object->position.y + bbB->min.y, b->object->position.z + bbB->min.z};
+            Point3D bMax = {b->object->position.x + bbB->max.x, b->object->position.y + bbB->max.y, b->object->position.z + bbB->max.z};
+            bool overlap = aMin.x <= bMax.x && aMax.x >= bMin.x &&
+                           aMin.y <= bMax.y && aMax.y >= bMin.y &&
+                           aMin.z <= bMax.z && aMax.z >= bMin.z;
+            if (!overlap) {
+                continue;
+            }
+            int damageFromA = a->GetCollisionDamage();
+            int damageFromB = b->GetCollisionDamage();
+            b->ApplyDamage(damageFromA, a);
+            a->ApplyDamage(damageFromB, b);
+            // 1 second — long enough to clear the overlap in the common
+            // case (a ram normally separates within a frame or two of
+            // real gameplay speed) without needing real bounce/separation
+            // physics, which this engine doesn't model for actor-actor
+            // contact at all.
+            a->collision_cooldown = 1.0f;
+            b->collision_cooldown = 1.0f;
         }
     }
     // Space missions have no runway/ground for SCJdynPlane's own landed

@@ -44,6 +44,16 @@ public:
     // autopilot's "no non-capital enemies nearby" engage gate
     // (SCStrike::checkKeyboard's AUTOPILOT handler).
     static bool IsCapitalShipName(const std::string &upperName);
+    // Subset of IsCapitalShipName's own prefix list: only the handful of
+    // truly massive, named/unique assets (dreadnought, carriers, the
+    // player's own Victory, a star base, the Behemoth superweapon) — not
+    // corvettes/destroyers/transports/shuttles, which are "capital-tier"
+    // for radar/IFF purposes but not what "a large capital ship" means for
+    // the death cinematic below. Drives SCStrike's large-ship explosion
+    // sequence (see [[project_wc3_hit_visuals_and_collision]]): first-two-
+    // frames, screen whiteout, then the rest of the animation, gated by
+    // has_exploded the same way the ordinary explosion spawn is.
+    static bool IsLargeCapitalShipName(const std::string &upperName);
     // Species check for the same real-world WC3 ship-class list above,
     // used as the friend/foe fallback for capital ships (MISN>TEAM only
     // ever lists the player's fighter wing, never capital ships — see
@@ -107,6 +117,13 @@ public:
     // ship/object is guaranteed an explosion, not just weapon kills) so it
     // doesn't double up on actors hasBeenHit already handled.
     bool has_exploded{false};
+    // "Disabled" (not destroyed) — set by OP_SET_TARGET_DISABLED
+    // (SCProg.cpp), the WC3 "shoot the engines until it reports disabled"
+    // mechanic (user-confirmed 2026-07 session, the Torgo mission's
+    // "disable tankers" objective). A disabled actor stops flying/
+    // fighting (see its own check in SCMission.cpp's per-actor update
+    // loop) but is still alive — distinct from is_destroyed.
+    bool is_disabled{false};
     bool prog_executed{false};
     // Total remaining hit points across every shield+armor quadrant below —
     // kept in sync by hasBeenHit purely so the existing threshold-based
@@ -127,12 +144,27 @@ public:
     // for gauges (current/max) since max varies per ship type.
     float max_shield_front{0.0f}, max_shield_back{0.0f}, max_shield_left{0.0f}, max_shield_right{0.0f};
     float max_armor_front{0.0f}, max_armor_back{0.0f}, max_armor_left{0.0f}, max_armor_right{0.0f};
+    // Total shield points/second this ship regenerates, split evenly
+    // across every currently-damaged facing (manual, 2026-07 session:
+    // "calibrated to regenerate totally in 10 seconds... divided among
+    // all sides with damaged shields"). Seeded from RSEntity::SHLD_FX::
+    // regen_rate (WC3Mission::buildActorFromPart) — 0 for actors with no
+    // SHLD chunk, which UpdateShieldRegen's own early-out handles.
+    // Unlike shields, armor never regenerates at all (manual, same
+    // message) — no equivalent field/logic exists for armor, by design.
+    float shield_regen_rate{0.0f};
     // Seconds remaining to keep showing the shield-hit visual (RSEntity::
     // shield->objct, the SHLDFX mesh — see [[project_wc3_shield_effect_mesh]]
     // memory note for its own APPR>SHLD parsing fix) after a hit was
     // actually absorbed by shield on some facing. Set by hasBeenHit,
     // ticked down and drawn in SCStrike's per-actor render loop.
     float shield_hit_flash_timer{0.0f};
+    // Seconds until this actor can deal/take ship-to-ship collision damage
+    // again (SCMission.cpp's own pairwise overlap check) — without this,
+    // two actors whose bounding boxes stay overlapping for several ticks
+    // (e.g. a kill that doesn't instantly separate them) would re-apply a
+    // near-lethal hit every single tick instead of once per collision.
+    float collision_cooldown{0.0f};
     // Internal-component damage, 0 (undamaged) to 100 (fully destroyed —
     // permanently unrepairable, per the manual). Indexed by ShipComponent.
     // Present on every actor (matching shield_front/armor_front's own
@@ -158,8 +190,18 @@ public:
     // independently confirmed against real WC3 Strakha behavior (the
     // 50/50 duty-cycle split is a reasonable guess, not measured).
     void UpdateCloak(float dt);
+    // Driven once per SCMission::update() tick, same as UpdateCloak — see
+    // shield_regen_rate's own comment.
+    void UpdateShieldRegen(float dt);
     int team_id{0};
     int current_target{0};
+    // Mines the player has dropped near this actor (ID_MINEMISS,
+    // proximity-matched at drop time — see SCPlane::Shoot's own comment).
+    // Read by OP_GET_MINE_COUNT_AT_NAVPOINT (228); only meaningful on the
+    // JUBOUY nav-point buoys in MISNJ002 ("Torgo 2"), the only file that
+    // uses the opcode, but tracked generically per-actor like
+    // component_damage/current_target rather than mission-specific state.
+    int mines_deployed{0};
     bool current_command_executed{false};
     prog_op current_command{prog_op::OP_NOOP};
     prog_op override_command{prog_op::OP_NOOP};
@@ -187,8 +229,32 @@ public:
     virtual bool activateTarget(uint8_t arg);
     virtual int getDistanceToTarget(uint8_t arg);
     virtual int getDistanceToSpot(uint8_t arg);
+    // Releases this actor's current_target/target/attacker/target_position
+    // state, mirroring the inline release destroyTarget() does on a kill.
+    // Used by OP_CLEAR_TARGET (145).
+    void releaseTarget();
     virtual void shootWeapon(SCMissionActors *target);
     virtual void hasBeenHit(SCSimulatedObject *weapon, SCMissionActors *attacker);
+    // The shield/armor/health-gated damage-application core hasBeenHit
+    // extracts `damage` and then runs — factored out so ship-to-ship
+    // collision damage (SCMission.cpp, see [[project_wc3_ship_collision]])
+    // can drive the exact same shield->armor->hull->death pipeline
+    // without a weapon object. `weapon` stays optional purely so the
+    // existing gun-impact-vs-explosion death-sound distinction still
+    // works unchanged for real weapon hits; leave it null for anything
+    // else (collisions included).
+    void ApplyDamage(int damage, SCMissionActors *attacker, SCSimulatedObject *weapon = nullptr);
+    // Manual, 2026-07 session: "Each fighter type has a unique damage
+    // value for collisions, which is just short of the total of a given
+    // side's armor and shields." No stored per-ship collision-damage
+    // field exists anywhere in the real IFF data (checked exhaustively —
+    // see [[project_wc3_capital_ship_stats]]), so this derives it from
+    // this actor's own front-facing shield+armor total instead — bigger/
+    // tougher ships naturally deal a bigger ram hit, matching the
+    // manual's own description without inventing an unstored constant.
+    // 0.9x keeps it "just short of" rather than exactly equal to that
+    // total, per the manual's own wording.
+    int GetCollisionDamage();
     // Called from hasBeenHit with whatever damage got past shield+armor on
     // the hit facing (0 if none did — component damage only has a chance
     // to happen on a genuine hull hit, per the manual). Base no-op; real

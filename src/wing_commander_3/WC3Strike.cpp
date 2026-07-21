@@ -126,12 +126,11 @@ bool WC3Strike::setMission(char const* missionName) {
         renderer.skyFaces = &wc3Mission->world->skyFaces;
         renderer.skyEntities = &wc3Mission->skyEntities;
         renderer.starSprites = &wc3Mission->world->starSprites;
-        // WRLD>BACK's palette index (see RSWorld::backgroundColorIndex) —
-        // the main VGA palette already stores 8-bit-converted colors (see
-        // RSPalette::parsePALT_PALT's convertFrom6To8 calls), so no further
-        // scaling is needed beyond mapping 0-255 to GL's 0-1 float range.
-        Texel backColor = VGA.getPalette()->colors[wc3Mission->world->backgroundColorIndex];
-        renderer.spaceBackgroundColor = {backColor.r / 255.0f, backColor.g / 255.0f, backColor.b / 255.0f};
+        // Fixed RGB(8,16,36) (user-confirmed, 2026-07 session) — replaces
+        // the previous WRLD>BACK palette-index lookup (RSWorld::
+        // backgroundColorIndex), which didn't match the real space
+        // background color.
+        renderer.spaceBackgroundColor = {8.0f / 255.0f, 16.0f / 255.0f, 36.0f / 255.0f};
         // Grey motion-dust particles (WRLD>DUST) — see SCRenderer.h's
         // show_dust/dustCount/dustSpawnRadius comments. hasDust is false
         // only for the 5 ground-mission worlds (no DUST chunk at all —
@@ -164,7 +163,7 @@ bool WC3Strike::setMission(char const* missionName) {
         renderer.skyFaces = nullptr;
         renderer.skyEntities = nullptr;
         renderer.starSprites = nullptr;
-        renderer.spaceBackgroundColor = {0.0f, 0.0f, 0.0f};
+        renderer.spaceBackgroundColor = {8.0f / 255.0f, 16.0f / 255.0f, 36.0f / 255.0f};
     }
 
     if (this->current_mission->player == nullptr) {
@@ -324,8 +323,41 @@ void WC3Strike::updateCloakEffect() {
     if (this->player_plane->cloak_factor > 0.0f) {
         RSVGA& vga = RSVGA::instance();
         VGAPalette* colorPal = vga.getPalette();
-        if (bwPalette != nullptr && colorPal != nullptr) {
-            vga.interpolerPalettes(colorPal, bwPalette, this->player_plane->cloak_factor);
+        // Bug fix (2026-07 session): this used to be dead code —
+        // `bwPalette` was declared but never assigned anywhere (checked:
+        // no `bwPalette =` exists in this file or WC3Strike.h), so the
+        // guard below was always false and the palette blend never ran
+        // at all. Lazily build it here, the first time it's actually
+        // needed, from `savedColorPalette` — a field that already existed
+        // for exactly this purpose but was likewise never populated.
+        //
+        // Critically, `savedColorPalette` must be captured *before* any
+        // blending happens, not read from `colorPal` on every call:
+        // `RSVGA::getPalette()` returns a pointer to the SAME live
+        // palette `interpolerPalettes` writes into (RSVGA::palette), so
+        // blending directly from `colorPal` every frame would blend from
+        // last frame's already-partially-grey result instead of the true
+        // original colors — decloaking would asymptotically approach some
+        // grey-ish equilibrium instead of ever fully restoring color, and
+        // repeated cloak/decloak cycles would drift further from the
+        // original palette each time with no way back.
+        if (colorPal != nullptr && bwPalette == nullptr) {
+            this->savedColorPalette = *colorPal;
+            this->bwPalette = new VGAPalette();
+            for (int i = 0; i < 256; i++) {
+                Texel *src = this->savedColorPalette.GetRGBColor(i);
+                // Standard luminance desaturation — same weights already
+                // used elsewhere in this codebase (SCCockpit.cpp).
+                uint8_t grey = (uint8_t)(0.299f * (float)src->r + 0.587f * (float)src->g + 0.114f * (float)src->b);
+                Texel *dst = this->bwPalette->GetRGBColor(i);
+                dst->r = grey;
+                dst->g = grey;
+                dst->b = grey;
+                dst->a = src->a;
+            }
+        }
+        if (bwPalette != nullptr) {
+            vga.interpolerPalettes(&this->savedColorPalette, bwPalette, this->player_plane->cloak_factor);
         }
     }
 }

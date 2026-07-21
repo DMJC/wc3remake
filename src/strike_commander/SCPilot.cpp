@@ -39,11 +39,14 @@ void SCPilot::SetTargetWaypoint(Vector3D waypoint) {
         az += 360.0f;
     }
     this->target_azimut = az*10.0f;
-    float ground_y = this->plane->area->getY(waypoint.x, waypoint.z);
+    // WC3 space missions have no terrain (this->plane->area stays null —
+    // see WC3Mission::is_space_mission); same -1000000.0f "no ground"
+    // sentinel SCJdynPlane::updatePosition already established.
+    float ground_y = (this->plane->area != nullptr) ? this->plane->area->getY(waypoint.x, waypoint.z) : -1000000.0f;
     if (waypoint.y < ground_y) {
         waypoint.y = ground_y+1000;
     }
-    float ground_level = this->plane->area->getY(this->plane->x, this->plane->z);
+    float ground_level = (this->plane->area != nullptr) ? this->plane->area->getY(this->plane->x, this->plane->z) : -1000000.0f;
     if (this->plane->y < ground_y + 1000) {
         waypoint.y = ground_y + 1000;
     }

@@ -155,10 +155,27 @@ void SCProg::execute() {
                         if (actor->actor_id == prog.arg) {
                             actor->object->alive = false;
                             actor->is_destroyed = false;
+                            // Death radio message — this scripted-destroy path
+                            // (the one real WC3 capital ships mostly die
+                            // through) never triggered one before, unlike
+                            // hasBeenHit's own weapon-kill death branch. Same
+                            // guard/RADI code as that one.
+                            if (actor->profile != nullptr) {
+                                actor->setMessage(0x0A);
+                            }
                             if (!actor->has_exploded && actor->object->entity->explos != nullptr &&
                                 actor->object->entity->explos->objct != nullptr) {
                                 actor->has_exploded = true;
-                                actor->mission->explosions.push_back(new SCExplosion(actor->object->entity->explos->objct, actor->object->position));
+                                // 12x explosion scale for capital ships — see
+                                // hasBeenHit's own comment (SCMissionActors.cpp)
+                                // for why. This is the path real WC3 capital
+                                // ships mostly die through (scripted mission
+                                // destruction, not sustained player fire).
+                                std::string upperName = actor->object->member_name;
+                                std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+                                float explosionScale = SCMissionActors::IsCapitalShipName(upperName) ? 600.0f : 50.0f;
+                                bool bigDeathSequence = SCMissionActors::IsLargeCapitalShipName(upperName);
+                                actor->mission->explosions.push_back(new SCExplosion(actor->object->entity->explos->objct, actor->object->position, explosionScale, bigDeathSequence));
                             }
                             break;
                         }
@@ -217,9 +234,11 @@ void SCProg::execute() {
                     this->actor->deactivate(prog.arg);
                 break;
                 case OP_ACTIVATE_OBJ:
+                case OP_ACTIVATE_OBJ_ALT:
                     this->actor->activateTarget(prog.arg);
                 break;
                 case OP_MOVE_FLAG_TO_WORK_REGISTER:
+                case OP_MOVE_FLAG_TO_WORK_REGISTER_ALT:
                     work_register = this->mission->mission->mission_data.flags[prog.arg];
                 break;
                 case OP_SAVE_VALUE_TO_GAMFLOW_REGISTER:
@@ -259,6 +278,29 @@ void SCProg::execute() {
                     bool is_less = (work_register < prog.arg);
                     bool is_greater = (work_register > prog.arg);
                     
+                    if (is_equal) {
+                        compare_flag |= PROG_CMP_EQUAL;
+                    }
+                    if (is_less) {
+                        compare_flag |= PROG_CMP_LESS;
+                    }
+                    if (is_greater) {
+                        compare_flag |= PROG_CMP_GREATER;
+                    }
+                }
+                break;
+                // See OP_CMP_WORK_WITH_FLAG's own comment (SCenums.h) — same
+                // as OP_CMP_WORK_WITH_VALUE, but the right-hand side is a
+                // flag's current value instead of a literal baked into the
+                // instruction.
+                case OP_CMP_WORK_WITH_FLAG:
+                {
+                    compare_flag = prog_compare_return_values::PROG_CMP_UNSET;
+                    int flag_value = this->mission->mission->mission_data.flags[prog.arg];
+                    bool is_equal = (work_register == flag_value);
+                    bool is_less = (work_register < flag_value);
+                    bool is_greater = (work_register > flag_value);
+
                     if (is_equal) {
                         compare_flag |= PROG_CMP_EQUAL;
                     }
@@ -312,7 +354,19 @@ void SCProg::execute() {
                         exec = false;
                     }
                 break;
+                // See OP_BRANCH_IF_LESS_OR_EQUAL's own comment (SCenums.h).
+                case OP_BRANCH_IF_LESS_OR_EQUAL:
+                    if (compare_flag & (prog_compare_return_values::PROG_CMP_LESS | prog_compare_return_values::PROG_CMP_EQUAL)) {
+                        jump_to = prog.arg;
+                        exec = false;
+                    }
+                break;
                 case OP_SELECT_NEXT_MISSION:
+                // See OP_SELECT_NEXT_MISSION_ALT's own comment (SCenums.h)
+                // — same MISN>MSGS-index-to-mission-basename mechanism,
+                // just the only transition opcode some files use instead
+                // of OP_SELECT_NEXT_MISSION/_END.
+                case OP_SELECT_NEXT_MISSION_ALT:
                     this->mission->next_mission_message_index = prog.arg;
                 break;
                 case OP_SELECT_NEXT_MISSION_END:
@@ -324,6 +378,39 @@ void SCProg::execute() {
 
                     // This opcode is a no-op in the original game, possibly reserved for future use.
 
+                break;
+                // See OP_SET_TARGET_DISABLED's own comment (SCenums.h).
+                case OP_GET_TARGET_ENGINE_HEALTH:
+                    work_register = 100;
+                    for (auto test_actor: this->mission->actors) {
+                        if (test_actor->actor_id == prog.arg) {
+                            work_register = 100 - (int)test_actor->component_damage[(size_t)ShipComponent::Engine];
+                            break;
+                        }
+                    }
+                break;
+                // See OP_GET_MINE_COUNT_AT_NAVPOINT's own comment
+                // (SCenums.h). arg is a 1-based ordinal among this
+                // mission's own JUBOUY actors (nav-point buoys), not an
+                // actor_id — resolved generically here rather than
+                // hardcoding MISNJ002's specific actor id numbers.
+                case OP_GET_MINE_COUNT_AT_NAVPOINT: {
+                    work_register = 0;
+                    int navpoint_ordinal = 0;
+                    for (auto test_actor: this->mission->actors) {
+                        if (test_actor->object == nullptr || test_actor->object->member_name != "JUBOUY") {
+                            continue;
+                        }
+                        navpoint_ordinal++;
+                        if (navpoint_ordinal == prog.arg) {
+                            work_register = test_actor->mines_deployed;
+                            break;
+                        }
+                    }
+                }
+                break;
+                case OP_CLEAR_TARGET:
+                    this->actor->releaseTarget();
                 break;
                 case OP_DIST_TO_TARGET:
                     work_register = this->actor->getDistanceToTarget(prog.arg);
@@ -355,7 +442,30 @@ void SCProg::execute() {
                         }
                     }
                 break;
+                // See OP_IS_TARGET_CLOAKED's own comment (SCenums.h).
+                case OP_IS_TARGET_CLOAKED:
+                    for (auto test_actor: this->mission->actors) {
+                        if (test_actor->actor_id == prog.arg) {
+                            if (test_actor->plane != nullptr && test_actor->plane->cloaked) {
+                                compare_flag = prog_compare_return_values::PROG_CMP_EQUAL;
+                            } else {
+                                compare_flag = prog_compare_return_values::PROG_CMP_NOT_EQUAL;
+                            }
+                            break;
+                        }
+                    }
+                break;
+                // See OP_SET_TARGET_DISABLED's own comment (SCenums.h).
+                case OP_SET_TARGET_DISABLED:
+                    for (auto test_actor: this->mission->actors) {
+                        if (test_actor->actor_id == prog.arg) {
+                            test_actor->is_disabled = true;
+                            break;
+                        }
+                    }
+                break;
                 case OP_SET_FLAG_TO_TRUE:
+                case OP_SET_FLAG_TO_TRUE_ALT:
                     this->mission->mission->mission_data.flags[prog.arg] = 1;
                 break;
                 case OP_SET_FLAG_TO_FALSE:

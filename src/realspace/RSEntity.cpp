@@ -1106,6 +1106,7 @@ void RSEntity::parseREAL_OBJT_SSHP_DAMG(uint8_t *data, size_t size) {
     IFFSaxLexer lexer;
     std::unordered_map<std::string, std::function<void(uint8_t * data, size_t size)>> handlers;
     handlers["FGTR"] = std::bind(&RSEntity::parseREAL_OBJT_SSHP_DAMG_FGTR, this, std::placeholders::_1, std::placeholders::_2);
+    handlers["CPTL"] = std::bind(&RSEntity::parseREAL_OBJT_SSHP_DAMG_CPTL, this, std::placeholders::_1, std::placeholders::_2);
     lexer.InitFromRAM(data, size, handlers);
 }
 void RSEntity::parseREAL_OBJT_SSHP_DAMG_FGTR(uint8_t *data, size_t size) {
@@ -1114,8 +1115,30 @@ void RSEntity::parseREAL_OBJT_SSHP_DAMG_FGTR(uint8_t *data, size_t size) {
     ByteStream bs(data, size);
     bs.ReadUInt32LE(); // constant 10 across every ship checked — meaning unknown
     bs.ReadUInt32LE(); // varies 2-5 — meaning unknown (damage-stage count?)
-    uint32_t hitpoints = bs.ReadUInt32LE();
-    this->health = (uint8_t)std::min<uint32_t>(hitpoints, 255);
+    this->health = bs.ReadUInt32LE();
+}
+// Capital ships (OBJT>SSHP>DAMG>CPTL) never had this chunk parsed at all
+// before this fix — `health` silently stayed 0 for every capital ship.
+// Unlike FGTR's 12-byte record, CPTL is a single flat 4-byte value (no
+// leading "constant 10"/"damage-stage count" fields — confirmed via
+// DAMG's own chunk size, 12 bytes total = 8-byte sub-chunk header + this
+// 4-byte payload, nothing else). Cross-checked 2026-07 session against
+// 7 real Kilrathi capital ships (KCORV/KDESTL/KDEST/KCRUISER/KCARRIER/
+// KDREAD/KTRN) and 4 Terran ones (TCRUISER/TDEST/TFRIG/VICTORY) — a real,
+// present, per-ship-varying value (2000-100000 across the corpus), but it
+// does NOT match the WC3 manual's own printed "Body" damage-point figures
+// by any consistent ratio (checked directly against user-supplied manual
+// numbers for all 7 Kilrathi ships — 6/7 mismatched, no common scale
+// factor). So this is wired up as the real `health`/hitpoints value this
+// chunk actually contains — same role as FGTR's own hitpoints field, same
+// gating logic in SCMissionActors::hasBeenHit — but is NOT claimed to be
+// the manual's specific "Body" statistic; that still has no confirmed
+// source field.
+void RSEntity::parseREAL_OBJT_SSHP_DAMG_CPTL(uint8_t *data, size_t size) {
+    if (size < 4)
+        return;
+    ByteStream bs(data, size);
+    this->health = bs.ReadUInt32LE();
 }
 // SSHP's WEAP chunk wraps a single flat "FGTR" record (matching the
 // DYNM/DAMG pattern above) containing GUNS/MISL/DECY sub-chunks — each a
@@ -1183,8 +1206,19 @@ int RSEntity::wc3WeaponNameToId(const std::string &name) {
     static const std::unordered_map<std::string, int> kNameToId = {
         {"NEUTGUN", ID_NEUTGUN}, {"ION_GUN", ID_IONGUN}, {"RLASER", ID_RLASER_WC3},
         {"REAPGUN", ID_REAPGUN}, {"TACHGUN", ID_TACHGUN},
+        // User-confirmed, 2026-07 session: PHOTGUN/PLASGUN/MASSGUN/MESOGUN
+        // all exist as real OBJECTS.TRE files alongside the 5 above (9
+        // real WC3 guns total). No raw SSHP hardpoint type-id byte is
+        // confirmed for these yet (see wc3GunRawIdToWeaponId below), so
+        // they only resolve through this name-based lookup for now.
+        {"PHOTGUN", ID_PHOTGUN}, {"PLASGUN", ID_PLASGUN},
+        {"MASSGUN", ID_MASSGUN}, {"MESOGUN", ID_MESOGUN},
         {"HSMISS", ID_HSMISS}, {"IRMISS", ID_IRMISS}, {"FFMISS", ID_FFMISS},
         {"TORKMISS", ID_TORKMISS}, {"TEMBMISS", ID_TEMBMISS}, {"MINEMISS", ID_MINEMISS},
+        // User-confirmed, 2026-07 session — real OBJECTS.TRE files
+        // DFMISS.IFF (dumbfire, an unguided rocket) and LEECHMIS.IFF
+        // (leech missile, drains target shield energy).
+        {"DFMISS", ID_DFMISS}, {"LEECHMIS", ID_LEECHMISS},
     };
     auto it = kNameToId.find(name);
     return (it != kNameToId.end()) ? it->second : -1;

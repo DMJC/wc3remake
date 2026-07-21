@@ -78,6 +78,42 @@ struct WorldCameraAutoSequence {
     std::vector<uint8_t> tailRaw; // everything past the shared header, verbatim, undecoded
 };
 
+// WRLD>CAMR's 9 single-record children (TARG/ROTA/CAMR/CHAS/NAV/COCK/VCTC/
+// WEAP/TRAK) — confirmed byte-for-byte IDENTICAL between every real
+// WORLD.IFF sample checked (2026-07 session, cross-checked against the
+// separately-attested "identical across all 43 real WORLD.IFF-family
+// files" note on parseWRLD_CAMR's own declaration below): a fixed
+// engine-wide camera-mode parameter table, not per-mission data. Common
+// shape: an 8-byte null-padded mode label matching the chunk's own name
+// ("TARGET\0\0" etc.), a 2-byte field (0 for every mode except COCK,
+// which reads 1 — meaning unconfirmed, kept as modeFlags rather than
+// discarded), an 8-byte actor name (always "PLAYER\0\0"; "NAVMAP\0\0" for
+// NAV itself), then a shared 10-byte tail: int32 sharedField0 (always
+// 50000), int16 fovDegrees (40 typical, 30 for COCK, 45 for NAV —
+// plausibly a real per-mode field of view in degrees, though not
+// independently confirmed as exactly that), int16 sharedField1 (always
+// 2560), int16 sharedField2 (always 0). CAMR (no actor — a free/self
+// camera, not locked to a target) and CHAS (chase camera) additionally
+// carry raw bytes BEFORE where the 2-byte-gap+actor-name would sit
+// (CAMR: 20 bytes with no actor name field at all; CHAS: 14 bytes,
+// plausibly a camera position/offset vector given a chase cam needs to
+// sit behind its target rather than directly on it, but not confidently
+// split into individual fields yet). VCTC/WEAP additionally carry raw
+// bytes AFTER the shared tail (16 and 28 bytes respectively). Undecoded
+// spans kept as raw blobs rather than guessed splits, same policy as
+// WorldCameraAutoSequence's own tailRaw above.
+struct WorldCameraModeParams {
+    std::string modeLabel;
+    std::vector<uint8_t> preActorRaw; // CAMR/CHAS only; empty otherwise
+    int16_t modeFlags{0};             // simple-layout modes only; 1 for COCK, 0 elsewhere
+    std::string actorName;            // empty for CAMR (no actor field)
+    int32_t sharedField0{0};          // always 50000
+    int16_t fovDegrees{0};
+    int16_t sharedField1{0};          // always 2560
+    int16_t sharedField2{0};          // always 0
+    std::vector<uint8_t> extraRaw;    // VCTC/WEAP only; empty otherwise
+};
+
 class RSWorld {
 private:
     void parseWRLD(uint8_t *data, size_t size);
@@ -140,30 +176,27 @@ private:
     // binding per chunk: TARG=Target, ROTA=Rotate, CAMR=Camera (generic/
     // self), CHAS=Chase Camera (F5), NAV=Navmap (N), COCK=Cockpit,
     // VCTC=Victim Camera (F9), WEAP=Weapon Camera (F8), TRAK=Track Camera
-    // (F10), AUTO=Autopilot Camera (A). None of these real WC3 function-key
-    // bindings exist in the engine yet — SCStrike.cpp's camera_mode/View
+    // (F10), AUTO=Autopilot Camera (A). SCStrike.cpp's camera_mode/View
     // system (View::FRONT/FOLLOW/RIGHT/LEFT/REAR/TARGET/EYE_ON_TARGET/
-    // MISSILE_CAM/etc.) is Strike Commander's own legacy view-cycling key
-    // scheme, not this one; wiring F5/F8/F9/F10/A to real WC3 camera modes
-    // (and consuming these chunks' per-mode FOV/position data instead of
-    // leaving it parsed-but-unused) is still an open gap, not done here.
+    // MISSILE_CAM/etc.) is still Strike Commander's own legacy view-cycling
+    // key scheme, not this one, and the real F5/F8/F9/F10/A key bindings
+    // still aren't wired up — but the 9 single-record children below are
+    // now actually parsed (see WorldCameraModeParams) rather than left as
+    // no-op stubs, and their real per-mode fovDegrees feeds SCStrike's
+    // existing View-mode camera setup (2026-07 session, user-requested:
+    // "use the WORLD.IFF camera data instead of guessed constants").
     // AUTO is a REPEATED chunk (4 separate AUTO records seen in one CAMR
     // FORM, sizes 77-98, not one chunk whose size differs per file) and
     // contains readable embedded strings — "TAKEOFF", "PLAYER", "COCKPIT"
     // seen so far — clearly one autopilot/camera-mode sequence label per
-    // instance, but the full field layout isn't decoded yet. All still
-    // no-op stubs; only the dispatch (previously dead) is fixed here.
+    // instance, but the full field layout isn't decoded yet. Still a
+    // no-op stub — only the dispatch (previously dead) is fixed here.
     //
-    // Partial decode of one real WORLD.IFF's CAMR (session notes, not
-    // stored anywhere — nothing renders this yet): TARG/ROTA/CHAS/COCK/
-    // VCTC/WEAP/TRAK all share a common record shape: an 8-10 byte
-    // null-padded ASCII mode label matching the chunk's own name (e.g.
-    // "TARGET\0\0\0\0", "COCKPIT\0"), an 8-byte null-padded actor name
-    // (always "PLAYER\0\0" in this sample), then a shared 10-byte tail:
-    // int32(50000) + int16(a per-mode value — 40 for TARG/ROTA/CHAS/VCTC/
-    // WEAP/TRAK, 30 for COCK; plausibly an FOV in degrees, narrower for the
-    // cockpit view) + int16(2560) + int16(0). VCTC/WEAP have extra trailing
-    // fields beyond this shared tail, not yet examined.
+    // TARG/ROTA/CAMR/CHAS/NAV/COCK/VCTC/WEAP/TRAK are now genuinely parsed
+    // into WorldCameraModeParams (its own comment has the up-to-date field
+    // breakdown, superseding the once-was-just-session-notes version this
+    // paragraph used to be) and consumed by SCStrike's camera setup — see
+    // WorldCameraModeParams's declaration above for the confirmed shape.
     //
     // AUTO records share this same header (label + "PLAYER" + the
     // int32(50000)/int16 tail) but carry substantially more trailing data
@@ -205,6 +238,21 @@ public:
     std::vector<WorldSkyFace> skyFaces;
     std::vector<WorldAsteroidField> asteroidFields;
     std::vector<WorldCameraAutoSequence> cameraAutoSequences;
+    // WRLD>CAMR's 9 single-record children — see WorldCameraModeParams for
+    // the shared field breakdown. Names match each chunk's own real WC3
+    // key-binding role (see parseWRLD_CAMR's own comment): camTarget=TARG,
+    // camRotate=ROTA, camCamera=CAMR (generic/self), camChase=CHAS (F5),
+    // camNavmap=NAV (N), camCockpit=COCK, camVictim=VCTC (F9),
+    // camWeapon=WEAP (F8), camTrack=TRAK (F10).
+    WorldCameraModeParams camTarget;
+    WorldCameraModeParams camRotate;
+    WorldCameraModeParams camCamera;
+    WorldCameraModeParams camChase;
+    WorldCameraModeParams camNavmap;
+    WorldCameraModeParams camCockpit;
+    WorldCameraModeParams camVictim;
+    WorldCameraModeParams camWeapon;
+    WorldCameraModeParams camTrack;
     // WRLD>INFO's 3 int32LE fields. infoField1 correlates exactly with
     // whether this world is a GROUND mission: the 5 worlds with no DUST
     // chunk (ALCOR, KILRAH, REACTOR, TSTPLNT, WORLDT) read (2000, 66286)

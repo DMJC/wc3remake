@@ -12,11 +12,31 @@ struct SCMissionWaypoint {
     SPOT *spot{nullptr};
     std::string *message{nullptr};
     std::string *objective{nullptr};
+    // SCMissionActorsPlayer::takeOff()/land() (SCMissionActors.cpp) each
+    // push a synthetic waypoint representing the mission's own launch/
+    // landing point, not a real player-facing navpoint — objective is
+    // exactly "take off" or "landing" (byte-confirmed against the
+    // source, not guessed). Shared by SCNavMap's marker list/N-key
+    // cycling, SCCockpit's radar plot, and SCStrike's proximity
+    // auto-advance — was duplicated ad hoc at each site before being
+    // pulled up here (2026-07 session).
+    static bool IsTakeoffOrLanding(SCMissionWaypoint *wp) {
+        if (wp == nullptr || wp->objective == nullptr) {
+            return false;
+        }
+        return *wp->objective == "take off" || *wp->objective == "landing";
+    }
 };
 
 struct RadioMessages {
     std::string message;
     MemSound *sound{nullptr};
+    // DATA\MOVIES\<name> filename from the sender's own RSProf::radi.fmv
+    // (a "radio face" video clip shown alongside this reply — WC3-only,
+    // empty for every SC profile and most WC3 RADI codes too) — see
+    // SCMissionActors::setMessage for how it's resolved, and SCCockpit's
+    // comm rendering for where it's actually played.
+    std::string fmvFilename;
 };
 class SCProg;
 

@@ -588,7 +588,11 @@ public:
     int32_t drag{0};
     RADAR_SIGN *radar_signature{nullptr};
     uint8_t target_type{0};
-    uint8_t health{0};
+    // Widened from uint8_t (2026-07 session): fighters (OBJT>SSHP>DAMG>
+    // FGTR) fit comfortably under 255, but capital ships (OBJT>SSHP>DAMG>
+    // CPTL — see parseREAL_OBJT_SSHP_DAMG_CPTL) run from 2000 (TFRIG) up
+    // to 100000 (KDREAD), which the old 8-bit field silently truncated.
+    uint32_t health{0};
     WDAT *wdat{nullptr};
     DYNN_MISS *dynn_miss{nullptr};
     MISL_DATA *misl_data{nullptr};
@@ -732,6 +736,7 @@ private:
     void parseREAL_OBJT_SSHP_DYNM_FGTR(uint8_t *data, size_t size);
     void parseREAL_OBJT_SSHP_DAMG(uint8_t *data, size_t size);
     void parseREAL_OBJT_SSHP_DAMG_FGTR(uint8_t *data, size_t size);
+    void parseREAL_OBJT_SSHP_DAMG_CPTL(uint8_t *data, size_t size);
     void parseREAL_OBJT_SSHP_WEAP(uint8_t *data, size_t size);
     void parseREAL_OBJT_SSHP_WEAP_FGTR(uint8_t *data, size_t size);
     void parseREAL_OBJT_SSHP_WEAP_FGTR_GUNS(uint8_t *data, size_t size);

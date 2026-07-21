@@ -1589,6 +1589,43 @@ bool SCPlane::Shoot(int weapon_hard_point_id, SCMissionActors *target, SCMission
 
     weap->weight = wobj->weight_in_kg*2.205f;
 
+    // Torgo 2 (MISNJ002.IFF) mine-count-per-nav-point win condition (user-
+    // described, 2026-07 session): matched to the nearest JUBOUY buoy actor
+    // at drop time, not at detonation — mines sit exactly where dropped
+    // (SCSimulatedObject::ComputeTrajectory never moves them again once
+    // spawned), so the drop position IS where the player judged the nav
+    // point to be. See OP_GET_MINE_COUNT_AT_NAVPOINT (228, SCProg.cpp) for
+    // the read side. Player-only: AI never carries/fires mines in practice,
+    // and the mechanic is specifically a player action per the mission
+    // objective text ("Mine jump point"). kMineDeployRadius is an estimate
+    // (no real data pins an exact "close enough" distance for this
+    // mechanic) — smaller than OP_76's confirmed 15000-unit "start
+    // engaging" radius, since dropping a mine implies deliberate precise
+    // placement, not just being in the general vicinity.
+    if (wobj->wdat->weapon_id == ID_MINEMISS && mission != nullptr &&
+        this->pilot != nullptr && this->pilot->actor_name == "PLAYER") {
+        static const float kMineDeployRadius = 3000.0f;
+        SCMissionActors *nearestBuoy = nullptr;
+        float nearestDist = 0.0f;
+        Vector3D dropPos = {weap->x, weap->y, weap->z};
+        for (auto candidate : mission->actors) {
+            if (candidate == nullptr || candidate->object == nullptr) {
+                continue;
+            }
+            if (candidate->object->member_name != "JUBOUY") {
+                continue;
+            }
+            float dist = (candidate->object->position - dropPos).Length();
+            if (nearestBuoy == nullptr || dist < nearestDist) {
+                nearestBuoy = candidate;
+                nearestDist = dist;
+            }
+        }
+        if (nearestBuoy != nullptr && nearestDist <= kMineDeployRadius) {
+            nearestBuoy->mines_deployed++;
+        }
+    }
+
     this->weaps_object.push_back(weap);
     return true;
 }

@@ -38,7 +38,7 @@ private:
 
 public:
     
-    float fovy{45.0f};
+    float fovy{30.0f};
     //Update parameters and recalculate perspective
     void setPersective(float fovy, float aspect, float zNear, float zFar);
     void update();

@@ -1262,7 +1262,7 @@ void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vect
 
             const Texel *texel = palette.GetRGBColor(triangle->color);
             gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
-                      texel->b / 255.0f * lambertianFactor, alpha);
+                      texel->b / 255.0f * lambertianFactor, alpha * this->modelAlphaMultiplier);
 
             gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
         }
@@ -1338,9 +1338,9 @@ void SCRenderer::drawModelColorPass(RSEntity *object, size_t lodLevel, std::vect
                 // of index 0.
                 const Texel *texel = palette.GetRGBColor(triangle->color);
                 gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
-                          texel->b / 255.0f * lambertianFactor, alpha);
-                
-                
+                          texel->b / 255.0f * lambertianFactor, alpha * this->modelAlphaMultiplier);
+
+
                 gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
             }
             gb.end();
@@ -1637,7 +1637,7 @@ void SCRenderer::drawModelTexturePass(RSEntity *object, size_t lodLevel, std::ve
 
                 const Texel *texel = palette.GetRGBColor(triangle->color-1);
 
-                gb.color4f(lambertianFactor, lambertianFactor, lambertianFactor, 1.0f);
+                gb.color4f(lambertianFactor, lambertianFactor, lambertianFactor, this->modelAlphaMultiplier);
 
                 if (usePerFaceUVNorm) {
                     float uRange = (triUMax > triUMin) ? (float)(triUMax - triUMin) : 1.0f;
@@ -1774,7 +1774,7 @@ void SCRenderer::drawModelTexturePass(RSEntity *object, size_t lodLevel, std::ve
                 : ComputeLambertAt(vLocal, nLocal, MV, lightEye, ambientLamber);
 
                 const Texel *texel = palette.GetRGBColor(triangle->color-1);
-                gb.color4f(lambertianFactor, lambertianFactor, lambertianFactor, 1.0f);
+                gb.color4f(lambertianFactor, lambertianFactor, lambertianFactor, this->modelAlphaMultiplier);
                 if (usePerFaceUVNorm) {
                     float uRange = (quadUMax > quadUMin) ? (float)(quadUMax - quadUMin) : 1.0f;
                     float vRange = (quadVMax > quadVMin) ? (float)(quadVMax - quadVMin) : 1.0f;
@@ -1863,7 +1863,7 @@ void SCRenderer::drawModelTransparentPass(RSEntity *object, size_t lodLevel, std
 
             const Texel *texel = palette.GetRGBColor(triangle->color-1);
             gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
-                      texel->b / 255.0f * lambertianFactor, texel->a);
+                      texel->b / 255.0f * lambertianFactor, texel->a * this->modelAlphaMultiplier);
 
             gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
         }
@@ -1912,7 +1912,7 @@ void SCRenderer::drawModelTransparentPass(RSEntity *object, size_t lodLevel, std
 
                 const Texel *texel = palette.GetRGBColor(triangle->color-1);
                 gb.color4f(texel->r / 255.0f * lambertianFactor, texel->g / 255.0f * lambertianFactor,
-                          texel->b / 255.0f * lambertianFactor, texel->a);
+                          texel->b / 255.0f * lambertianFactor, texel->a * this->modelAlphaMultiplier);
 
                 gb.vertex3f(vLocal.x, vLocal.y, vLocal.z);
             }
@@ -2617,7 +2617,13 @@ void SCRenderer::renderSkybox() {
         // size at that scale) keeps every face's apparent screen size
         // consistent regardless of its individual distance.
         constexpr float kReferenceDistance = 12800.0f;
-        constexpr float kReferenceScale = 16.0f;
+        // Halved from 16.0f (user-reported, 2026-07 session: skybox objects
+        // needed to be 1/2 their previous size) — every other scale below
+        // is computed proportionally from this one constant, so halving it
+        // here halves both COMET's own size and the galaxy faces' derived
+        // 16x-on-top size uniformly, without touching the distance-based
+        // proportionality or the extra-16x-beyond-reference-distance logic.
+        constexpr float kReferenceScale = 8.0f;
         float scale = kReferenceScale * ((float)face.distance / kReferenceDistance);
         // The distance-proportional formula alone wasn't enough — darkgal1
         // (and the other 4 galaxy faces sharing its 25600 distance) still
@@ -3522,4 +3528,34 @@ void SCRenderer::drawBillboard(Vector3D pos, Texture *tex, float size, float alp
     glEnable(GL_CULL_FACE);
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_DEPTH_TEST);
+}
+void SCRenderer::renderFullscreenFlash(float r, float g, float b, float alpha) {
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, 1.0, 0.0, 1.0, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    gb.begin(GL_QUADS);
+    gb.color4f(r, g, b, alpha);
+    gb.vertex3f(0.0f, 0.0f, 0.0f);
+    gb.vertex3f(1.0f, 0.0f, 0.0f);
+    gb.vertex3f(1.0f, 1.0f, 0.0f);
+    gb.vertex3f(0.0f, 1.0f, 0.0f);
+    gb.end();
+
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
 }

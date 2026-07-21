@@ -1095,7 +1095,17 @@ void SCStrike::autopilotCompute() {
         this->player_plane->x = destination.x;
         this->player_plane->z = destination.y;
     }
-    float dest_min_altitude = this->current_mission->area->getY(this->player_plane->x, this->player_plane->z);
+    // WC3 space missions have no terrain at all (WC3Mission::loadMission()
+    // only constructs `area` for ground missions — see is_space_mission),
+    // so `area` can legitimately be null here even on a real, working
+    // mission. SCStrike is shared with Strike Commander, which always has
+    // terrain, so this null case was never hit there. No ground to clamp
+    // against in space — fall straight to the dest_y branch below by
+    // making the comparison a no-op (dest_y < dest_min_altitude is false
+    // when they're equal).
+    float dest_min_altitude = (this->current_mission->area != nullptr)
+        ? this->current_mission->area->getY(this->player_plane->x, this->player_plane->z)
+        : dest_y;
     if (dest_y<dest_min_altitude) {
         this->player_plane->y += dest_min_altitude;
     } else {
@@ -1301,27 +1311,31 @@ static std::vector<int> collectDistinctGunTypes(SCPlane *plane) {
     }
     return types;
 }
-// Mirrors collectDistinctGunTypes above (same first-encountered-order scan
-// of weaps_load, same dedup-by-weapon_id), but for missiles/ordnance
-// (weapon_category != 0) instead of guns -- backs selected_missile_group,
-// WC3's own independent missile-type cycle (see that field's own comment
-// for why this can't just reuse selected_weapon/MDFS_WEAPONS's existing
-// SC1-oriented logic).
-static std::vector<int> collectDistinctMissileTypes(SCPlane *plane) {
-    std::vector<int> types;
-    for (auto *hpt : plane->weaps_load) {
+// Backs selected_missile_group, WC3's own independent missile-*bank* cycle
+// (see that field's own comment for why this can't just reuse
+// selected_weapon/MDFS_WEAPONS's existing SC1-oriented logic). Each
+// missile/ordnance (weapon_category != 0) hardpoint is its own bank —
+// user-corrected, 2026-07 session: "only one missile bank is selected at
+// a time, regardless if it has the same type of missiles as another
+// bank" — so this collects weaps_load *indices*, not distinct weapon_ids
+// (an earlier version deduped by type, which put two same-type banks
+// under the same cycle step and selected/fired both together). Guns
+// still intentionally cycle by type (see CYCLE_GUNS's own comment — every
+// hardpoint sharing that type fires as one simultaneous salvo, a
+// deliberate, different mechanic from missiles' one-bank-at-a-time rule).
+static std::vector<int> collectMissileHardpointIndices(SCPlane *plane) {
+    std::vector<int> indices;
+    for (size_t i = 0; i < plane->weaps_load.size(); i++) {
+        auto *hpt = plane->weaps_load[i];
         if (hpt == nullptr || hpt->objct == nullptr || hpt->objct->wdat == nullptr) {
             continue;
         }
         if (hpt->objct->wdat->weapon_category == 0) {
             continue;
         }
-        int weaponId = hpt->objct->wdat->weapon_id;
-        if (std::find(types.begin(), types.end(), weaponId) == types.end()) {
-            types.push_back(weaponId);
-        }
+        indices.push_back((int)i);
     }
-    return types;
+    return indices;
 }
 
 /**
@@ -1456,6 +1470,10 @@ void SCStrike::checkKeyboard(void) {
         } else {
             printf("CYCLE_GUNS: pressed, but weaps_load has zero gun-category (weapon_category==0) hardpoints with a resolved weapon -- nothing to cycle\n");
         }
+        // User-requested (2026-07 session): G should also open the
+        // weapons MFD, same as W/M (MDFS_WEAPONS) already do.
+        this->cockpit->show_weapons = true;
+        this->mfd_timeout = 400;
     }
     // Guns always fire down the boresight, no target required. Fires every
     // hardpoint matching the CYCLE_GUNS-selected type (or every gun
@@ -1551,53 +1569,79 @@ void SCStrike::checkKeyboard(void) {
     // selected_weapon landing on a gun slot (Enter shouldn't double as a
     // second gun trigger).
     if (m_keyboard->isActionPressed(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_MISSILE))) {
-        // WC3: resolve the hardpoint from selected_missile_group's own
+        // WC3: resolve the hardpoint(s) from selected_missile_group's own
         // independent missile-type cycle instead of the SC1 selected_weapon
         // index (which MDFS_WEAPONS no longer drives for WC3 ships at all —
-        // see that handler's own comment) — first hardpoint whose
-        // weapon_id matches the currently selected missile type.
-        int selIdx = -1;
+        // see that handler's own comment). selected_missile_group < 0 is
+        // the "select all hardpoints" state (B key, user-confirmed 2026-07
+        // session — WC3 has no airbrake to steal B for, unlike Strike
+        // Commander): every missile/torpedo hardpoint fires together,
+        // rather than resolving to the first one matching a single type.
+        std::vector<int> selIdxs;
         if (this->player_plane->is_wc3_ship) {
-            std::vector<int> missileTypes = collectDistinctMissileTypes(this->player_plane);
-            if (!missileTypes.empty()) {
-                int targetWeaponId = missileTypes[this->player_plane->selected_missile_group % missileTypes.size()];
+            if (this->player_plane->selected_missile_group < 0) {
                 for (size_t i = 0; i < this->player_plane->weaps_load.size(); i++) {
                     auto *hpt = this->player_plane->weaps_load[i];
                     if (hpt != nullptr && hpt->objct != nullptr && hpt->objct->wdat != nullptr &&
-                        hpt->objct->wdat->weapon_id == targetWeaponId) {
-                        selIdx = (int)i;
-                        break;
+                        hpt->objct->wdat->weapon_category != 0) {
+                        selIdxs.push_back((int)i);
                     }
+                }
+            } else {
+                std::vector<int> bankIndices = collectMissileHardpointIndices(this->player_plane);
+                if (!bankIndices.empty()) {
+                    selIdxs.push_back(bankIndices[this->player_plane->selected_missile_group % bankIndices.size()]);
                 }
             }
         } else {
-            selIdx = this->player_plane->selected_weapon;
+            selIdxs.push_back(this->player_plane->selected_weapon);
         }
-        if (selIdx >= 0 && (size_t)selIdx < this->player_plane->weaps_load.size()) {
+        // wp_cooldown is shared across the whole plane, not per-hardpoint
+        // (same as the gun salvo above) — only the first hardpoint to fire
+        // this frame is called unconditionally; later ones in the same
+        // "all hardpoints" salvo get their cooldown forced to 0 first so
+        // the first shot's freshly-set cooldown doesn't block them too.
+        bool firstFired = false;
+        bool anyAttempted = false;
+        for (int selIdx : selIdxs) {
+            if (selIdx < 0 || (size_t)selIdx >= this->player_plane->weaps_load.size()) {
+                continue;
+            }
             auto *selected = this->player_plane->weaps_load[selIdx];
-            if (selected != nullptr && selected->objct != nullptr && selected->objct->wdat != nullptr &&
-                selected->objct->wdat->weapon_category != 0) {
-                // WC3's heatseeker/image-recognition/friend-or-foe missiles
-                // can dumbfire (fly straight ahead, unguided) with no target
-                // selected at all — see SCPlane::Shoot()'s own comment on
-                // this. Requiring `target != nullptr` here unconditionally
-                // (as before) silently blocked FIRE_MISSILE from doing
-                // anything at all whenever nothing was targeted, even
-                // though Shoot()'s own dumbfire branch already handles a
-                // null target safely. Torpedo/T-bomb (weapon_category==3)
-                // and SC1's own missiles still require a real target, same
-                // as before — only these three IDs get the relaxation.
-                int weaponId = selected->objct->wdat->weapon_id;
-                bool canDumbfireUnlocked = weaponId == weapon_ids::ID_HSMISS ||
-                    weaponId == weapon_ids::ID_IRMISS || weaponId == weapon_ids::ID_FFMISS;
-                if (target != nullptr || canDumbfireUnlocked) {
-                    // Real lock-on timer (SCCockpit::updateLockOn) — lets
-                    // Shoot() decide missile guided-vs-dumbfire and gate
-                    // torpedo/T-bomb firing entirely.
-                    this->player_plane->Shoot((int)selIdx, target, this->current_mission,
-                                               this->cockpit->lock_progress);
+            if (selected == nullptr || selected->objct == nullptr || selected->objct->wdat == nullptr ||
+                selected->objct->wdat->weapon_category == 0) {
+                continue;
+            }
+            // WC3's heatseeker/image-recognition/friend-or-foe missiles
+            // can dumbfire (fly straight ahead, unguided) with no target
+            // selected at all — see SCPlane::Shoot()'s own comment on
+            // this. Requiring `target != nullptr` here unconditionally
+            // (as before) silently blocked FIRE_MISSILE from doing
+            // anything at all whenever nothing was targeted, even
+            // though Shoot()'s own dumbfire branch already handles a
+            // null target safely. Torpedo/T-bomb (weapon_category==3)
+            // and SC1's own missiles still require a real target, same
+            // as before — only these three IDs get the relaxation.
+            int weaponId = selected->objct->wdat->weapon_id;
+            bool canDumbfireUnlocked = weaponId == weapon_ids::ID_HSMISS ||
+                weaponId == weapon_ids::ID_IRMISS || weaponId == weapon_ids::ID_FFMISS;
+            if (target == nullptr && !canDumbfireUnlocked) {
+                continue;
+            }
+            // Real lock-on timer (SCCockpit::updateLockOn) — lets Shoot()
+            // decide missile guided-vs-dumbfire and gate torpedo/T-bomb
+            // firing entirely.
+            if (!anyAttempted) {
+                firstFired = this->player_plane->Shoot((int)selIdx, target, this->current_mission,
+                                                         this->cockpit->lock_progress);
+                anyAttempted = true;
+                if (firstFired) {
                     this->cockpit->is_shooting = true;
                 }
+            } else if (firstFired) {
+                this->player_plane->wp_cooldown = 0;
+                this->player_plane->Shoot((int)selIdx, target, this->current_mission,
+                                           this->cockpit->lock_progress);
             }
         }
     }
@@ -1629,7 +1673,19 @@ void SCStrike::checkKeyboard(void) {
         }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_BRAKES))) {
-        this->player_plane->SetSpoilers();
+        if (this->player_plane->is_wc3_ship) {
+            // WC3 has no airbrake (user-confirmed, 2026-07 session: "wing
+            // commander hasn't got brakes like Strike Commander") — B is
+            // instead "select all hardpoints", selecting every missile/
+            // torpedo hardpoint to fire simultaneously (see
+            // selected_missile_group's own comment for the sentinel) —
+            // and opens the weapons MFD, same as CYCLE_GUNS/MDFS_WEAPONS.
+            this->player_plane->selected_missile_group = -1;
+            this->cockpit->show_weapons = true;
+            this->mfd_timeout = 400;
+        } else {
+            this->player_plane->SetSpoilers();
+        }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_FLAPS))) {
         this->player_plane->SetFlaps();
@@ -1650,9 +1706,30 @@ void SCStrike::checkKeyboard(void) {
     // SCStrike.cpp is shared between both games, and SC still needs it.
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_RADAR))) {
         this->cockpit->show_radars = !this->cockpit->show_radars;
+        // WC3's real "cycle target sub-system/turret" key. Reuses the same
+        // 'r' binding show_radars is already dead code for under WC3 (see
+        // comment above) instead of a separate action — a plain no-op for
+        // SC/any target with no turret data (turretCount == 0).
+        int turretCount = this->cockpit->GetCurrentTargetTurretCount();
+        if (turretCount > 0) {
+            this->cockpit->targeted_turret_index = (this->cockpit->targeted_turret_index + 1) % turretCount;
+        }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_DAMAGE))) {
-        this->cockpit->show_damage = !this->cockpit->show_damage;
+        // Damage MFD has two real pages (user-described, 2026-07 session:
+        // subsystem text list, then a ship-graphic damage diagram) — see
+        // SCCockpit::damage_page. First press opens the panel on page 0;
+        // pressing again while it's open cycles to the next page; pressing
+        // once more (wrapping back to page 0) closes it.
+        if (!this->cockpit->show_damage) {
+            this->cockpit->show_damage = true;
+            this->cockpit->damage_page = 0;
+        } else {
+            this->cockpit->damage_page = (this->cockpit->damage_page + 1) % 2;
+            if (this->cockpit->damage_page == 0) {
+                this->cockpit->show_damage = false;
+            }
+        }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_POWER))) {
         // User-confirmed real behavior: 'p' rotates E->W->S->D->shield->E
@@ -1675,10 +1752,10 @@ void SCStrike::checkKeyboard(void) {
         // and was walking into/getting stuck on gun hardpoints instead of
         // cycling ordnance cleanly.
         if (this->cockpit->show_weapons) {
-            std::vector<int> missileTypes = collectDistinctMissileTypes(this->player_plane);
-            if (!missileTypes.empty()) {
+            std::vector<int> bankIndices = collectMissileHardpointIndices(this->player_plane);
+            if (!bankIndices.empty()) {
                 this->player_plane->selected_missile_group =
-                    (this->player_plane->selected_missile_group + 1) % (int)missileTypes.size();
+                    (this->player_plane->selected_missile_group + 1) % (int)bankIndices.size();
             }
             this->player_plane->wp_cooldown = 0;
             this->mfd_timeout = 400;
@@ -2150,30 +2227,60 @@ void SCStrike::findTarget() {
     // >enemies/friendlies (see that split's own comment) — every enemy was
     // being filtered out here whenever the two team_id guesses happened to
     // coincide, which is why targeting was stuck on "none".
-    std::vector<int> candidates;
-    for (int i = 0; i < (int)this->current_mission->actors.size(); i++) {
-        auto actor = this->current_mission->actors[i];
-        if (actor == nullptr || actor == this->current_mission->player) {
-            continue;
+    // User-requested (2026-07 session): T should cycle through the actors
+    // at the current nav point specifically, not just "everything in
+    // range" — the current nav point's own area_id (waypoints.back()-style
+    // "most recently pushed" entry, see the big comment on waypoints
+    // below) is matched against each actor's own MISN_PART::area_id.
+    // Falls back to the unfiltered in-range scan if that yields nothing
+    // (e.g. no waypoint yet, or a nav point whose area has no actors of
+    // its own — SIM missions and area_id==255/"no fixed area" actors),
+    // so T still does something useful rather than going silent.
+    short navPointAreaId = -1;
+    bool haveNavPointArea = false;
+    if (this->nav_point_id < this->current_mission->waypoints.size()) {
+        SCMissionWaypoint *navWp = this->current_mission->waypoints[this->nav_point_id];
+        if (navWp != nullptr && navWp->spot != nullptr) {
+            navPointAreaId = navWp->spot->area_id;
+            haveNavPointArea = true;
         }
-        if (!actor->is_active || actor->is_destroyed) {
-            continue;
+    }
+
+    auto collectCandidates = [&](bool filterByNavPointArea) {
+        std::vector<int> result;
+        for (int i = 0; i < (int)this->current_mission->actors.size(); i++) {
+            auto actor = this->current_mission->actors[i];
+            if (actor == nullptr || actor == this->current_mission->player) {
+                continue;
+            }
+            if (!actor->is_active || actor->is_destroyed) {
+                continue;
+            }
+            // User-confirmed (2026-07 session): cloaked contacts (e.g. the
+            // Skipper Missile, SKIPMISS — cloaks every 3 seconds specifically
+            // "to prevent missile lock") can't be targeted at all while
+            // cloaked; only decloaked. SCMissionActors::UpdateCloak drives
+            // actor->plane->cloaked once per SCMission::update() tick.
+            if (actor->plane != nullptr && actor->plane->cloaked) {
+                continue;
+            }
+            if (filterByNavPointArea && (short)actor->object->area_id != navPointAreaId) {
+                continue;
+            }
+            float dx = actor->object->position.x - this->player_plane->x;
+            float dy = actor->object->position.y - this->player_plane->y;
+            float dz = actor->object->position.z - this->player_plane->z;
+            float distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq <= target_range_sq) {
+                result.push_back(i);
+            }
         }
-        // User-confirmed (2026-07 session): cloaked contacts (e.g. the
-        // Skipper Missile, SKIPMISS — cloaks every 3 seconds specifically
-        // "to prevent missile lock") can't be targeted at all while
-        // cloaked; only decloaked. SCMissionActors::UpdateCloak drives
-        // actor->plane->cloaked once per SCMission::update() tick.
-        if (actor->plane != nullptr && actor->plane->cloaked) {
-            continue;
-        }
-        float dx = actor->object->position.x - this->player_plane->x;
-        float dy = actor->object->position.y - this->player_plane->y;
-        float dz = actor->object->position.z - this->player_plane->z;
-        float distSq = dx * dx + dy * dy + dz * dz;
-        if (distSq <= target_range_sq) {
-            candidates.push_back(i);
-        }
+        return result;
+    };
+
+    std::vector<int> candidates = haveNavPointArea ? collectCandidates(true) : std::vector<int>();
+    if (candidates.empty()) {
+        candidates = collectCandidates(false);
     }
 
     if (candidates.empty()) {
@@ -2182,6 +2289,7 @@ void SCStrike::findTarget() {
         this->target = nullptr;
         this->current_mission->player->target = nullptr;
         this->cockpit->target = nullptr;
+        this->cockpit->target_manually_selected = false;
         printf("Target: none\n");
         return;
     }
@@ -2215,6 +2323,7 @@ void SCStrike::findTarget() {
     this->target = this->current_mission->actors[selectedIndex];
     this->current_mission->player->target = this->target;
     this->cockpit->target = this->target->object;
+    this->cockpit->target_manually_selected = true;
     printf("Target: %s\n", this->target->object->member_name.c_str());
 }
 // Real WC3-style auto-targeting: continuously targets whatever in-range
@@ -2239,6 +2348,32 @@ void SCStrike::updateAutoTarget() {
             return;
         }
         this->cockpit->target_hard_locked = false;
+        // Fall through so a target is re-acquired this same frame instead
+        // of leaving current_target stale for one frame.
+    }
+    // Bug fix (2026-07 session, user-reported: pressing 'T' often didn't
+    // seem to change the target): this function used to run completely
+    // unconditionally whenever target_hard_locked was false, so it
+    // overwrote findTarget()'s manual T-cycle pick back to "nearest thing
+    // in the front cone" on essentially the very next frame — only
+    // "sticking" when that happened to already be the same actor. Same
+    // stillValid/fall-through shape as the hard-lock block above, just
+    // without forcing the HUD's locked-square box style (target_hard_locked
+    // stays false — the player selected this, didn't weapons-lock it).
+    if (this->cockpit->target_manually_selected) {
+        bool stillValid = (this->target != nullptr && this->target->is_active && !this->target->is_destroyed &&
+                            (this->target->plane == nullptr || !this->target->plane->cloaked));
+        if (stillValid) {
+            const float maxLockRange = 80000.0f * 1.5f;  // real confirmed max radar range
+            float dx = this->target->object->position.x - this->player_plane->x;
+            float dy = this->target->object->position.y - this->player_plane->y;
+            float dz = this->target->object->position.z - this->player_plane->z;
+            stillValid = (dx * dx + dy * dy + dz * dz) <= (maxLockRange * maxLockRange);
+        }
+        if (stillValid) {
+            return;
+        }
+        this->cockpit->target_manually_selected = false;
         // Fall through so a target is re-acquired this same frame instead
         // of leaving current_target stale for one frame.
     }
@@ -2332,6 +2467,34 @@ void SCStrike::updateNavPoint() {
         // sticks until the next real objective change.
         this->nav_point_id = (uint8_t)((count - 1 > 255) ? 255 : count - 1);
         this->last_nav_point_count = count;
+    }
+    // Proximity auto-advance (user-requested, 2026-07 session): once the
+    // player gets within kNavPointReachedRadius of the currently-selected
+    // nav point, move on to the next real (non-takeoff/landing) entry
+    // already present in the waypoint history. Deliberately bounded, not
+    // wrap-around, and only ever steps *forward* from nav_point_id — see
+    // this function's own doc comment above for the exact bug an earlier,
+    // unbounded version of this idea caused (advanced past the single
+    // "take off" entry that exists at mission start into an out-of-bounds
+    // index, permanently disabling autopilot). With this forward-only,
+    // bounds-checked search, that same moment is naturally a no-op: with
+    // only 1 entry, there's nothing at nav_point_id+1 to search, so the
+    // loop below never even runs.
+    if (this->player_plane != nullptr && this->nav_point_id < count) {
+        SCMissionWaypoint *current = this->current_mission->waypoints[this->nav_point_id];
+        if (current != nullptr && current->spot != nullptr) {
+            const float kNavPointReachedRadius = 1000.0f;
+            Vector3D navPos = current->spot->position;
+            Vector3D playerPos = {this->player_plane->x, this->player_plane->y, this->player_plane->z};
+            if ((navPos - playerPos).Length() < kNavPointReachedRadius) {
+                for (size_t idx = (size_t)this->nav_point_id + 1; idx < count; idx++) {
+                    if (!SCMissionWaypoint::IsTakeoffOrLanding(this->current_mission->waypoints[idx])) {
+                        this->nav_point_id = (uint8_t)((idx > 255) ? 255 : idx);
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 // See declaration comment (SCStrike.h). "Immediate area" — no real data
@@ -2437,7 +2600,9 @@ void SCStrike::setMission(char const *missionName) {
     this->player_plane = this->current_mission->player->plane;
     this->player_plane->yaw = (360 - playerCoord->azymuth) * 10.0f;
     this->player_plane->object = playerCoord;
-    float ground = this->area->getY(new_position.x, new_position.z);
+    // area is null in WC3 space missions (see WC3Mission::is_space_mission)
+    // — nothing to taxi/take off from, so just skip the roll simulation.
+    float ground = (this->area != nullptr) ? this->area->getY(new_position.x, new_position.z) : new_position.y;
     if (fabs(ground - new_position.y) > 10.0f) {
         this->player_plane->SetThrottle(100);
         this->player_plane->SetWheel();
@@ -2817,7 +2982,47 @@ void SCStrike::runFrame(void) {
         Renderer.camera.fovy = 30.0f;
         Renderer.camera.update();
     } else {
-        Renderer.camera.fovy = 45.0f;
+        // Real per-mode field of view from WORLD.IFF's WRLD>CAMR sub-
+        // chunks (RSWorld::camCockpit/camTarget/camChase/camTrack/
+        // camWeapon — user-requested, 2026-07 session: use the real IFF
+        // camera data instead of guessed constants; the cockpit-forward
+        // 30.0f here specifically supersedes an earlier 25.0f derived
+        // from screenshot pixel measurements once this real value came to
+        // light — see camCockpit's own comment for that reconciliation).
+        // 30.0f is also the fallback for missions with no WRLD loaded, or
+        // for camera_mode values with no confident real-chunk match yet
+        // (EYE_ON_TARGET/OBJECT/AUTO_PILOT — AUTO_PILOT's real camera data
+        // is WorldCameraAutoSequence's own richer, still-unconsumed shape,
+        // not this simple fixed-FOV one).
+        float fovy = 30.0f;
+        RSWorld *world = (this->current_mission != nullptr) ? this->current_mission->world : nullptr;
+        if (world != nullptr) {
+            switch (this->camera_mode) {
+            case View::FRONT:
+            case View::REAL:
+            case View::LEFT:
+            case View::RIGHT:
+            case View::REAR:
+            case View::CONTROLLER_LOOK:
+                if (world->camCockpit.fovDegrees > 0) fovy = (float)world->camCockpit.fovDegrees;
+                break;
+            case View::TARGET:
+                if (world->camTarget.fovDegrees > 0) fovy = (float)world->camTarget.fovDegrees;
+                break;
+            case View::FOLLOW:
+                if (world->camChase.fovDegrees > 0) fovy = (float)world->camChase.fovDegrees;
+                break;
+            case View::TRACK:
+                if (world->camTrack.fovDegrees > 0) fovy = (float)world->camTrack.fovDegrees;
+                break;
+            case View::MISSILE_CAM:
+                if (world->camWeapon.fovDegrees > 0) fovy = (float)world->camWeapon.fovDegrees;
+                break;
+            default:
+                break;
+            }
+        }
+        Renderer.camera.fovy = fovy;
         Renderer.camera.update();
     }
     this->player_plane->getPosition(&new_position);
@@ -3127,7 +3332,18 @@ void SCStrike::runFrame(void) {
                         // render loop below) represent it from then on,
                         // matching a real destroyed ship having nothing
                         // left to show but wreckage.
+                        // Enemy ships fade to fully transparent on cloak,
+                        // back to fully opaque on decloak (manual, 2026-07
+                        // session) — SCMissionActors::UpdateCloak ramps
+                        // plane->cloak_factor for every non-player actor;
+                        // the player's own cloak instead drives a greyscale
+                        // screen fade (WC3Strike::updateCloakEffect), not
+                        // this. Restored to 1.0f right after so nothing
+                        // else drawn later this frame (weapons, other
+                        // actors, HUD) inherits the fade.
+                        Renderer.modelAlphaMultiplier = 1.0f - actor->plane->cloak_factor;
                         actor->plane->Render();
+                        Renderer.modelAlphaMultiplier = 1.0f;
                         if (actor->plane->alive) {
                             actor->plane->RenderSimulatedObject();
                         }
@@ -3240,6 +3456,16 @@ void SCStrike::runFrame(void) {
                 continue;
             }
             expl->render();
+            if (expl->whiteoutRequested) {
+                this->screen_whiteout_timer = 0.5f;
+                expl->whiteoutRequested = false;
+            }
+        }
+        if (this->screen_whiteout_timer > 0.0f) {
+            this->screen_whiteout_timer -= GameTimer::getInstance().getDeltaTime();
+            if (this->screen_whiteout_timer < 0.0f) {
+                this->screen_whiteout_timer = 0.0f;
+            }
         }
 
         float debrisDt = GameTimer::getInstance().getDeltaTime();
@@ -3261,10 +3487,17 @@ void SCStrike::runFrame(void) {
         this->player_plane->RenderSimulatedObject();
         this->cockpit->cam = camera;
 
-        Vector3D centerPoint = {0,0,-10};
-        
-        centerPoint = camera->getPosition()+camera->getForward()*10.0f;
-        Renderer.drawPoint(centerPoint, {0.0f, 1.0f, 0.0f}, {0,0,0}, {0.0f, 0.0f, 0.0f});
+        // User-reported (2026-07 session): a green pixel/dot fixed at
+        // screen center in every camera view. This was an always-on debug
+        // marker — a point drawn 10 units directly ahead of the camera
+        // along its own forward vector, which by construction always
+        // projects to dead center regardless of camera mode. Not gated by
+        // any debug flag, not part of the real boresight/reticle HUD
+        // system (see SCCockpit's own kTargetingReticle/kCenterMarker for
+        // that). Disabled rather than deleted outright in case it was
+        // useful for future debugging — re-enable by uncommenting.
+        // Vector3D centerPoint = camera->getPosition()+camera->getForward()*10.0f;
+        // Renderer.drawPoint(centerPoint, {0.0f, 1.0f, 0.0f}, {0,0,0}, {0.0f, 0.0f, 0.0f});
         Renderer.drawPoint(this->cockpit->targetImpactPointWorld, {0.0f, 1.0f, 1.0f}, {0,0,0}, {0.0f, 0.0f, 0.0f});
         switch (this->camera_mode) {
         case View::MISSILE_CAM:
@@ -3307,6 +3540,12 @@ void SCStrike::runFrame(void) {
         case View::CONTROLLER_LOOK:
             this->renderVirtualCockpit();
             break;
+        }
+        // Large-capital-ship death whiteout — see screen_whiteout_timer's
+        // own comment (SCStrike.h). Drawn last so it covers the 3D scene
+        // and the cockpit HUD just rendered above.
+        if (this->screen_whiteout_timer > 0.0f) {
+            Renderer.renderFullscreenFlash(1.0f, 1.0f, 1.0f, 1.0f);
         }
     };
 

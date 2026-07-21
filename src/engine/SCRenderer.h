@@ -121,7 +121,7 @@ public:
 
     static bool hasInstance() { return (bool)s_instance; }
     float verticalOffset{0.45f};
-    float fov{45.0f};
+    float fov{30.0f};
     int max_view_distance{160000};
     bool show_fog{true};
     bool show_textured{true};
@@ -139,11 +139,11 @@ public:
     // above's palette-indexed RLEShape glints — see buildStarSpriteTextures.
     std::vector<Texture*> starSpriteTextures;
     RSImageSet* starSpriteTexturesSource{nullptr};
-    // Space background clear color, resolved from WRLD>BACK's palette index
-    // (see RSWorld::backgroundColorIndex) by WC3Strike::setMission(); a dark
-    // navy blue for most missions, not pure black. Defaults to black to
-    // match prior behavior when no WRLD data is available.
-    Vector3D spaceBackgroundColor{0.0f, 0.0f, 0.0f};
+    // Space background clear color — fixed RGB(8,16,36) (user-confirmed,
+    // 2026-07 session), set by WC3Strike::setMission(). Previously
+    // resolved dynamically from WRLD>BACK's palette index (RSWorld::
+    // backgroundColorIndex), which didn't match the real color.
+    Vector3D spaceBackgroundColor{8.0f / 255.0f, 16.0f / 255.0f, 36.0f / 255.0f};
     // Grey motion-dust particles (WRLD>DUST — see RSWorld.h) that spawn
     // near the player in open space and drift backward as they fly,
     // confirmed against live gameplay. show_dust is toggled every frame by
@@ -183,6 +183,15 @@ public:
     bool dustCamPosInitialized{false};
     int lodLevel{0};
     GLuint texture{0};
+    // Multiplies every model-draw alpha (drawModelColorPass/
+    // drawModelTexturePass/drawModelTransparentPass — see each pass' own
+    // `float alpha = 1.0f;`) for the duration of one drawModelWithChilds
+    // call. Callers set it right before drawing a cloaking actor's ship
+    // (see SCPlane::cloak_factor) and must restore it to 1.0f right after
+    // — a single global toggle rather than threading an alpha parameter
+    // through every draw-pass signature, since blending (GL_BLEND) is
+    // already unconditionally enabled for every model draw regardless.
+    float modelAlphaMultiplier{1.0f};
     
     SCRenderer();
     ~SCRenderer();
@@ -235,6 +244,12 @@ public:
     void drawModelTexturePass(RSEntity *object, size_t lodLevel, std::vector<Vector3D> &vertexNormals, float ambientLamber, Vector3D lightEye, float *MV);
     void drawModelTransparentPass(RSEntity *object, size_t lodLevel, std::vector<Vector3D> &vertexNormals, float ambientLamber, Vector3D lightEye, float *MV);
     void drawBillboard(Vector3D pos, Texture *tex, float size, float alpha = 1.0f);
+    // Full-viewport solid-color overlay, drawn in normalized screen space
+    // (independent of the 3D camera) so it always covers everything
+    // rendered earlier this frame — used for the large-capital-ship death
+    // whiteout (SCStrike::checkExplosionScreenEffects). Call last, after
+    // both the 3D scene and the cockpit HUD have been drawn.
+    void renderFullscreenFlash(float r, float g, float b, float alpha);
     void displayModel(RSEntity *object, size_t lodLevel);
      
     void createTextureInGPU(Texture *texture);

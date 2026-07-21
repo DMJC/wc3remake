@@ -110,6 +110,13 @@ protected:
      */
     bool autopilot{false};
     int autopilot_timeout{0};
+    // Seconds remaining to draw a full-screen white overlay (see
+    // SCRenderer::renderFullscreenFlash) — set to 0.5f by the explosion
+    // render loop when a large-capital-ship death sequence (SCExplosion::
+    // bigDeathSequence/whiteoutRequested) reaches its pause point. Ticked
+    // down and drawn once per frame, right after the cockpit HUD, so it
+    // covers everything rendered so far.
+    float screen_whiteout_timer{0.0f};
     float autopilot_target_azimuth{0};
     // Which scripted autopilot sequence (if any) is currently driving
     // camera_mode==View::AUTO_PILOT. NONE means the pre-existing generic

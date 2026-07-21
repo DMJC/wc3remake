@@ -24,17 +24,19 @@ static const float MISN_AREA_POSITION_SCALE = 256.0f;
 // PART x/z are a 24-bit fixed-point value with a 16-bit fraction (raw value
 // is a near-exact multiple of 65536 in the large majority of real records —
 // e.g. a recurring "tdest" destroyer placement's z=6,815,744 is exactly
-// 104.0*65536), unlike AREA's plain-integer position field above. Confirmed
-// against live gameplay radar readings: that same tdest offset (x=0,
-// z=6,815,744) — a CAST slot player-identified as the destroyer "Coventry" —
-// read as ~16200-16500 units on the in-game radar across two missions,
-// giving 155.8-158.7 real-units per fixed-point-unit (i.e. per raw/65536).
-// A second, rougher reading (a "directly ahead" darket, raw z=-5,767,168 ==
-// -88.0 fixed-point, radar-estimated at "~15000 but likely lower") is
-// consistent with the same range once adjusted down. 158.0 is a working
-// point estimate within that confirmed band, not a fully pinned constant —
-// refine with more readings if precision matters.
-static const float MISN_PART_POSITION_SCALE = 158.0f / 65536.0f;
+// 104.0*65536), unlike AREA's plain-integer position field above.
+// The original 158.0 estimate below was fitted against this engine's own
+// in-game radar/HUD readout — which is itself just Vector3D::Length() on
+// the very position this constant produces, making that calibration
+// circular (any error in the constant gets silently absorbed into the
+// "confirmed" radar reading used to fit it). User-confirmed (2026-07
+// session) against real WC3 mission data instead, and landing on the same
+// 256.0 as MISN_AREA_POSITION_SCALE above: MISNA002's TCS Victory (id=5)
+// and Terran Cruiser (id=3), both area_id=0 so the AREA scale cancels out
+// of this pair, are a raw x delta of 3,840,000 apart, which comes out to
+// exactly 15000.0 units at 256.0/65536 — clean enough (vs. e.g. 18516 at
+// a naively-doubled 316.0) to confirm PART and AREA share one real scale.
+static const float MISN_PART_POSITION_SCALE = 256.0f / 65536.0f;
 
 void missionstrtoupper(char *src) {
     int i = 0;
@@ -257,27 +259,39 @@ int32_t ReadInt24LE_fromVec(std::vector<uint8_t>data, int offset) {
     return i;
 }
 void RSMission::parseMISN_SPOT(uint8_t *data, size_t size) {
-    size_t numParts = size / 14;
+    // Real record size is 16 bytes, not 14 — confirmed exhaustively across
+    // every SPOT chunk in the 85-file corpus (56 files with a SPOT chunk):
+    // all 56 divide evenly by 16, none by 14. The old 14-byte guess read
+    // area_id as 2 bytes and x/z as 3-byte Int24LE fields, drifting further
+    // out of alignment with every record past the first in any file with
+    // more than one SPOT entry — same shape of bug as the MISN_PART stride
+    // fix earlier this session, just for waypoints instead of actors.
+    //
+    // The real layout is area_id/x/z/y as four plain int32 LE fields (16
+    // bytes total), no separate 1-byte "unknown" fields either side of
+    // area_id/y — confirmed by decoding real position data with this
+    // layout and finding exclusively clean, hand-authored round numbers
+    // (e.g. MISNJ001 x=20000, MISNK003 x=15000, MISNKA02 x=-20000, many
+    // exact multiples of 50/100/500/1000) at a magnitude consistent with
+    // other confirmed in-game distances, plus a consistent area_id=-1
+    // sentinel on blank/unused trailing slots across many files. Unlike
+    // PART's own fix, no new scale constant is needed here — these values
+    // are already at the same real-world-unit scale BLOCK_COORD_SCALE=1.0
+    // always assumed; it was purely a stride/field-width bug, not a scale
+    // one.
+    size_t numParts = size / 16;
     ByteStream stream(data, size);
     for (int i = 0; i < numParts; i++) {
         SPOT *spt = new SPOT();
         if (spt != NULL) {
             spt->id = i;
-            spt->area_id = 0;
-            spt->area_id |= stream.ReadByte() << 0;
-            spt->area_id |= stream.ReadByte() << 8;
-
-            spt->unknown1 = stream.ReadByte();
-            int32_t x, z;
-            int16_t y;
-            x = stream.ReadInt24LE();
-            z = stream.ReadInt24LE();
-            y = 0;
-            y |= stream.ReadByte() << 0;
-            y |= stream.ReadByte() << 8;
+            spt->area_id = (int16_t)stream.ReadInt32LE();
+            int32_t x, z, y;
+            x = stream.ReadInt32LE();
+            z = stream.ReadInt32LE();
+            y = stream.ReadInt32LE();
             spt->position = Vector3D(x * BLOCK_COORD_SCALE, y * HEIGH_MAP_SCALE, -z * BLOCK_COORD_SCALE);
-            
-            spt->unknown2 = stream.ReadByte();
+
             this->mission_data.spots.push_back(spt);
         }
     }
@@ -393,7 +407,68 @@ void RSMission::parseMISN_PROG(uint8_t *data, size_t size) {
 }
 void RSMission::parseMISN_PART(uint8_t *data, size_t size) {
     ByteStream stream(data, size);
-    size_t numParts = size / 62;
+    // Bug fix (2026-07 session, user-reported: nav points/autopilot
+    // completely broken): the real on-disk PART record is 93 bytes, not
+    // 62 — confirmed by locating every ship-name string inside several
+    // real files' raw PART chunk bytes (TSIM001.IFF: ARROWP/darket;
+    // MISNA002.IFF: victory/tdest/tcruiser/HELLCATP/HELLCAT/darket×10/
+    // KTRN/KCORV) and finding them landing exactly 93 bytes apart, every
+    // time, never 62. Under the old 62-byte stride, only the FIRST record
+    // in any file read (mostly) correctly by coincidence — every record
+    // after that read from the wrong absolute offset, most visibly
+    // corrupting progs_id (on_is_activated/on_mission_update/
+    // on_is_destroyed/on_missions_init): those indices are what
+    // SCMissionActorsPlayer::flyToArea/flyToWaypoint/etc. (SCMissionActors.cpp)
+    // need to populate SCMission::waypoints, so nav-point display and
+    // SCStrike::autopilotCompute (which bails out immediately on an empty
+    // waypoints list) were silently starved of real data on any mission
+    // with more than ~1-2 real PART records — i.e. effectively always.
+    //
+    // The leading fields (id/unknown0/member_name/member_name_destroyed/
+    // weapon_load, 28 bytes) kept their existing width/order — only
+    // widened fields needed new offsets. area_id, x, z, y, and all 4
+    // progs_id slots are confirmed (cross-referenced against real
+    // semantics: area_id reads a clean small int or the -1/0xFFFFFFFF
+    // "no area" sentinel — which truncates to the existing 255 sentinel
+    // used everywhere downstream; x/z/y read as plausible large-magnitude
+    // position values, same apparent scale as before, just no longer
+    // packed into 24/16-bit fields; and crucially, MISNA002's KTRN
+    // (a Kilrathi transport) has on_mission_update=10, and PROG block 10
+    // in that same file's raw PROG data is independently confirmed (via
+    // direct opcode scan) to contain OP_SET_OBJ_FLY_TO_AREA — exactly the
+    // opcode a transport ordered to relocate between areas would need).
+    // area_id/on_is_activated/on_mission_update/on_is_destroyed/
+    // on_missions_init are each a full 4-byte LE int on disk now, but
+    // still truncated into their existing narrow struct fields here
+    // (uint8_t) since every real value fits in a byte and every
+    // "!= 255" sentinel check elsewhere in the codebase is unchanged.
+    //
+    // The 33-byte span between y (ends at offset 44) and progs_id (starts
+    // at offset 77) — old unknown1/unknown2/unknown3/azymuth/roll/pitch,
+    // now presumably wider still — is NOT resolved: not enough
+    // independent semantic anchors were found to pin down individual
+    // field boundaries with confidence, and guessing wrong here risks
+    // silently corrupting ship orientation instead of just leaving it at
+    // a default. Kept as a raw byte blob in unknown_bytes rather than
+    // guessing a split (same policy this codebase already uses elsewhere,
+    // e.g. WorldCameraAutoSequence::tailRaw) — azymuth/roll/pitch/
+    // unknown1/unknown2/unknown3 are left at their struct defaults (0)
+    // until that span gets its own real decode. This was already
+    // effectively true under the old broken stride for every record past
+    // the first anyway (those fields read garbage, not real data), so
+    // this isn't a regression for any record that previously "worked" —
+    // only record 0 could have been reading a real azymuth before, and
+    // even that read from the wrong relative offset once y widened.
+    // This 93-byte layout is only independently verified against real WC3
+    // data (see above). RSMission is shared with Strike Commander/Pacific
+    // Strike too, and their own native mission archives were NOT
+    // re-verified this session — this project has no configured SC/PS
+    // data_path (only [WC3] in config.ini), so that code path isn't
+    // currently exercised here, but fall back to the old 62-byte layout
+    // whenever the chunk size doesn't cleanly divide by 93, rather than
+    // assuming every RSMission-derived game matches WC3's format.
+    bool useNewLayout = (size % 93 == 0);
+    size_t numParts = size / (useNewLayout ? 93 : 62);
     for (int i = 0; i < numParts; i++) {
         MISN_PART *prt = new MISN_PART();
         prt->id = 0;
@@ -408,44 +483,110 @@ void RSMission::parseMISN_PART(uint8_t *data, size_t size) {
         std::transform(prt->member_name_destroyed.begin(), prt->member_name_destroyed.end(), prt->member_name_destroyed.begin(), ::toupper);
         prt->weapon_load = stream.ReadString(8);
         std::transform(prt->weapon_load.begin(), prt->weapon_load.end(), prt->weapon_load.begin(), ::toupper);
-        
-        prt->area_id = stream.ReadByte();
-        prt->unknown1 = stream.ReadByte();
-        prt->unknown2 = 0;
-        prt->unknown2 |= stream.ReadByte() << 0;
-        prt->unknown2 |= stream.ReadByte() << 8;
-        int32_t x, z;
-        int16_t y;
-        // ReadInt24LE() actually consumes 4 bytes (reads an unused buffer[3]
-        // it never folds into the result) — fine for formats with a real
-        // alignment/padding byte after each 24-bit field, but PART records
-        // have no room for one: the field layout only reconciles to the
-        // true 62-byte record width (id 2 + unknown0 2 + member_name 8 +
-        // member_name_destroyed 8 + weapon_load 8 + area_id 1 + unknown1 1 +
-        // unknown2 2 + x 3 + z 3 + y 2 + unknown3 1 + azymuth 2 +
-        // unknown_bytes 11 + progs_id 8 = 62) if x/z are real 3-byte reads.
-        // Use the sibling that actually reads 3.
-        x = stream.ReadInt24LEByte3();
-        z = stream.ReadInt24LEByte3();
-        y = 0;
-        y |= stream.ReadByte() << 0;
-        y |= stream.ReadByte() << 8;
-        // Y left on the old (1.0) scale, unlike x/z: y is only a 16-bit field
-        // (not the 24-bit fixed-point encoding x/z show), and real values
-        // seen (-59, 97, -99, ...) don't fit the same /65536 pattern — likely
-        // a different, smaller-magnitude unit, not yet investigated.
-        prt->position = Vector3D(x * MISN_PART_POSITION_SCALE, y * HEIGH_MAP_SCALE, -z * MISN_PART_POSITION_SCALE);
 
-        prt->unknown3 = stream.ReadByte();
-        prt->azymuth = 0;
-        prt->azymuth |= stream.ReadByte() << 0;
-        prt->azymuth |= stream.ReadByte() << 8;
-        for (int k = 0; k < 11; k++) {
-            prt->unknown_bytes.push_back(stream.ReadByte());
-        }
-        for (int k = 0; k < 4; k++) {
-            prt->progs_id.push_back(stream.ReadByte());
-            stream.ReadByte();
+        if (useNewLayout) {
+            prt->area_id = (uint8_t)stream.ReadInt32LE();
+            int32_t x, z, y;
+            x = stream.ReadInt32LE();
+            z = stream.ReadInt32LE();
+            y = stream.ReadInt32LE();
+            // Bug fix (2026-07 session, live-tested after the stride fix
+            // landed: destroyers went invisible, player spawned outside
+            // the Victory instead of inside it): y used to be a genuinely
+            // narrow 16-bit field (old comment: "real values seen (-59,
+            // 97, -99, ...)"), left unscaled (HEIGH_MAP_SCALE=1.0) on
+            // purpose. Now that it's a full 4-byte field reading the same
+            // large-magnitude fixed-point encoding as x/z (hundreds of
+            // thousands, not tens), it needs x/z's own scale, not the old
+            // one — reusing HEIGH_MAP_SCALE here left every new-layout
+            // actor's Y off by ~5 orders of magnitude (e.g. real WC3
+            // destroyer data: raw y=-767745 read as -767745 world units
+            // unscaled, vs. a sane ~-1851 once scaled like x/z).
+            prt->position = Vector3D(x * MISN_PART_POSITION_SCALE, y * MISN_PART_POSITION_SCALE, -z * MISN_PART_POSITION_SCALE);
+
+            // Middle span decode (2026-07 session, continued after the
+            // stride/y-scale fixes): byte-diffed dozens of real records
+            // across the whole campaign (MISNA001-004, MISNK001,
+            // MISNK02A/B, MISNK03A, MISNL001, ...) hunting for records
+            // with actual non-zero orientation data. azymuth/pitch came
+            // out extremely clean — always exact multiples of 5 degrees
+            // (0/10/20/25/30/45/90/180/235/270), and always paired
+            // symmetrically for opposing-formation wingmen (e.g. two
+            // vaktoth at pitch=+90, two at pitch=-90) — high confidence.
+            // roll never showed a single non-zero sample in the whole
+            // corpus scanned; kept at the same offset per the struct's
+            // pre-existing field order (which the OLD 62-byte parser
+            // declared but never actually read at all — this is the
+            // first time roll/pitch have been wired up from real data).
+            prt->unknown1 = stream.ReadByte();
+            prt->azymuth = (uint16_t)stream.ReadShort();
+            prt->roll = (uint16_t)stream.ReadShort();
+            prt->pitch = (uint16_t)stream.ReadShort();
+            prt->unknown3 = stream.ReadByte();
+            // Bug fix (2026-07 session, found while investigating MISNJ002
+            // "Torgo 2"'s wave-spawn opcodes): this loop's own bound (20)
+            // never matched the very breakdown documented directly below
+            // it, which already summed to 25 (4+1+4+4+12) — a plain
+            // miscount, not a deliberate choice. Reading only 20 left
+            // every record after the first drifting 5 bytes short of the
+            // real 93-byte stride (the loop's sequential ByteStream reads
+            // have no per-record seek to resync), corrupting id/
+            // member_name/area_id/position/progs_id for every actor past
+            // the first in EVERY WC3 mission — the same class of bug as
+            // the original 93-vs-62 stride fix above, just smaller and
+            // easier to miss. Confirmed against MISNA002.IFF: with the
+            // wrong 20-byte bound, record 1 reads member_name as garbage
+            // ("\xFF\x01tde") with a huge nonsense position; with the
+            // correct 25, record 1 reads cleanly as "tdest" at a small,
+            // sane position — matching this file's own real actor list
+            // (victory/tdest/tdest/tcruiser/HELLCATP/HELLCAT/...) exactly.
+            //
+            // Remaining 25 bytes: a per-ship-class constant (4 bytes —
+            // e.g. always 204800 for "darket", 0 for Terran ships;
+            // plausibly a turn-rate/AI-tuning value, not investigated
+            // further), 1 padding byte, a friend/hostile flag (4 bytes —
+            // +1 Terran, -1 Kilrathi, 0 for at least one neutral prop
+            // ("jubouy", a jump buoy)), an id-mirroring value (4 bytes,
+            // closely tracks this record's own `id` for every ship
+            // checked except one NPC wingman), and a 3-component (x,y,z-
+            // shaped) formation-offset vector (12 bytes, non-zero only
+            // for paired wingman records) — real, structured data, but
+            // without an existing struct field to land in and not needed
+            // for anything currently broken, so still kept as a raw blob
+            // rather than adding new fields for data nothing consumes yet.
+            for (int k = 0; k < 25; k++) {
+                prt->unknown_bytes.push_back(stream.ReadByte());
+            }
+            for (int k = 0; k < 4; k++) {
+                prt->progs_id.push_back((uint8_t)stream.ReadInt32LE());
+            }
+        } else {
+            // Old 62-byte layout — untouched, kept for any RSMission
+            // consumer whose real data doesn't match WC3's 93-byte one.
+            prt->area_id = stream.ReadByte();
+            prt->unknown1 = stream.ReadByte();
+            prt->unknown2 = 0;
+            prt->unknown2 |= stream.ReadByte() << 0;
+            prt->unknown2 |= stream.ReadByte() << 8;
+            int32_t x, z;
+            int16_t y;
+            x = stream.ReadInt24LEByte3();
+            z = stream.ReadInt24LEByte3();
+            y = 0;
+            y |= stream.ReadByte() << 0;
+            y |= stream.ReadByte() << 8;
+            prt->position = Vector3D(x * MISN_PART_POSITION_SCALE, y * HEIGH_MAP_SCALE, -z * MISN_PART_POSITION_SCALE);
+            prt->unknown3 = stream.ReadByte();
+            prt->azymuth = 0;
+            prt->azymuth |= stream.ReadByte() << 0;
+            prt->azymuth |= stream.ReadByte() << 8;
+            for (int k = 0; k < 11; k++) {
+                prt->unknown_bytes.push_back(stream.ReadByte());
+            }
+            for (int k = 0; k < 4; k++) {
+                prt->progs_id.push_back(stream.ReadByte());
+                stream.ReadByte();
+            }
         }
         prt->on_is_activated = prt->progs_id[0];
         prt->on_mission_update = prt->progs_id[1];
