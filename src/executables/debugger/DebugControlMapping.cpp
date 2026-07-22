@@ -112,6 +112,7 @@ void DebugControlMapping::buildActionList() {
         { "MDFS Radar",             CreateAction(InputAction::SIM_START, S::MDFS_RADAR)         },
         { "MDFS Damage",            CreateAction(InputAction::SIM_START, S::MDFS_DAMAGE)        },
         { "MDFS Weapons",           CreateAction(InputAction::SIM_START, S::MDFS_WEAPONS)       },
+        { "Cycle Missiles",         CreateAction(InputAction::SIM_START, S::CYCLE_MISSILES)     },
         { "MDFS Target Camera",     CreateAction(InputAction::SIM_START, S::MDFS_TARGET_CAMERA) },
         { "Radar Zoom In",          CreateAction(InputAction::SIM_START, S::RADAR_ZOOM_IN)      },
         { "Radar Zoom Out",         CreateAction(InputAction::SIM_START, S::RADAR_ZOOM_OUT)     },

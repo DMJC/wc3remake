@@ -1538,8 +1538,26 @@ bool SCPlane::Shoot(int weapon_hard_point_id, SCMissionActors *target, SCMission
     // nb_weap here would hit 0 after the very first shot and make every
     // subsequent Shoot() call on that hardpoint fail the nb_weap<=0 check
     // near the top of this function as if ammo had run out.
+    // Bug found (2026-07 session, user-reported: weapons MFD missile count
+    // showing "-664"): the objct->weaps[0] branch below reads/decrements
+    // this->weaps_load[hpid]->objct->weaps[0]->nb_weap -- but objct is the
+    // weapon-TYPE's own shared RSEntity (the same prototype object every
+    // ship mounting that weapon type points to), and its ->weaps[0] here is
+    // whatever RSEntity::parseREAL_OBJT_PODR_DATA populated from that
+    // weapon's own OBJT>PODR>DATA chunk -- a submunition/pod count, nothing
+    // to do with this hardpoint's remaining ammo. For missiles/torpedoes
+    // that chunk is unrelated and the counter is shared across every ship
+    // (including AI) firing that same weapon type, so gating the real
+    // ammo decrement behind it let the displayed count drift to nonsense
+    // values. The real per-hardpoint ammo count is already correctly
+    // tracked in this->weaps_load[hpid]->nb_weap itself (seeded from the
+    // ship's own SSHP>WEAP>FGTR>MISL ammo field -- see SCPlane::InitLoadout),
+    // so only guns -- where this dual-counter path may have been intended --
+    // still take it; every non-gun weapon now always decrements its own
+    // hardpoint's real count directly, one per shot.
     if (!this->infinite_ammo && !IsWC3EnergyGunWeaponId(wobj->wdat->weapon_id)) {
-        if (this->weaps_load[weapon_hard_point_id]->objct->weaps.size() > 0) {
+        bool isGunCategory = wobj->wdat->weapon_category == 0;
+        if (isGunCategory && this->weaps_load[weapon_hard_point_id]->objct->weaps.size() > 0) {
             this->weaps_load[weapon_hard_point_id]->objct->weaps[0]->nb_weap--;
             if (this->weaps_load[weapon_hard_point_id]->objct->weaps[0]->nb_weap <= 0) {
                 this->weaps_load[weapon_hard_point_id]->nb_weap--;

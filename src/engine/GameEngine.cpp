@@ -185,14 +185,14 @@ void GameEngine::initKeyboard() {
     // Guns on Space, missiles/torpedo on Enter — real WC-series controls,
     // not a single fire button (see FIRE_MISSILE's own comment).
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::FIRE_MISSILE), SDL_SCANCODE_RETURN);
-    // Moved off M — M is now bound to MDFS_WEAPONS below (real WC3 control:
-    // G cycles gun type, M cycles missile/ordnance hardpoint).
+    // Moved off M — M is now bound to CYCLE_MISSILES below (real WC3
+    // control: G cycles gun type, M cycles missile/ordnance bank).
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::TOGGLE_MOUSE), SDL_SCANCODE_U);
-    // M cycles which missile/ordnance hardpoint FIRE_MISSILE/Enter fires —
-    // same action W already triggers (MDFS_WEAPONS' cycling handler,
-    // SCStrike.cpp, updates selected_weapon); bound additively, not a
-    // replacement for W.
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS), SDL_SCANCODE_M);
+    // M cycles which missile/ordnance bank FIRE_MISSILE/Enter fires (user-
+    // requested, 2026-07 session) — its own action now, not an MDFS_WEAPONS
+    // alias: W/MDFS_WEAPONS only opens the weapons MFD and no longer
+    // cycles anything (see that action's own comment).
+    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::CYCLE_MISSILES), SDL_SCANCODE_M);
     // LANDING_GEAR moved off L to O so L is free for LOCK_TARGET (real WC3
     // uses L for target lock).
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::LANDING_GEAR), SDL_SCANCODE_O);
@@ -230,7 +230,12 @@ void GameEngine::initKeyboard() {
     // 2026-07 session) — moved SPEC_KEY_1 (a mission-force-end debug cheat,
     // not a real WC3 control at all) off F10 onto X to make room.
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::VIEW_TRACK), SDL_SCANCODE_F10);
-    m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::SPEC_KEY_1), SDL_SCANCODE_X);
+    // SPEC_KEY_1's X binding removed entirely (user-requested, 2026-07
+    // session: "pressing x is ending the mission, get rid of this
+    // keybinding") — it's a mission-force-end debug cheat, not a real
+    // WC3 control, and X was never a good fit for it either (see the
+    // relocation comment above). The action/handler (SCStrike.cpp) is
+    // left in place, just unreachable from any key now.
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::SPEC_KEY_2), SDL_SCANCODE_F11);
     // PAUSE moved off P so P is free for MDFS_POWER (left MFD power meters).
     m_keyboard->bindKeyToAction(CreateAction(InputAction::SIM_START, SimActionOfst::PAUSE), SDL_SCANCODE_E);

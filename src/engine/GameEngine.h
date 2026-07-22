@@ -135,6 +135,14 @@ enum SimActionOfst {
     // cheat before this — see that binding's own relocation comment. See
     // View::TRACK's own comment for the camera behavior.
     VIEW_TRACK = 76,
+    // Cycles WC3's independent missile/ordnance-*bank* selection
+    // (SCPlane::selected_missile_group), completely separate from
+    // CYCLE_GUNS/gun-type selection. User-requested (2026-07 session): M
+    // used to alias MDFS_WEAPONS (open-only, no cycling — see that
+    // action's own comment) and did this cycling as a side effect of
+    // being pressed while the weapons MFD was already open; split into
+    // its own action so W/M no longer do the same thing.
+    CYCLE_MISSILES = 77,
 };
 
 class GameEngine{

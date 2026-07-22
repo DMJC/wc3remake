@@ -812,7 +812,14 @@ void SCCockpit::RenderMFDSPower(Point2D pmfd, FrameBuffer *fb) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
     }
-    this->RenderMFDS(pmfd, fb);
+    // clearBackground=false (user-requested, 2026-07 session: "still
+    // seeing some clear to black in the left MFDs"). RenderWC3
+    // InstrumentsSVGA already draws this page's real backdrop (the
+    // mode=0x060a gauge bezels, same shapes drawn again below) before
+    // this function runs — RenderMFDS's own black clear was painting
+    // straight over that real art instead of onto a blank panel. Same
+    // fix already applied to RenderMFDSWeapon/RenderMFDSDamage.
+    this->RenderMFDS(pmfd, fb, false);
     if (this->cockpit->instrumentShapes.empty()) {
         return;
     }
@@ -909,6 +916,16 @@ void SCCockpit::RenderMFDSPower(Point2D pmfd, FrameBuffer *fb) {
 // weapons/comm/damage/cam), same as every other show_* flag. Direct 's'
 // (MDFS_SHIELD) still independently toggles the shield page on its own,
 // unrelated to this cycle.
+void SCCockpit::ClearLeftMfdPages() {
+    this->show_radars = false;
+    this->show_weapons = false;
+    this->show_damage = false;
+    this->show_comm = false;
+    this->show_cam = false;
+    this->show_power = false;
+    this->show_shield = false;
+}
+
 void SCCockpit::CyclePowerOrShield() {
     if (this->show_power) {
         this->selected_power_gauge++;
@@ -922,6 +939,7 @@ void SCCockpit::CyclePowerOrShield() {
         this->show_power = true;
         this->selected_power_gauge = 0;
     } else {
+        this->ClearLeftMfdPages();
         this->show_power = true;
         this->selected_power_gauge = 0;
     }
@@ -986,7 +1004,15 @@ void SCCockpit::RenderMFDSShield(Point2D pmfd, FrameBuffer *fb) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
     }
-    this->RenderMFDS(pmfd, fb);
+    // clearBackground=false (user-requested, 2026-07 session: "still
+    // seeing some clear to black in the left MFDs"). RenderWC3
+    // InstrumentsSVGA already draws this page's real backdrop (shape 59,
+    // the grid panel — see this file's page-id comment above
+    // RenderWC3InstrumentsSVGA's pageVisible) before this function runs —
+    // RenderMFDS's own black clear was painting straight over that real
+    // art instead of onto a blank panel. Same fix already applied to
+    // RenderMFDSWeapon/RenderMFDSDamage/RenderMFDSPower.
+    this->RenderMFDS(pmfd, fb, false);
     if (this->cockpit->instrumentShapes.empty()) {
         return;
     }
@@ -3236,7 +3262,15 @@ void SCCockpit::RenderMFDSCommWC3(Point2D pmfd, int mode, FrameBuffer *fb) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
     }
-    this->RenderMFDS(pmfd, fb);
+    // clearBackground=false (user-requested, 2026-07 session: "still
+    // seeing some clear to black in the left MFDs"). RenderWC3
+    // InstrumentsSVGA already draws this page's real backdrop (shape 53,
+    // kSidePanel — see this file's page-id comment above
+    // RenderWC3InstrumentsSVGA's pageVisible) before this function runs —
+    // RenderMFDS's own black clear was painting straight over that real
+    // art instead of onto a blank panel. Same fix already applied to
+    // RenderMFDSWeapon/RenderMFDSDamage/RenderMFDSPower/RenderMFDSShield.
+    this->RenderMFDS(pmfd, fb, false);
     this->UpdateCommVideo();
     if (this->commVideoStream != nullptr && !this->commVideoStream->isFinished()) {
         // Fills the whole VDU panel, replacing the contact/question list
@@ -3275,15 +3309,10 @@ void SCCockpit::RenderMFDSCommWC3(Point2D pmfd, int mode, FrameBuffer *fb) {
         }
         return;
     }
-    auto bgIt = this->cockpit->instrumentShapes.find(WC3CockpitShapeId::kSidePanel);
-    if (bgIt != this->cockpit->instrumentShapes.end() && bgIt->second != nullptr && bgIt->second->GetNumImages() > 0) {
-        RLEShape *bgShape = bgIt->second->GetShape(0);
-        if (bgShape != nullptr) {
-            Point2D bgPos = pmfd;
-            bgShape->SetPosition(&bgPos);
-            fb->drawShape(bgShape);
-        }
-    }
+    // kSidePanel background removed (user-requested, 2026-07 session:
+    // "get rid of the background on the comms page") — text now drawn
+    // directly over whatever's already on the panel, same treatment as
+    // the Weapon MFD.
     WC3Font *font = WC3Globals::getInstance().getFont("SLRG");
     if (font == nullptr || !font->isLoaded()) {
         return;
@@ -3832,9 +3861,11 @@ void SCCockpit::RenderWC3InstrumentsSVGA(FrameBuffer* fb, bool useHud) {
     //     plus shape 38 (close match for kTargetLockBoxSVGA), consistent
     //     with a target-lock overlay drawn only in single-target radar
     //     submode.
-    //   0x04 -> Comm: shape 53 (kSidePanel). Corroborated independently by
-    //     SYS's own page-4 slot being the real "Comm" subsystem id (16) —
-    //     two unrelated chunks agreeing. High confidence.
+    //   0x04 -> Comm: shape 53 (kSidePanel) was the real backdrop
+    //     (corroborated independently by SYS's own page-4 slot being the
+    //     real "Comm" subsystem id (16) — two unrelated chunks agreeing,
+    //     high confidence) but is no longer drawn — user-requested,
+    //     2026-07 session, same "no backdrop" treatment as Weapon.
     //   0x06 -> Power: confirmed separately, see RenderMFDSPower.
     //   0x03 (shape 44, kSystemStatusIconsSVGA, 38 frames) and 0x05 (shape
     //     43, kPilotHandAnimation2SVGA, 12 frames) have no corroborating
@@ -3849,6 +3880,11 @@ void SCCockpit::RenderWC3InstrumentsSVGA(FrameBuffer* fb, bool useHud) {
     // That's the reported "MFD sprites drawn over each other" bug.
     bool leftMfdPageActive = this->show_radars || this->show_weapons || this->show_damage ||
                               this->show_comm || this->show_cam || this->show_power || this->show_shield;
+    // The show_* flags are now kept mutually exclusive at the point each
+    // page is opened (see SCCockpit::ClearLeftMfdPages, called from every
+    // MDFS_* key handler in SCStrike.cpp and from CyclePowerOrShield
+    // above) — so at most one of them is ever true here and a plain
+    // per-page check is enough; no priority arbitration needed.
     auto pageVisible = [&](uint16_t mode) -> bool {
         uint8_t page = (uint8_t)(mode >> 8);
         if (page == 0x00) return this->show_shield;
@@ -3858,7 +3894,12 @@ void SCCockpit::RenderWC3InstrumentsSVGA(FrameBuffer* fb, bool useHud) {
         // still includes show_radars so the idle/default bucket below
         // correctly stays hidden while radar mode is active.
         if (page == 0x02) return false;
-        if (page == 0x04) return this->show_comm;
+        // Comm page background removed (user-requested, 2026-07 session:
+        // "get rid of the background on the comms page") — shape 53
+        // (kSidePanel) no longer drawn here, same treatment as the
+        // Weapon MFD's own backdrop removal (RenderMFDS's clearBackground
+        // comment, above).
+        if (page == 0x04) return false;
         if (page == 0x06) return this->show_power;
         return !leftMfdPageActive;
     };
@@ -4286,7 +4327,14 @@ void SCCockpit::RenderMFDSDamage(Point2D pmfd_left, FrameBuffer *fb) {
     if (!fb) {
         fb = VGA.getFrameBuffer();
     }
-    this->RenderMFDS(pmfd_left, fb);
+    // clearBackground=false (user-requested, 2026-07 session: "black
+    // square behind it, shouldn't have a background") — same tradeoff as
+    // RenderMFDSWeapon's own clearBackground=false above: neither the
+    // page-0 subsystem text list nor the page-1 ship diagram has a solid
+    // backdrop of its own, so RenderMFDS's anti-residue black clear just
+    // left a flat black panel behind them instead of the cockpit's real
+    // instrument art showing through.
+    this->RenderMFDS(pmfd_left, fb, false);
     if (this->cockpit->instrumentShapes.empty()) {
         Point2D damage_pos = {pmfd_left.x +25, pmfd_left.y +15};
         RLEShape *damage_shape = this->cockpit->MONI.MFDS.DAMG.ARTS.GetShape(0);
@@ -4295,45 +4343,109 @@ void SCCockpit::RenderMFDSDamage(Point2D pmfd_left, FrameBuffer *fb) {
         return;
     }
     if (this->damage_page == 0) {
-        // Page 0: per-subsystem text list (user-described, 2026-07
-        // session). COCK>FRNT>SYS gives the real on-screen slot order +
-        // subsystem id per row (see RSCockpit::WC3DamageSubsystemSlot for
-        // what's confirmed vs. still unconfirmed about its 10-byte record
-        // layout), cross-referenced against COCK>FRNT>DAMG>TEXT for the
-        // real subsystem name per id. Row *positions* here are computed
-        // (evenly spaced bottom-up), not file-derived — no chunk records
-        // individual row coordinates, only the label list and the slot
-        // order. No per-subsystem damage *state* is tracked anywhere in
-        // the simulation either (SCMissionActors only has aggregate
-        // shield_front/back/left/right + overall health, no per-subsystem
-        // hit points) — so this lists the real subsystem names in their
-        // real order but can't yet highlight which one is damaged.
-        const auto &slots = g_ifVGA ? this->cockpit->vgaFrontSys : this->cockpit->svgaFrontSys;
-        const auto &labels = g_ifVGA ? this->cockpit->vgaFrontDamageLabels : this->cockpit->svgaFrontDamageLabels;
-        if (!slots.empty() && !labels.empty() && this->font != nullptr) {
+        // Page 0: header + per-subsystem text list (user-described/
+        // user-sourced, 2026-07 session). Real chunk sources, all from the
+        // HUD form (not FRNT — user-specified, 2026-07 session):
+        //   - COCK>VGA|SVGA>HUD>TEXT mode=0x05: id=0 "DAMAGE REPORT" (the
+        //     page header) and id=14 "   No Damage" (shown when nothing's
+        //     damaged) — both real, positioned text, not computed layout.
+        //   - COCK>VGA|SVGA>HUD>SYS: the real on-screen slot order +
+        //     subsystem id per row (see RSCockpit::WC3DamageSubsystemSlot
+        //     for what's confirmed vs. still unconfirmed about its 10-byte
+        //     record layout).
+        //   - COCK>VGA|SVGA>HUD>DAMG>TEXT: the real subsystem name per id,
+        //     cross-referenced against SYS above.
+        // Per-subsystem damage *state*, unlike when this list was first
+        // written, is now tracked (SCMissionActors::component_damage[],
+        // player-only — see ShipComponent's own comment) — the 8 real
+        // DAMG ids map onto 8 of its 11 components (VDU1/VDU2/
+        // TacticalDisplay are the "Front" 3 that never appear in this
+        // list — see RenderVDUDamageOverlay's own handling of those).
+        // Only actually-damaged subsystems are listed now, in their real
+        // slot order; row *positions* are still computed (evenly spaced
+        // bottom-up) since DAMG>TEXT carries no per-row coordinates of its
+        // own, only the label list.
+        const auto &hudText = g_ifVGA ? this->cockpit->vgaHudText : this->cockpit->svgaHudText;
+        const auto &slots = g_ifVGA ? this->cockpit->vgaHudSys : this->cockpit->svgaHudSys;
+        const auto &labels = g_ifVGA ? this->cockpit->vgaHudDamageLabels : this->cockpit->svgaHudDamageLabels;
+        // WC3Font/"SLRG" (not this->font/RSFont — SC-only, resolves to
+        // nullptr for WC3 cockpits: SHUDFONT.SHP isn't a WC3 asset, so
+        // RSFontManager::GetFont's map lookup default-constructs a null
+        // entry for it — user-reported, 2026-07 session: "damage display
+        // showing no text" (this whole page silently no-op'd on that null
+        // check). Reaching damage_page==0 at all already requires
+        // instrumentShapes to be non-empty (WC3-only — see this function's
+        // own SC/MONI.MFDS.DAMG early-return above), so there's no SC
+        // fallback needed here. Same font/color already used for the comm
+        // page (RenderMFDSCommWC3) and the weapons-MFD status text.
+        WC3Font *font = WC3Globals::getInstance().getFont("SLRG");
+        if (font == nullptr || !font->isLoaded()) {
+            return;
+        }
+        uint8_t green = ClosestPaletteIndex(this->palette, 0, 200, 50);
+        const RSCockpit::WC3TextEntry *headerEntry = nullptr;
+        const RSCockpit::WC3TextEntry *noDamageEntry = nullptr;
+        for (const auto &t : hudText) {
+            if (t.mode != 0x05) continue;
+            if (t.id == 0) {
+                headerEntry = &t;
+            } else if (t.id == 14) {
+                noDamageEntry = &t;
+            }
+        }
+        if (headerEntry != nullptr) {
+            Point2D pos = {pmfd_left.x + headerEntry->x, pmfd_left.y + headerEntry->y};
+            font->drawTextColored(fb, headerEntry->text, pos.x, pos.y, green);
+        }
+        std::vector<uint8_t> damagedIds;
+        if (this->player_plane != nullptr && this->player_plane->pilot != nullptr && !slots.empty()) {
+            SCMissionActors *pilot = this->player_plane->pilot;
             std::vector<RSCockpit::WC3DamageSubsystemSlot> ordered(slots.begin(), slots.end());
             std::sort(ordered.begin(), ordered.end(), [](const RSCockpit::WC3DamageSubsystemSlot &a, const RSCockpit::WC3DamageSubsystemSlot &b) {
                 return a.slotOrder < b.slotOrder;
             });
-            Point2D mfdSize = this->GetWC3MfdSize();
-            const int rowHeight = 8;
-            int startY = pmfd_left.y + mfdSize.y - (int)(ordered.size() * rowHeight) - 4;
-            if (startY < pmfd_left.y + 20) startY = pmfd_left.y + 20;
-            int row = 0;
             for (const auto &slot : ordered) {
-                if (slot.subsystemId == 0xFF) continue;
-                const char *name = nullptr;
-                for (const auto &label : labels) {
-                    if (label.id == slot.subsystemId) {
-                        name = label.label;
-                        break;
-                    }
+                ShipComponent comp;
+                switch (slot.subsystemId) {
+                    case 16: comp = ShipComponent::Communications; break;
+                    case 17: comp = ShipComponent::Shields; break;
+                    case 18: comp = ShipComponent::AutoRepair; break;
+                    case 32: comp = ShipComponent::Afterburners; break;
+                    case 33: comp = ShipComponent::PowerPlant; break;
+                    case 34: comp = ShipComponent::Engine; break;
+                    case 48: comp = ShipComponent::Targeting; break;
+                    case 49: comp = ShipComponent::Guns; break;
+                    default: continue;  // 0xFF (disabled slot) or unmapped id
                 }
-                if (name == nullptr) continue;
-                Point2D textPos = {pmfd_left.x + 4, startY + row * rowHeight};
-                fb->printText(this->font, textPos, std::string(name), 0);
-                row++;
+                if (pilot->component_damage[(size_t)comp] > 0.0f) {
+                    damagedIds.push_back(slot.subsystemId);
+                }
             }
+        }
+        if (damagedIds.empty()) {
+            if (noDamageEntry != nullptr) {
+                Point2D pos = {pmfd_left.x + noDamageEntry->x, pmfd_left.y + noDamageEntry->y};
+                font->drawTextColored(fb, noDamageEntry->text, pos.x, pos.y, green);
+            }
+            return;
+        }
+        Point2D mfdSize = this->GetWC3MfdSize();
+        const int rowHeight = 8;
+        int startY = pmfd_left.y + mfdSize.y - (int)(damagedIds.size() * rowHeight) - 4;
+        if (startY < pmfd_left.y + 20) startY = pmfd_left.y + 20;
+        int row = 0;
+        for (uint8_t id : damagedIds) {
+            const char *name = nullptr;
+            for (const auto &label : labels) {
+                if (label.id == id) {
+                    name = label.label;
+                    break;
+                }
+            }
+            if (name == nullptr) continue;
+            Point2D textPos = {pmfd_left.x + 4, startY + row * rowHeight};
+            font->drawTextColored(fb, name, textPos.x, textPos.y, green);
+            row++;
         }
         return;
     }
@@ -4657,18 +4769,14 @@ void SCCockpit::Render(CockpitFace face) {
                 this->RenderMFDSPower(pmfd_left, fb);
             } else if (this->show_shield) {
                 this->RenderMFDSShield(pmfd_left, fb);
-            } else {
-                // User-reported (2026-07 session): pressing 's' (MDFS_
-                // SHIELD) twice — toggling show_shield back off — left the
-                // shield page's last-drawn content (background grid,
-                // gauges, ...) sitting on screen instead of clearing. None
-                // of the RenderMFDS* branches above run when every show_*
-                // flag is false, so nothing was ever clearing the panel in
-                // that state; each RenderMFDS* function's own black clear
-                // (RenderMFDS) only runs when it's actually called. Clear
-                // it directly here instead.
-                this->RenderMFDS(pmfd_left, fb);
             }
+            // Idle-state black clear removed (user-requested, 2026-07
+            // session: "get rid of the idle clear"). No show_* branch
+            // above runs when every page is closed, so whatever the
+            // RenderWC3InstrumentsSVGA idle/default bucket (pages 0x03/
+            // 0x05, drawn earlier this frame — see its own pageVisible
+            // comment) put on the left MFD is left showing instead of
+            // being wiped to black.
         }
         this->RenderCommMessages({0,200}, fb);
     }

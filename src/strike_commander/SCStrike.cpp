@@ -1471,9 +1471,29 @@ void SCStrike::checkKeyboard(void) {
             printf("CYCLE_GUNS: pressed, but weaps_load has zero gun-category (weapon_category==0) hardpoints with a resolved weapon -- nothing to cycle\n");
         }
         // User-requested (2026-07 session): G should also open the
-        // weapons MFD, same as W/M (MDFS_WEAPONS) already do.
+        // weapons MFD, same as CYCLE_MISSILES/M does below.
         this->cockpit->show_weapons = true;
-        this->mfd_timeout = 400;
+    }
+    // M cycles WC3's independent missile/ordnance-*bank* selection
+    // (SCPlane::selected_missile_group), completely separate from
+    // CYCLE_GUNS/gun-type selection above — user-requested (2026-07
+    // session), its own action now rather than an MDFS_WEAPONS side
+    // effect (see that action's own comment). Only meaningful for WC3
+    // ships; SC1's selected_weapon index has no per-bank concept to
+    // cycle. Mirrors CYCLE_GUNS's own "also open the weapons MFD"
+    // behavior.
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::CYCLE_MISSILES)) &&
+        this->player_plane->is_wc3_ship) {
+        std::vector<int> bankIndices = collectMissileHardpointIndices(this->player_plane);
+        if (!bankIndices.empty()) {
+            this->player_plane->selected_missile_group =
+                (this->player_plane->selected_missile_group + 1) % (int)bankIndices.size();
+        }
+        this->player_plane->wp_cooldown = 0;
+        if (!this->cockpit->show_weapons) {
+            this->cockpit->ClearLeftMfdPages();
+        }
+        this->cockpit->show_weapons = true;
     }
     // Guns always fire down the boresight, no target required. Fires every
     // hardpoint matching the CYCLE_GUNS-selected type (or every gun
@@ -1682,7 +1702,6 @@ void SCStrike::checkKeyboard(void) {
             // and opens the weapons MFD, same as CYCLE_GUNS/MDFS_WEAPONS.
             this->player_plane->selected_missile_group = -1;
             this->cockpit->show_weapons = true;
-            this->mfd_timeout = 400;
         } else {
             this->player_plane->SetSpoilers();
         }
@@ -1705,7 +1724,12 @@ void SCStrike::checkKeyboard(void) {
     // press is a no-op for WC3 cockpits rather than removed outright —
     // SCStrike.cpp is shared between both games, and SC still needs it.
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_RADAR))) {
-        this->cockpit->show_radars = !this->cockpit->show_radars;
+        if (!this->cockpit->show_radars) {
+            this->cockpit->ClearLeftMfdPages();
+            this->cockpit->show_radars = true;
+        } else {
+            this->cockpit->show_radars = false;
+        }
         // WC3's real "cycle target sub-system/turret" key. Reuses the same
         // 'r' binding show_radars is already dead code for under WC3 (see
         // comment above) instead of a separate action — a plain no-op for
@@ -1722,6 +1746,7 @@ void SCStrike::checkKeyboard(void) {
         // pressing again while it's open cycles to the next page; pressing
         // once more (wrapping back to page 0) closes it.
         if (!this->cockpit->show_damage) {
+            this->cockpit->ClearLeftMfdPages();
             this->cockpit->show_damage = true;
             this->cockpit->damage_page = 0;
         } else {
@@ -1737,95 +1762,27 @@ void SCStrike::checkKeyboard(void) {
         this->cockpit->CyclePowerOrShield();
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_SHIELD))) {
-        this->cockpit->show_shield = !this->cockpit->show_shield;
+        // User-requested (2026-07 session): pressing 's' while already on
+        // the shield page is a no-op now — it no longer closes the page.
+        if (!this->cockpit->show_shield) {
+            this->cockpit->ClearLeftMfdPages();
+            this->cockpit->show_shield = true;
+        }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::CYCLE_COCKPIT_VIEW))) {
         this->cockpit->CycleViewMode();
     }
-    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS)) &&
-        this->player_plane->is_wc3_ship) {
-        // WC3: independent missile/ordnance-type cycle (selected_missile_
-        // group), completely separate from gun selection (selected_gun_
-        // group/CYCLE_GUNS) -- per user direction. The SC1 logic below
-        // (selected_weapon, hpts.size()/2+1 sizing, SC1 HUD weapon-mode
-        // switch) doesn't apply to WC3's simpler fixed 1:1 hardpoint layout
-        // and was walking into/getting stuck on gun hardpoints instead of
-        // cycling ordnance cleanly.
-        if (this->cockpit->show_weapons) {
-            std::vector<int> bankIndices = collectMissileHardpointIndices(this->player_plane);
-            if (!bankIndices.empty()) {
-                this->player_plane->selected_missile_group =
-                    (this->player_plane->selected_missile_group + 1) % (int)bankIndices.size();
-            }
-            this->player_plane->wp_cooldown = 0;
-            this->mfd_timeout = 400;
-        } else {
-            this->cockpit->show_weapons = !this->cockpit->show_weapons;
-            this->mfd_timeout = 400;
-            this->player_plane->wp_cooldown = 0;
-        }
-    } else if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS))) {
-        if (this->cockpit->show_weapons) {
-            int nb_hardpoint = this->player_plane->object->entity->hpts.size() / 2 +1;
-            int next_weapon = (this->player_plane->selected_weapon + 1) % nb_hardpoint;
-            if (this->air_weapons_mode) {
-                while (this->player_plane->weaps_load[next_weapon] != nullptr &&
-                       this->player_plane->weaps_load[next_weapon]->objct != nullptr &&
-                       this->player_plane->weaps_load[next_weapon]->objct->wdat != nullptr &&
-                       this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_20MM &&
-                       this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_AIM120 &&
-                       this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_AIM9J &&
-                       this->player_plane->weaps_load[next_weapon]->objct->wdat->weapon_id != weapon_ids::ID_AIM9M) {
-                    next_weapon = (next_weapon + 1) % nb_hardpoint;
-                    if (next_weapon == this->player_plane->selected_weapon) {
-                        break;
-                    }
-                }
-            }
-            if ((this->player_plane->weaps_load[this->player_plane->selected_weapon] != nullptr) && (this->player_plane->weaps_load[this->player_plane->selected_weapon]->objct->wdat->weapon_id == weapon_ids::ID_20MM) && (!this->air_weapons_mode && this->cockpit->weapon_mode == Hud_weapon_mode::WM_HUD_LCOS)) {
-                this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_STRAF;
-            } else {
-                this->player_plane->selected_weapon = next_weapon;
-                if (this->player_plane->weaps_load[this->player_plane->selected_weapon] == nullptr) {
-                    this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_NONE;
-                } else {
-                    switch (this->player_plane->weaps_load[this->player_plane->selected_weapon]->objct->wdat->weapon_id) {
-                        case weapon_ids::ID_20MM:
-                            this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_LCOS;
-                            break;
-                        case weapon_ids::ID_AIM120:
-                            this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_LRM;
-                            break;
-                        case weapon_ids::ID_AIM9J:
-                        case weapon_ids::ID_AIM9M:
-                            this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_SRM;
-                            break;
-                        case weapon_ids::ID_AGM65D:
-                        case weapon_ids::ID_GBU15:
-                            this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_IRST;
-                            break;
-                        case weapon_ids::ID_MK20:
-                        case weapon_ids::ID_MK82:
-                        case weapon_ids::ID_DURANDAL:
-                            this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_CCIP;
-                            break;
-                        case weapon_ids::ID_LAU3:
-                            this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_STRAF;
-                            break;
-                        default:
-                            this->cockpit->weapon_mode = Hud_weapon_mode::WM_HUD_NONE;
-                            break;
-                    }
-                }
-            }
-            
-            
-            this->player_plane->wp_cooldown = 0;
-            this->mfd_timeout = 400;
-        } else {
-            this->cockpit->show_weapons = !this->cockpit->show_weapons;
-            this->mfd_timeout = 400;
-            this->player_plane->wp_cooldown = 0;
+    if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_WEAPONS))) {
+        // User-requested (2026-07 session): "pressing w should not change
+        // missile or gun mounts. It should just display the weapons MFD."
+        // Cycling gun type/missile bank now lives solely on their own
+        // dedicated real-WC3 controls (CYCLE_GUNS/G, TOGGLE_BRAKES/B "select
+        // all hardpoints" — see their own comments); W/MDFS_WEAPONS no
+        // longer doubles as a cycle key for either, on WC3 or SC1 ships. No
+        // effect if the weapons page is already open, same as MDFS_SHIELD.
+        if (!this->cockpit->show_weapons) {
+            this->cockpit->ClearLeftMfdPages();
+            this->cockpit->show_weapons = true;
         }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::SHOW_NAVMAP))) {
@@ -1869,8 +1826,13 @@ void SCStrike::checkKeyboard(void) {
         }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO))) {
-        this->cockpit->show_comm = !this->cockpit->show_comm;
-        this->mfd_timeout = 400;
+        // User-requested (2026-07 session): pressing 'c' while already on
+        // the comm page is a no-op now — it no longer closes the page.
+        // Same treatment as MDFS_SHIELD/MDFS_WEAPONS.
+        if (!this->cockpit->show_comm) {
+            this->cockpit->ClearLeftMfdPages();
+            this->cockpit->show_comm = true;
+        }
     }
     
     
@@ -1945,7 +1907,12 @@ void SCStrike::checkKeyboard(void) {
         this->pilote_lookat.x = 180;
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::MDFS_TARGET_CAMERA))) {
-        this->cockpit->show_cam = !this->cockpit->show_cam;
+        if (!this->cockpit->show_cam) {
+            this->cockpit->ClearLeftMfdPages();
+            this->cockpit->show_cam = true;
+        } else {
+            this->cockpit->show_cam = false;
+        }
     }
     if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::WEAPON_MODE_TOGGLE))) {
         this->air_weapons_mode = !this->air_weapons_mode;
@@ -2008,7 +1975,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }
         if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M2))) {
@@ -2020,7 +1986,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }
         if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M3))) {
@@ -2032,7 +1997,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }
         if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M4))) {
@@ -2044,7 +2008,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }
         if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M5))) {
@@ -2056,7 +2019,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }
         if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M6))) {
@@ -2068,7 +2030,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }
         if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M7))) {
@@ -2080,7 +2041,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }
         if (m_keyboard->isActionJustPressed(CreateAction(InputAction::SIM_START, SimActionOfst::COMM_RADIO_M8))) {
@@ -2092,7 +2052,6 @@ void SCStrike::checkKeyboard(void) {
                     this->cockpit->show_comm = false;
                 }
                 this->cockpit->comm_target = 0;
-                this->mfd_timeout = 400;
             }
         }   
     }
@@ -2880,7 +2839,6 @@ void SCStrike::runFrame(void) {
     this->checkKeyboard();
     Renderer.setLight(&this->light);
     if (!this->pause_simu && this->camera_mode!=View::AUTO_PILOT) {
-        this->mfd_timeout--;
         // While docked, force the plane's actual simulated heading (not
         // just the camera's rendered one — see getDockedCarrierYawTenths)
         // to match the carrier's, otherwise the visual forward direction
@@ -3032,14 +2990,6 @@ void SCStrike::runFrame(void) {
         this->player_plane->object->position.y = new_position.y;
     }
     this->cockpit->Update();
-    if (this->mfd_timeout <= 0) {
-        if (this->cockpit->show_comm) {
-            this->cockpit->show_comm = false;
-        }
-        if (this->cockpit->show_weapons) {
-            this->cockpit->show_weapons = false;
-        }
-    }
 
     Vector3D target_position = {0,0,0};
     if (this->target != nullptr) {

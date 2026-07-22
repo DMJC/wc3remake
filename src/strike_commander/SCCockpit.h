@@ -206,7 +206,11 @@ public:
     // COCK>FRNT>INST mode=0x00 — the same page id as SYS's own slot 0,
     // whose subsystem id (17) is the real "Shields" entry — two
     // independent chunks agreeing. See RenderMFDSShield.
-    bool show_shield{false};
+    // Defaults on (user-requested, 2026-07 session: "by default the
+    // shield page should be displayed") — no other show_* flag defaults
+    // true, so this doesn't fight ClearLeftMfdPages/the mutual-exclusion
+    // invariant; it's just the left MFD's initial page instead of none.
+    bool show_shield{true};
     // Power-allocation MFD state (user-confirmed real behavior, 2026-07
     // session): MDFS_POWER ('p') rotates through 5 states — the 4 gauges
     // (each highlighted in turn) then the shield/hull MFD, back to the
@@ -220,6 +224,15 @@ public:
     float power_alloc[4]{25.0f, 25.0f, 25.0f, 25.0f};
     static constexpr float kTotalPowerUnits = 100.0f;
     void CyclePowerOrShield();
+    // Forces the left-MFD page flags (show_radars/show_weapons/
+    // show_damage/show_comm/show_cam/show_power/show_shield) mutually
+    // exclusive. Call this before setting any one of them true so opening
+    // a page always closes whatever page was open before it — user-
+    // reported: switching pages (e.g. shield -> weapons via 's' then 'w')
+    // left the previous page's flag (and its drawn content) still active
+    // underneath the new one, since none of the MDFS_* key handlers used
+    // to touch any flag but their own.
+    void ClearLeftMfdPages();
     void AdjustSelectedPower(float delta);
     bool target_in_range{false};
     // Lock-on state, computed each Update() tick by updateLockOn() (see

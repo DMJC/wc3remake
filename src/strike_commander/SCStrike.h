@@ -171,10 +171,6 @@ protected:
      * @brief The AI planes
      */
     std::vector<SCAiPlane *> ai_planes;
-    /**
-     * @brief The MFD timeout
-     */
-    int32_t mfd_timeout{0};
     // Afterburner sound state ('48_8bit_11025.wav', user-identified —
     // 3.74s, 8-bit mono 11025Hz). Real behavior: play the full clip once
     // from the moment the key is pressed, then once only the last second

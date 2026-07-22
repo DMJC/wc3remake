@@ -13,8 +13,8 @@ target_include_directories(libRealSpace_tests
 )
 
 # Lier avec les bibliothèques du projet et Google Test
-target_link_libraries(libRealSpace_tests 
-    PRIVATE 
+target_link_libraries(libRealSpace_tests
+    PRIVATE
     commons
     engine
     realspace
